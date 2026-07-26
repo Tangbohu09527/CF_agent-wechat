@@ -1,0 +1,15 @@
+.env
+.env.*
+!.env.example
+.env.local
+secrets/
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa
+id_ed25519
+auth-token
+
+# External upstream dependency; not redistributed by this repository.
+agent-wechat/

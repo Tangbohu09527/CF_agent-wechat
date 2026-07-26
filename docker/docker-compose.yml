@@ -1,0 +1,55 @@
+services:
+  agent-wechat:
+    image: "${AGENT_WECHAT_IMAGE:?Set AGENT_WECHAT_IMAGE in .env}"
+    container_name: "${AGENT_WECHAT_CONTAINER_NAME:-cf-agent-wechat-lab}"
+    restart: "no"
+
+    security_opt:
+      - seccomp=unconfined
+    cap_add:
+      - SYS_PTRACE
+
+    ports:
+      - "${AGENT_WECHAT_BIND_IP:?Set AGENT_WECHAT_BIND_IP in .env}:${AGENT_WECHAT_PORT:-6174}:6174"
+
+    volumes:
+      - type: bind
+        source: ./data
+        target: /data
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./wechat-home
+        target: /home/wechat
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./secrets/auth-token
+        target: /data/auth-token
+        read_only: true
+        bind:
+          create_host_path: false
+
+    environment:
+      AGENT_HOST: "0.0.0.0"
+      AGENT_PORT: "6174"
+      AGENT_DB_PATH: "/data/agent.db"
+      ENABLE_VNC: "${ENABLE_VNC:-1}"
+      NOVNC_PORT: "6080"
+      PROXY: "${PROXY:-}"
+      RUST_LOG: "${RUST_LOG:-info}"
+
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "--show-error", "http://127.0.0.1:6174/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 90s
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"
+
+    stop_grace_period: 30s
