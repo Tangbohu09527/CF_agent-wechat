@@ -1,42 +1,141 @@
 # CF_agent-wechat
 
-CF_agent-wechat 是企业 AI 微信入口的验证与集成项目。
+## 项目介绍
+
+CF_agent-wechat 是企业 AI 自动化系统的微信入口层。本仓库负责固化
+agent-wechat 的部署基线、验证结论和企业集成边界，不包含上游源码，也不承载
+AI 推理或企业业务逻辑。
+
+> 当前状态：V1 技术验证已完成。本文中的 `Verified` 仅表示指定测试环境和固定
+> 镜像基线已通过验证，不表示生产可用。
+
+## 架构定位
+
+```text
+员工微信
+    ↓
+agent-wechat
+    ↓
+CF Gateway（规划）
+    ↓
+Hermes Agent
+    ↓
+Skills
+    ↓
+企业系统
+```
+
+agent-wechat 负责微信账号运行、消息收发、联系人和聊天管理、图片或文件入口，
+以及微信事件转发。它不负责 AI 推理、Skill 执行、ERP 操作或企业业务逻辑。
+这些职责应由规划中的 CF Gateway、Hermes Agent 和 Skills 分层承担。
+
+## 环境要求
+
+已验证基线：
+
+| 项目 | 基线 |
+| --- | --- |
+| 虚拟化 | VMware Workstation |
+| 操作系统 | Debian 13 Trixie |
+| Linux kernel | 6.12 |
+| 容器运行时 | Docker CE / Docker Engine 29.x |
+| Compose | Docker Compose v2 |
+| agent-wechat 镜像 | `ghcr.io/thisnick/agent-wechat:0.11.15` |
+| 镜像固定方式 | `ghcr.io/thisnick/agent-wechat@sha256:<verified-digest>` |
+
+建议至少提供 2 CPU、2 GB RAM 和 10 GB 可用磁盘。端口、权限和持久化要求见
+[Docker 部署手册](docker/README.md)。
+
+## 快速部署
+
+以下命令用于新的 Debian 部署目录。不要把真实 token、`.env` 或运行数据提交到
+Git；已有数据恢复时，必须同时恢复 `data/` 和 `secrets/auth-token`，不要生成
+新 token。
+
+```bash
+cd docker
+cp -n .env.example .env
+mkdir -p data wechat-home secrets backups
+test -z "$(find data -mindepth 1 -print -quit)" && \
+  (umask 077; set -o noclobber; openssl rand -hex 32 > secrets/auth-token)
+
+docker pull ghcr.io/thisnick/agent-wechat:0.11.15
+docker image inspect --format '{{index .RepoDigests 0}}' \
+  ghcr.io/thisnick/agent-wechat:0.11.15
+```
+
+将输出的完整 digest 写入 `.env` 的 `AGENT_WECHAT_IMAGE`，然后执行：
+
+```bash
+chmod 700 data wechat-home secrets backups
+chmod 600 secrets/auth-token
+chmod 755 preflight.sh
+./preflight.sh
+docker compose --env-file .env config
+docker compose --env-file .env up -d
+```
+
+仓库 Compose 基线仍使用 `restart: "no"`。验证环境的自动恢复结论来自
+`restart: unless-stopped`；两者差异和 VNC 修复依赖见
+[验证记录](docs/validation.md#运行时配置差异)。
+
+## 验证方式
+
+```bash
+docker compose --env-file .env ps
+curl --fail --silent --show-error http://127.0.0.1:6174/health
+
+TOKEN="$(cat secrets/auth-token)"
+curl --fail --silent --show-error \
+  -H "Authorization: Bearer ${TOKEN}" \
+  http://127.0.0.1:6174/api/status/auth
+unset TOKEN
+```
+
+微信 GUI 登录不等于 agent-wechat 初始化完成。首次初始化必须连接
+`/api/ws/login`，完成 login flow，等待 `login_success` 并取得 `userId`；之后才将
+联系人、聊天和消息 API 判定为可用。完整步骤见 [API 文档](docs/api.md)。
 
 ## 当前状态
 
-项目处于 **V1 技术验证阶段**。当前已完成项目初始化、外部依赖分析、文档建设和测试部署准备，尚未部署，也未接入 Hermes Agent 或实现企业业务逻辑。
+### Verified
 
-## 项目目标
+- Debian 13 环境部署、Docker/Compose 启动、镜像 digest 固定和容器健康检查。
+- auth-token 配置及 Bearer 认证。
+- 宿主机重启后容器、agent-wechat 和 VNC 恢复（验证环境配置）。
+- 联系人、聊天和消息读取。
+- 私聊与群聊文本消息发送。
 
-作为企业 AI 自动化系统的微信入口，承接员工微信消息，并在后续阶段通过 CF_gateway 对接 Hermes Agent、Skills 和自动化流程。
+### Pending
 
-CF_agent-wechat 当前负责：
+- 图片发送与文件发送。
+- `/api/ws/events` 实时消息事件。
+- CF Gateway 与 Hermes Agent 集成。
 
-- 企业验证：评估上游能力是否满足企业微信 AI 入口需求。
-- 部署管理：维护 V1 测试配置、版本基线和部署记录。
-- 未来企业扩展：通过 CF_gateway 和外围服务增加企业能力。
+### Known Issue
 
-## 外部依赖
+- 默认 VNC 启动状态不稳定，验证环境依赖 `docker/fix-vnc.sh` 和
+  `cf-wechat-vnc-fix.service` 恢复 interactive x11vnc。
+- 上述 VNC 运维资产尚未纳入当前仓库；重建环境前必须从受控部署记录取得。
+- 仓库 Compose 的重启策略与已验证环境存在差异，不能直接据此声明自动恢复。
 
-- 依赖名称：agent-wechat
-- 上游地址：<https://github.com/thisnick/agent-wechat>
-- 使用方式：作为微信通信能力的外部依赖进行独立获取和验证。
-- 仓库边界：本仓库不包含、不修改、也不公开再分发上游源码。
+## Roadmap
 
-上游当前未声明明确的开源许可证，因此 `agent-wechat/` 仅作为本地外部依赖目录使用，并已从 Git 跟踪中排除。使用者应自行遵守上游条款并确认所需授权。
+1. 将 VNC 修复脚本、systemd unit 和 `unless-stopped` 策略纳入正式变更评审。
+2. 验证图片发送、文件发送和 WebSocket 实时消息事件。
+3. 定义 CF Gateway 的鉴权、消息契约、幂等、重试和审计边界。
+4. 完成备份恢复演练、版本升级回退演练和长期稳定性验证。
+5. 接入 Hermes Agent 与 Skills，并保持 AI 和企业业务逻辑在入口层之外。
 
-## 目录说明
+## 文档
 
-- `agent-wechat/`：可选的本地外部依赖目录，已被 Git 忽略，不属于本仓库发布内容。
-- `cf-gateway/`：未来的企业桥接层，目前仅保留目录。
-- `docker/`：CF_wechat-lab 的 V1 部署准备配置和部署前检查脚本。
-- `docs/`：项目说明、架构、部署记录和阶段规划。
+- [文档索引](docs/README.md)
+- [架构设计](docs/01_架构设计.md)
+- [部署记录](docs/02_部署记录.md)
+- [V1 验证记录](docs/validation.md)
+- [API 文档](docs/api.md)
+- [故障排查](docs/troubleshooting.md)
+- [运维与交接](docs/operations.md)
 
-## 建设原则
-
-- 上游依赖独立维护，不将其源码纳入本仓库。
-- 所有修改可追踪，文档与变更同步记录。
-- 企业扩展优先放在 CF_gateway，不侵入上游核心。
-- 当前阶段不提前实现业务逻辑。
-
-详细文档见 [docs/README.md](docs/README.md)。
+上游项目：<https://github.com/thisnick/agent-wechat>。上游源码不属于本仓库；使用
+前应独立确认其许可证和授权条件。
