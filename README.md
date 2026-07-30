@@ -94,7 +94,9 @@ unset TOKEN
 
 微信 GUI 登录不等于 agent-wechat 初始化完成。首次初始化必须连接
 `/api/ws/login`，完成 login flow，等待 `login_success` 并取得 `userId`；之后才将
-联系人、聊天和消息 API 判定为可用。完整步骤见 [API 文档](docs/api.md)。
+联系人、聊天和消息 API 判定为可用。Docker 重启后微信客户端需要重新登录，并应
+通过 `/api/status/auth` 复核 `status=logged_in`。完整步骤见
+[API 文档](docs/api.md)。
 
 ## 当前状态
 
@@ -103,13 +105,15 @@ unset TOKEN
 - Debian 13 环境部署、Docker/Compose 启动、镜像 digest 固定和容器健康检查。
 - auth-token 配置及 Bearer 认证。
 - 宿主机重启后容器、agent-wechat 和 VNC 恢复（验证环境配置）。
-- 联系人、聊天和消息读取。
-- 私聊与群聊文本消息发送。
+- `/api/status/auth` 登录状态查询。
+- 按 `chatId` 发送文本，以及包含发送者、内容和时间等字段的消息读取。
+- `txt`、`zip` 文件消息识别和 Base64 获取。
+- 群消息、发送者、群文件以及文本/文件引用上下文读取。
 
 ### Pending
 
-- 图片发送与文件发送。
-- `/api/ws/events` 实时消息事件。
+- 图片发送与通过 API 发送文件。
+- `/api/ws/events` 实时消息事件；连接已建立，但未观察到新消息推送。
 - CF Gateway 与 Hermes Agent 集成。
 
 ### Known Issue
@@ -118,11 +122,12 @@ unset TOKEN
   `cf-wechat-vnc-fix.service` 恢复 interactive x11vnc。
 - 上述 VNC 运维资产尚未纳入当前仓库；重建环境前必须从受控部署记录取得。
 - 仓库 Compose 的重启策略与已验证环境存在差异，不能直接据此声明自动恢复。
+- Docker 重启后微信客户端需要重新登录。
 
 ## Roadmap
 
 1. 将 VNC 修复脚本、systemd unit 和 `unless-stopped` 策略纳入正式变更评审。
-2. 验证图片发送、文件发送和 WebSocket 实时消息事件。
+2. 验证图片/API 文件发送，并调查 WebSocket 未推送新消息事件的问题。
 3. 定义 CF Gateway 的鉴权、消息契约、幂等、重试和审计边界。
 4. 完成备份恢复演练、版本升级回退演练和长期稳定性验证。
 5. 接入 Hermes Agent 与 Skills，并保持 AI 和企业业务逻辑在入口层之外。
@@ -132,7 +137,8 @@ unset TOKEN
 - [文档索引](docs/README.md)
 - [架构设计](docs/01_架构设计.md)
 - [部署记录](docs/02_部署记录.md)
-- [V1 验证记录](docs/validation.md)
+- [V1 验证结果](docs/05_V1验证结果.md)
+- [V1 回归矩阵](docs/validation.md)
 - [API 文档](docs/api.md)
 - [故障排查](docs/troubleshooting.md)
 - [运维与交接](docs/operations.md)

@@ -35,9 +35,33 @@ agent-wechat 已完成自己的登录初始化和用户绑定。
 
 ### 结果判定
 
-收到 `login_success`，取得 `userId`，且业务 API 可用。
+`GET /api/status/auth` 返回 `status=logged_in`，且业务 API 可用。
 
-## 2. Docker 启动后 VNC 无法交互
+## 2. Docker 重启后微信客户端需要重新登录
+
+### 现象
+
+Docker 重启后容器自动恢复、container health 正常且 VNC 可访问，但微信客户端
+处于未登录状态。
+
+### 原因
+
+容器和 VNC 的运行状态恢复不等于微信客户端会话自动恢复。当前已验证环境需要人工
+重新登录微信。
+
+### 处理
+
+1. 确认容器为 `healthy` 且 `/health` 返回成功。
+2. 通过 noVNC/VNC 打开 XFCE 桌面。
+3. 重新登录微信客户端。
+4. 查询 `GET /api/status/auth`。
+5. 复核消息读取或文本发送 API。
+
+### 结果判定
+
+`/api/status/auth` 返回 `status=logged_in`，agent-server 登录状态正常。
+
+## 3. Docker 启动后 VNC 无法交互
 
 ### 现象
 
@@ -67,7 +91,23 @@ systemd unit 执行成功，noVNC 页面可见且鼠标键盘可以交互。
 修复脚本和 unit 当前未包含在仓库中。新环境缺少它们时不能只凭上述服务名恢复，
 需要从受控部署记录取得实际文件。
 
-## 3. Debian 13 无法直接 pip install
+## 4. `/api/ws/events` 已连接但没有新消息事件
+
+### 现象
+
+WebSocket 连接可以建立，但微信产生新消息后客户端没有收到事件推送。
+
+### 状态
+
+当前为 **Pending Investigation**。已验证的只有连接建立，不能据此宣称实时消息
+能力可用。
+
+### 排查方向
+
+记录握手认证、订阅条件、连接日志、心跳、微信新消息时间点和服务端日志，并确认
+客户端没有过滤未知事件。取得真实事件前，不将轮询替换为 WebSocket。
+
+## 5. Debian 13 无法直接 pip install
 
 ### 现象
 

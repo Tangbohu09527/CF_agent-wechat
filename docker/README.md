@@ -141,7 +141,8 @@ unset TOKEN
 ```
 
 预期容器最终为 `healthy`，`/health` 返回成功。认证接口显示 `logged_out` 时，
-即使微信 GUI 已登录，也需要执行完整的 agent-wechat 初始化流程。
+需要完成微信/agent-wechat 登录流程并再次查询状态。已验证成功状态为
+`status=logged_in`。
 
 ## 微信初始化
 
@@ -164,8 +165,9 @@ GUI 登录不等于 agent-wechat 初始化完成。接口和验证能力见
 
 ### Verified
 
-验证环境使用 `restart: unless-stopped`，Debian 重启后容器、agent-wechat 和 VNC
-均可恢复。
+验证环境使用 `restart: unless-stopped`。Docker 重启后容器自动恢复、container
+health 正常且 VNC 可访问。微信客户端需要重新登录；重新登录后 agent-server 状态
+恢复正常，`/api/status/auth` 返回 `status=logged_in`。
 
 ### Known Issue
 

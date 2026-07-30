@@ -62,8 +62,9 @@ docker compose --env-file .env logs --tail=200 agent-wechat
 3. 同时恢复 `data/`、`wechat-home/` 和原 `secrets/auth-token`。
 4. 恢复正确属主与权限，不使用全局可写权限绕过。
 5. 运行 `./preflight.sh` 和 `docker compose --env-file .env config`。
-6. 启动后验证 `/health`、`/api/ws/login` session、联系人、聊天和消息。
-7. 在验证环境配置下复核 VNC 修复服务。
+6. 启动后验证 `/health` 和 noVNC/VNC；微信未登录时完成重新登录。
+7. 验证 `/api/status/auth` 返回 `logged_in`，再复核聊天和消息 API。
+8. 在验证环境配置下复核 VNC 修复服务。
 
 不要在恢复失败时删除 `agent.db` 或生成新 token 后反复尝试；先保留现场并查看
 容器日志。
@@ -83,7 +84,19 @@ systemctl status cf-wechat-vnc-fix.service
 curl --fail --silent --show-error http://127.0.0.1:6174/health
 ```
 
-随后实际访问 noVNC，确认画面和鼠标键盘交互。端口可达不能替代交互验收。
+随后实际访问 noVNC，确认 XFCE 画面和鼠标键盘交互。端口可达不能替代交互验收。
+本轮实测中微信客户端在 Docker 重启后需要重新登录。登录完成后执行：
+
+```bash
+TOKEN="$(cat secrets/auth-token)"
+curl --fail --silent --show-error \
+  -H "Authorization: Bearer ${TOKEN}" \
+  http://127.0.0.1:6174/api/status/auth
+unset TOKEN
+```
+
+验收结果应为 `status=logged_in`，并继续复核消息读取或文本发送。容器、health 和
+VNC 恢复不能替代微信登录与 API 状态验收。
 
 ## 版本升级与回退
 

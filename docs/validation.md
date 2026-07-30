@@ -8,6 +8,9 @@
 | 操作系统 | Debian 13 Trixie |
 | Linux kernel | 6.12 |
 | Docker | Docker CE / Docker Engine 29.x |
+| 容器 | `agent-wechat` |
+| 桌面环境 | XFCE |
+| 远程桌面 | noVNC/VNC |
 | Docker Compose | v2 |
 | 镜像 tag | `ghcr.io/thisnick/agent-wechat:0.11.15` |
 | 镜像部署方式 | digest 固定：`ghcr.io/thisnick/agent-wechat@sha256:<verified-digest>` |
@@ -36,7 +39,10 @@
 | Docker `restart: unless-stopped` | **Verified** | PASS |
 | Debian 重启后容器自动恢复 | **Verified** | PASS |
 | agent-wechat 自动启动 | **Verified** | PASS |
+| Container health | **Verified** | 正常 |
 | VNC 访问恢复 | **Verified** | PASS，依赖额外修复服务 |
+| 微信客户端登录 | **Known Issue** | Docker 重启后需要重新登录 |
+| agent-server 登录恢复 | **Verified** | 微信重新登录后状态正常 |
 
 ### 运行时配置差异
 
@@ -66,8 +72,8 @@ journalctl -u cf-wechat-vnc-fix.service -n 100 --no-pager
 
 ## 微信初始化流程
 
-微信 GUI 登录 **不等于** agent-wechat 初始化完成。两个状态来自不同状态源；
-即使 GUI 已登录，`/api/status/auth` 仍可能显示 `logged_out`。
+微信 GUI 登录 **不等于** agent-wechat 初始化完成。两个状态来自不同状态源。本轮
+Docker 重启后微信客户端需要重新登录；重新登录后 agent-server 登录状态恢复正常。
 
 正确流程：
 
@@ -83,8 +89,8 @@ userId
 contacts / chats / messages API 可用
 ```
 
-只有收到 `login_success`、取得 `userId`，并成功调用业务 API 后，才判定
-agent-wechat session 初始化完成。
+初始化流程完成后必须直接复核 `GET /api/status/auth` 和业务 API。本轮已验证
+`status=logged_in`，`loggedInUser=wxid_trx4eew84jvc22_0352`。
 
 ## API 能力
 
@@ -92,23 +98,30 @@ agent-wechat session 初始化完成。
 | --- | --- | --- |
 | 联系人读取 | **Verified** | PASS |
 | 聊天读取 | **Verified** | PASS |
-| 消息读取 | **Verified** | PASS |
-| 私聊文本发送 | **Verified** | PASS |
-| 群聊文本发送 | **Verified** | PASS |
+| 消息字段：`sender`、`senderName`、`content`、`timestamp`、`isSelf` | **Verified** | PASS |
+| 按 `chatId` 文本发送 | **Verified** | `success=true` |
+| `txt`、`zip` 文件消息识别 | **Verified** | `type=49`、`localId`、文件名 |
+| `txt`、`zip` Base64 获取 | **Verified** | PASS |
+| 群消息、发送者和群文件 | **Verified** | `isGroup=true` |
+| 文本/文件引用上下文 | **Verified** | `reply.sender`、`reply.content` |
 | 图片发送 | **Pending** | 未验证 |
-| 文件发送 | **Pending** | 未验证 |
-| WebSocket 实时消息事件 | **Pending** | 未验证 |
+| 通过 API 发送文件 | **Pending** | 未验证 |
+| WebSocket 实时消息事件 | **Pending Investigation** | 连接成功，未观察到事件 |
 | Hermes Gateway 集成 | **Pending** | 未验证 |
 
-接口路径和认证边界见 [api.md](api.md)。
+完整实测结果见 [05_V1验证结果.md](05_V1验证结果.md)，接口路径和认证边界见
+[api.md](api.md)。
 
 ## 回归检查
 
 镜像 digest、Docker/Compose 版本、宿主机系统或 VNC 修复逻辑变化后，至少重跑：
 
-1. Compose 配置解析和容器健康检查。
-2. auth-token 认证。
-3. `/api/ws/login` 完整初始化。
-4. 联系人、聊天、消息读取。
-5. 私聊与群聊文本发送。
-6. 宿主机重启后的容器、agent-wechat 和 VNC 恢复。
+1. Compose 配置解析、容器自动恢复和健康检查。
+2. noVNC/VNC 可访问性与交互。
+3. 微信客户端重新登录。
+4. `/api/status/auth` 返回 `logged_in`。
+5. 指定 `chatId` 的文本发送和消息字段读取。
+6. `txt`、`zip` 文件消息识别与 Base64 获取。
+7. 群消息、发送者、群文件和 `isGroup`。
+8. 文本、文件引用的 `reply` 上下文。
+9. `/api/ws/events` 连接及新消息事件观察；没有事件时保持 Pending。
