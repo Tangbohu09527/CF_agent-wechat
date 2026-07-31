@@ -104,6 +104,7 @@ contacts / chats / messages API 可用
 | `txt`、`zip` Base64 获取 | **Verified** | PASS |
 | 群消息、发送者和群文件 | **Verified** | `isGroup=true` |
 | 文本/文件引用上下文 | **Verified** | `reply.sender`、`reply.content` |
+| 合并转发消息 | **Verified** | 外层识别已验证，内部解析待增强 |
 | 图片发送 | **Pending** | 未验证 |
 | 通过 API 发送文件 | **Pending** | 未验证 |
 | WebSocket 实时消息事件 | **Pending Investigation** | 连接成功，未观察到事件 |
@@ -124,4 +125,5 @@ contacts / chats / messages API 可用
 6. `txt`、`zip` 文件消息识别与 Base64 获取。
 7. 群消息、发送者、群文件和 `isGroup`。
 8. 文本、文件引用的 `reply` 上下文。
-9. `/api/ws/events` 连接及新消息事件观察；没有事件时保持 Pending。
+9. 合并转发消息的外层标题和发送者；media API 应保持已记录的 `unsupported` 边界。
+10. `/api/ws/events` 连接及新消息事件观察；没有事件时保持 Pending。

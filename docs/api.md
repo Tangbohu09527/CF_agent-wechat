@@ -34,7 +34,7 @@ unset TOKEN
 | GET | `/api/chats` | 读取聊天 | **Verified** |
 | GET | `/api/messages/{chat_id}` | 读取指定聊天的消息 | **Verified** |
 | POST | `/api/messages/send` | 按 `chatId` 发送文本 | **Verified**：`success=true` |
-| GET | `/api/messages/{chat_id}/media/{local_id}` | 获取文件 Base64 数据 | **Verified**：`txt`、`zip` |
+| GET | `/api/messages/{chat_id}/media/{local_id}` | 获取受支持文件的 Base64 数据 | **Verified**：`txt`、`zip` |
 
 `{chat_id}` 必须使用 API 返回的聊天标识，并由客户端做 URL 编码。当前验证确认
 端点可用，但尚未在本仓库冻结分页、错误码、消息体字段和兼容性契约；Gateway
@@ -126,6 +126,27 @@ unset TOKEN
 }
 ```
 
+## 合并转发消息
+
+微信群中的微信“合并转发聊天记录”已验证可由
+`GET /api/messages/{chat_id}` 读取。外层消息返回 `type=49`，`content` 为外层标题，
+例如“罗明贺的聊天记录”，并包含 `localId`、`serverId`、`sender`、`senderName`、
+`timestamp` 和 `isSelf`。
+
+使用 `GET /api/messages/{chat_id}/media/{local_id}` 尝试获取内部内容时，已验证返回：
+
+```json
+{
+  "type": "unsupported",
+  "format": "",
+  "filename": ""
+}
+```
+
+因此当前能力边界为：支持合并转发消息存在性、发送者和外层标题识别；不支持自动
+展开内部聊天记录，也不支持提取内部文本或文件。结论为：**外层识别已验证，内部
+解析待增强**。
+
 ## 已验证能力
 
 - **Verified**：联系人读取。
@@ -135,6 +156,7 @@ unset TOKEN
 - **Verified**：`txt`、`zip` 文件消息识别与 Base64 获取。
 - **Verified**：群消息、发送者和群文件识别。
 - **Verified**：文本和文件引用上下文读取。
+- **Verified**：合并转发消息外层识别；内部解析待增强。
 
 ## 尚未验证
 
