@@ -90,7 +90,27 @@ contacts / chats / messages API 可用
 ```
 
 初始化流程完成后必须直接复核 `GET /api/status/auth` 和业务 API。本轮已验证
-`status=logged_in`，`loggedInUser=wxid_trx4eew84jvc22_0352`。
+`status=logged_in`，`loggedInUser=<wechat-user-id>`。
+
+## Gateway/Hermes V1 Staging
+
+| 验证项 | 状态 | 结果 |
+| --- | --- | --- |
+| Gateway WeChat Polling | **Verified** | 文本消息进入 Message Store |
+| Identity / Permission | **Verified** | 身份解析和权限准入通过 |
+| Employee Workspace / AIThread | **Verified** | 线程创建与绑定通过 |
+| Hermes dispatch / response | **Verified** | API 调用和响应回传通过 |
+| WeChat outbound | **Verified** | `{"chatId":"...","text":"..."}` |
+| Self echo guard | **Verified** | 原始 `isSelf` / `RawWechatMessage.is_self=true` 在 normalize/sink 前过滤，checkpoint 推进 |
+| End-to-end text reply | **Verified** | 微信收到 Hermes 文本回复 |
+| Group context key | **Known Issue** | 当前 whole-room；目标 `bot + group + sender` |
+
+联调环境为 Debian 13 Docker agent-wechat、CF_agent-gateway Worker 和 Windows AI
+主机 Hermes API。Gateway 仓库验证结果：`pytest: 393 passed`、`ruff: passed`、
+`git diff --check: passed`。
+
+该闭环只覆盖文本。图片理解、附件传递、文件处理、OCR、压缩包解析、企业知识库、
+Skill 自动执行和生产自动部署均未验证。
 
 ## API 能力
 
@@ -100,7 +120,7 @@ contacts / chats / messages API 可用
 | 聊天读取 | **Verified** | PASS |
 | 消息字段：`sender`、`senderName`、`content`、`timestamp`、`isSelf` | **Verified** | PASS |
 | 按 `chatId` 文本发送 | **Verified** | `success=true` |
-| `txt`、`zip` 文件消息识别 | **Verified** | `type=49`、`localId`、文件名 |
+| agent-wechat `txt`、`zip` 文件入口识别 | **Verified** | `type=49`、`localId`、文件名 |
 | `txt`、`zip` Base64 获取 | **Verified** | PASS |
 | 群消息、发送者和群文件 | **Verified** | `isGroup=true` |
 | 文本/文件引用上下文 | **Verified** | `reply.sender`、`reply.content` |
@@ -108,10 +128,11 @@ contacts / chats / messages API 可用
 | 图片发送 | **Pending** | 未验证 |
 | 通过 API 发送文件 | **Pending** | 未验证 |
 | WebSocket 实时消息事件 | **Pending Investigation** | 连接成功，未观察到事件 |
-| Hermes Gateway 集成 | **Pending** | 未验证 |
+| Hermes Gateway 文本集成 | **Verified** | V1 Staging 文本闭环通过 |
 
 完整实测结果见 [05_V1验证结果.md](05_V1验证结果.md)，接口路径和认证边界见
-[api.md](api.md)。
+[api.md](api.md)。入口侧文件识别不等于 Gateway 附件传递、系统文件处理或压缩包
+解析。
 
 ## 回归检查
 
@@ -127,3 +148,8 @@ contacts / chats / messages API 可用
 8. 文本、文件引用的 `reply` 上下文。
 9. 合并转发消息的外层标题和发送者；media API 应保持已记录的 `unsupported` 边界。
 10. `/api/ws/events` 连接及新消息事件观察；没有事件时保持 Pending。
+11. Gateway Polling 文本进入 Message Store 并完成 Identity、Permission 和 AIThread。
+12. Hermes 响应使用 `{"chatId":"...","text":"..."}` 返回微信。
+13. 自身消息在 normalize/sink 前过滤，不进入 admission 或 Hermes，但 checkpoint
+    必须推进。
+14. 群聊 whole-room 偏差保持 Known Issue，直至按 `bot + group + sender` 隔离。

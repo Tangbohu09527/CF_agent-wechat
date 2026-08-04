@@ -22,6 +22,7 @@ docker compose --env-file .env logs --tail=200 agent-wechat
 - 磁盘空间、`data/` 和 `wechat-home/` 增长处于可控范围。
 - 日志没有数据库、微信进程、Xvfb 或 x11vnc 持续错误。
 - API session 状态符合预期；GUI 状态不能替代 API 状态。
+- V1 Staging 中 Gateway Polling checkpoint 持续推进，自身消息不触发 Hermes。
 - 验证环境中 `cf-wechat-vnc-fix.service` 正常。
 
 ## 安全边界
@@ -127,5 +128,7 @@ VNC 恢复不能替代微信登录与 API 状态验收。
 - [ ] `restart: unless-stopped` 与仓库 Compose 差异已说明。
 - [ ] `docker/fix-vnc.sh` 和 `cf-wechat-vnc-fix.service` 的受控来源已说明。
 - [ ] 微信账号登录、session 初始化和异常处置责任人明确。
-- [ ] Pending 能力没有被写入对外承诺。
-- [ ] CF Gateway / Hermes 尚未接入的边界已说明。
+- [ ] agent-wechat 入口文件识别与系统文件处理的边界已说明。
+- [ ] Gateway/Hermes 仅完成 V1 Staging 文本闭环的边界已说明。
+- [ ] 图片理解、附件、文件、OCR、压缩包、知识库、Skills 和生产自动部署仍为 Pending。
+- [ ] 群聊 whole-room 与目标 `bot + group + sender` 的偏差已交接。

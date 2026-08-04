@@ -3,8 +3,8 @@
 ## 适用范围
 
 本文只记录镜像 `ghcr.io/thisnick/agent-wechat:0.11.15` 固定 digest 基线中已经
-验证的端点和行为。请求/响应字段尚未作为 CF Gateway 稳定契约冻结；升级镜像后
-必须重新验证。
+验证的端点和行为。V1 Staging 已确认文本发送请求字段为 `chatId` 和 `text`；
+其余请求/响应字段尚未作为完整稳定契约冻结，升级镜像后必须重新验证。
 
 ## 访问与认证
 
@@ -73,7 +73,7 @@ unset TOKEN
 ```json
 {
   "status": "logged_in",
-  "loggedInUser": "wxid_trx4eew84jvc22_0352"
+  "loggedInUser": "<wechat-user-id>"
 }
 ```
 
@@ -81,8 +81,17 @@ unset TOKEN
 
 ## 文本消息
 
-`POST /api/messages/send` 已验证可指定 `chatId` 并发送文本，成功响应包含
-`success=true`。
+`POST /api/messages/send` 已验证请求体：
+
+```json
+{
+  "chatId": "...",
+  "text": "..."
+}
+```
+
+`text` 是发送文本的字段，成功响应包含 `success=true`。旧 Gateway 请求体使用的
+`content` 字段不符合该接口契约；`content` 仍是读取消息时的内容字段。
 
 `GET /api/messages/{chat_id}` 已验证返回消息的以下字段：
 
@@ -91,6 +100,24 @@ unset TOKEN
 - `content`
 - `timestamp`
 - `isSelf`
+
+## Gateway V1 Staging Polling
+
+当前 Gateway 通过 Polling 读取消息，未使用仍处于 Pending Investigation 的
+`/api/ws/events`。agent-wechat 原始响应字段为 `isSelf`；Gateway Polling 将它
+解析为 `RawWechatMessage.is_self`。值为 `true` 时在 normalize/sink 之前过滤：
+
+- 不进入 normalize 或 sink。
+- 不进入 permission admission。
+- 不调用 Hermes。
+- 仍推进 checkpoint。
+
+这避免 Gateway 发出的微信回复再次触发 Hermes，同时保留当前 at-least-once
+delivery 语义。V1 Staging 已完成文本消息经过 Identity、Permission、AIThread、
+Hermes 并返回微信的闭环。
+
+群聊目标上下文按 `bot + group + sender` 隔离；Gateway V1 当前 whole-room 聚合
+是已知实现偏差。
 
 ## 文件消息
 
@@ -130,7 +157,7 @@ unset TOKEN
 
 微信群中的微信“合并转发聊天记录”已验证可由
 `GET /api/messages/{chat_id}` 读取。外层消息返回 `type=49`，`content` 为外层标题，
-例如“罗明贺的聊天记录”，并包含 `localId`、`serverId`、`sender`、`senderName`、
+例如“<用户的聊天记录>”，并包含 `localId`、`serverId`、`sender`、`senderName`、
 `timestamp` 和 `isSelf`。
 
 使用 `GET /api/messages/{chat_id}/media/{local_id}` 尝试获取内部内容时，已验证返回：
@@ -163,19 +190,22 @@ unset TOKEN
 - **Pending**：图片发送。
 - **Pending**：通过 API 发送文件。
 - **Pending Investigation**：`/api/ws/events` 实时消息事件；仅连接已验证。
-- **Pending**：CF Gateway / Hermes Agent 集成。
+- **Verified**：Gateway/Hermes V1 Staging 文本闭环。
+- **Pending**：图片理解、附件传递、文件处理、OCR、压缩包解析、知识库、Skills
+  和生产自动部署。
 
-文件接收与获取不等于文件发送，因此不能将 `POST /api/messages/send` 描述为支持
-所有消息类型。实时消息事件尚未观察到，不得对外宣称支持。
+agent-wechat 的文件接收与获取不等于 Gateway 附件传递、系统文件处理或文件发送，
+也不表示压缩包内容已经解析。实时消息事件尚未观察到，不得对外宣称支持。
 
-## Gateway 接入前待冻结项
+## Gateway 后续待收口项
 
-- 请求和响应 JSON schema。
+- 除 `{"chatId":"...","text":"..."}` 外的请求字段及完整响应 JSON schema。
 - 分页、排序和消息时间语义。
 - 错误码、超时和重试条件。
 - 发送幂等与重复消息识别。
 - WebSocket 认证、心跳、重连和事件去重。
 - chat ID、user ID 和 message ID 的稳定性与映射规则。
+- 群聊 `bot + group + sender` 上下文隔离。
 - 敏感数据脱敏和审计字段。
 
 这些项目均为 `Pending`。

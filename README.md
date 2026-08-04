@@ -16,18 +16,19 @@ AI 推理或企业业务逻辑。
     ↓
 agent-wechat
     ↓
-CF Gateway（规划）
+CF Gateway
     ↓
 Hermes Agent
     ↓
-Skills
+Skills（后续阶段）
     ↓
 企业系统
 ```
 
 agent-wechat 负责微信账号运行、消息收发、联系人和聊天管理、图片或文件入口，
 以及微信事件转发。它不负责 AI 推理、Skill 执行、ERP 操作或企业业务逻辑。
-这些职责应由规划中的 CF Gateway、Hermes Agent 和 Skills 分层承担。
+V1 Staging 已由 CF Gateway 接通微信文本消息、Hermes 调用和微信回复回传；Skills
+及企业系统执行仍属于后续阶段。
 
 ## 环境要求
 
@@ -107,15 +108,23 @@ unset TOKEN
 - 宿主机重启后容器、agent-wechat 和 VNC 恢复（验证环境配置）。
 - `/api/status/auth` 登录状态查询。
 - 按 `chatId` 发送文本，以及包含发送者、内容和时间等字段的消息读取。
-- `txt`、`zip` 文件消息识别和 Base64 获取。
+- agent-wechat 入口侧 `txt`、`zip` 文件消息识别和 Base64 获取。
 - 群消息、发送者、群文件以及文本/文件引用上下文读取。
 - 群聊合并转发消息的外层识别、发送者识别和标题读取；内部解析待增强。
+- V1 Staging 通过 Gateway Polling 完成“微信文本消息 → 身份与权限准入 → AIThread
+  → Hermes → 微信文本回复”闭环。
+- Gateway 调用 `POST /api/messages/send` 使用 `{"chatId":"...","text":"..."}`，
+  并在 Polling 层过滤自身消息、推进 checkpoint，避免回复回环。
 
 ### Pending
 
+- 图片理解、图片附件传递、文件消息端到端处理、OCR 和压缩包内容解析。
 - 图片发送与通过 API 发送文件。
 - `/api/ws/events` 实时消息事件；连接已建立，但未观察到新消息推送。
-- CF Gateway 与 Hermes Agent 集成。
+- 企业知识库、Skill 自动执行和生产环境自动部署。
+
+agent-wechat 单体能够识别并获取部分文件消息，不表示 Gateway 已完成附件传递、文件
+处理或压缩包解析。
 
 ### Known Issue
 
@@ -124,14 +133,17 @@ unset TOKEN
 - 上述 VNC 运维资产尚未纳入当前仓库；重建环境前必须从受控部署记录取得。
 - 仓库 Compose 的重启策略与已验证环境存在差异，不能直接据此声明自动恢复。
 - Docker 重启后微信客户端需要重新登录。
+- 群聊目标上下文应按 `bot + group + sender` 隔离；Gateway V1 当前仍按 whole-room
+  聚合，是已知实现偏差，不代表最终上下文模型。
 
 ## Roadmap
 
 1. 将 VNC 修复脚本、systemd unit 和 `unless-stopped` 策略纳入正式变更评审。
 2. 验证图片/API 文件发送，并调查 WebSocket 未推送新消息事件的问题。
-3. 定义 CF Gateway 的鉴权、消息契约、幂等、重试和审计边界。
+3. 收口 CF Gateway 群聊上下文键、消息契约、幂等、重试和审计边界。
 4. 完成备份恢复演练、版本升级回退演练和长期稳定性验证。
-5. 接入 Hermes Agent 与 Skills，并保持 AI 和企业业务逻辑在入口层之外。
+5. 在已接通 Hermes 文本链路的基础上逐步建设 Skills，并保持企业业务逻辑在入口层
+   之外。
 
 ## 文档
 
