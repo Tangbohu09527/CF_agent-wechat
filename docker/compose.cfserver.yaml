@@ -1,0 +1,79 @@
+name: cf-agent-wechat
+
+services:
+  agent-wechat:
+    image: "${AGENT_WECHAT_IMAGE:?Set AGENT_WECHAT_IMAGE in .env}"
+    container_name: "${AGENT_WECHAT_CONTAINER_NAME:-cf-agent-wechat}"
+    restart: unless-stopped
+
+    security_opt:
+      - seccomp=unconfined
+
+    cap_add:
+      - SYS_PTRACE
+
+    ports:
+      - "${AGENT_WECHAT_BIND_IP:?Set AGENT_WECHAT_BIND_IP in .env}:${AGENT_WECHAT_PORT:-6174}:6174"
+
+    volumes:
+      - type: bind
+        source: "${CF_AGENT_WECHAT_STORAGE_ROOT:-/srv/storage/cf-agent-wechat}/data"
+        target: /data
+        bind:
+          create_host_path: false
+
+      - type: bind
+        source: "${CF_AGENT_WECHAT_STORAGE_ROOT:-/srv/storage/cf-agent-wechat}/wechat-home"
+        target: /home/wechat
+        bind:
+          create_host_path: false
+
+      - type: bind
+        source: "${CF_AGENT_WECHAT_STORAGE_ROOT:-/srv/storage/cf-agent-wechat}/secrets/auth-token"
+        target: /data/auth-token
+        read_only: true
+        bind:
+          create_host_path: false
+
+    environment:
+      AGENT_HOST: "0.0.0.0"
+      AGENT_PORT: "6174"
+      AGENT_DB_PATH: "/data/agent.db"
+
+      # Production mode: keep the internal Xvfb desktop, but do not start
+      # x11vnc, websockify, or noVNC.
+      ENABLE_VNC: "0"
+
+      PROXY: "${PROXY:-}"
+      RUST_LOG: "${RUST_LOG:-info}"
+
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "curl",
+          "--fail",
+          "--silent",
+          "--show-error",
+          "http://127.0.0.1:6174/health"
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 1m30s
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"
+
+    stop_grace_period: 30s
+
+    networks:
+      - cf-internal
+
+networks:
+  cf-internal:
+    external: true
+    name: cf-internal
