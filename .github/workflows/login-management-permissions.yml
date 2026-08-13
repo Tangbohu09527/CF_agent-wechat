@@ -1,0 +1,25 @@
+name: Login management permissions
+
+on:
+  push:
+    paths:
+      - ".github/workflows/login-management-permissions.yml"
+      - "scripts/**"
+      - "tests/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux-permissions:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install venv support
+        run: sudo apt-get update && sudo apt-get install -y python3-venv
+      - name: Run root and ordinary-user integration test
+        run: >-
+          sudo env GITHUB_ACTIONS=true CF_AGENT_WECHAT_PERMISSION_TEST=1
+          bash tests/integration/login_management_permissions.sh

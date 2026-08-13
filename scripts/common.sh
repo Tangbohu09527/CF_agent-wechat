@@ -1,13 +1,17 @@
 #!/usr/bin/env bash
 
 # Shared configuration for the host-side agent-wechat management scripts.
+set +x
+set +a
+
 SCRIPTS_DIR="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 
 API_URL="${API_URL:-http://127.0.0.1:6174}"
 API_URL="${API_URL%/}"
-TOKEN_FILE="${TOKEN_FILE:-/srv/storage/cf-agent-wechat/secrets/auth-token}"
+DEFAULT_TOKEN_FILE="/srv/storage/cf-agent-wechat/secrets/auth-token"
+TOKEN_FILE="${TOKEN_FILE:-$DEFAULT_TOKEN_FILE}"
 SESSION_ID="${SESSION_ID:-default}"
-CONTAINER_NAME="${CONTAINER_NAME:-${AGENT_WECHAT_CONTAINER_NAME:-cf-agent-wechat-lab}}"
+CONTAINER_NAME="${CONTAINER_NAME:-${AGENT_WECHAT_CONTAINER_NAME:-cf-agent-wechat}}"
 
 HTTP_CONNECT_TIMEOUT="${HTTP_CONNECT_TIMEOUT:-5}"
 HTTP_TIMEOUT="${HTTP_TIMEOUT:-45}"
@@ -17,8 +21,14 @@ LOGIN_CONFIRM_INTERVAL="${LOGIN_CONFIRM_INTERVAL:-2}"
 
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 REQUIREMENTS_FILE="${REQUIREMENTS_FILE:-${SCRIPTS_DIR}/requirements.txt}"
-_DEFAULT_DATA_HOME="${XDG_DATA_HOME:-${HOME:-/tmp}/.local/share}"
-VENV_DIR="${CF_AGENT_WECHAT_VENV:-${_DEFAULT_DATA_HOME}/cf-agent-wechat/venv}"
+if [ -n "${XDG_DATA_HOME:-}" ]; then
+  _DEFAULT_DATA_HOME="$XDG_DATA_HOME"
+elif [ -n "${HOME:-}" ]; then
+  _DEFAULT_DATA_HOME="${HOME}/.local/share"
+else
+  _DEFAULT_DATA_HOME=""
+fi
+VENV_DIR="${CF_AGENT_WECHAT_VENV:-${_DEFAULT_DATA_HOME:+${_DEFAULT_DATA_HOME}/cf-agent-wechat/venv}}"
 
 case "$API_URL" in
   http://*) _DEFAULT_WS_URL="ws://${API_URL#http://}/api/ws/login" ;;
@@ -27,7 +37,9 @@ case "$API_URL" in
 esac
 WS_URL="${WS_URL:-${_DEFAULT_WS_URL}}"
 
+unset AUTH_TOKEN
 AUTH_TOKEN=""
+export -n AUTH_TOKEN
 AUTH_STATUS=""
 AUTH_ACCOUNT=""
 LAST_ERROR=""
@@ -88,20 +100,86 @@ validate_configuration() {
 }
 
 load_auth_token() {
-  if [ -L "$TOKEN_FILE" ]; then
-    LAST_ERROR="token 文件不能是符号链接：${TOKEN_FILE}"
-    return 1
-  fi
-  if [ ! -f "$TOKEN_FILE" ]; then
-    LAST_ERROR="token 文件不存在：${TOKEN_FILE}"
-    return 1
-  fi
-  if [ ! -r "$TOKEN_FILE" ]; then
-    LAST_ERROR="token 文件不可读：${TOKEN_FILE}"
-    return 1
+  local token_value token_status
+
+  AUTH_TOKEN=""
+  export -n AUTH_TOKEN
+  if [ -r "$TOKEN_FILE" ]; then
+    if [ -L "$TOKEN_FILE" ]; then
+      LAST_ERROR="token 文件不能是符号链接：${TOKEN_FILE}"
+      return 1
+    fi
+    if [ ! -f "$TOKEN_FILE" ]; then
+      LAST_ERROR="token 路径不是普通文件：${TOKEN_FILE}"
+      return 1
+    fi
+    if ! token_value="$(/bin/cat -- "$TOKEN_FILE")"; then
+      LAST_ERROR="无法读取 token 文件：${TOKEN_FILE}"
+      return 1
+    fi
+  else
+    if [ "$TOKEN_FILE" != "$DEFAULT_TOKEN_FILE" ]; then
+      LAST_ERROR="当前用户无法读取自定义 token 路径；sudo 读取仅允许默认路径：${DEFAULT_TOKEN_FILE}"
+      return 1
+    fi
+    if ! command -v sudo >/dev/null 2>&1; then
+      LAST_ERROR="当前用户无法读取 token，且未安装 sudo：${TOKEN_FILE}"
+      return 1
+    fi
+
+    if token_value="$(
+      sudo -- /bin/sh -c '
+token_file=/srv/storage/cf-agent-wechat/secrets/auth-token
+secrets_dir=/srv/storage/cf-agent-wechat/secrets
+if [ ! -e "$secrets_dir" ]; then
+  exit 41
+fi
+if [ -L "$secrets_dir" ] || [ ! -d "$secrets_dir" ]; then
+  exit 47
+fi
+if [ -L "$token_file" ]; then
+  exit 42
+fi
+if [ ! -e "$token_file" ]; then
+  exit 41
+fi
+if [ ! -f "$token_file" ]; then
+  exit 43
+fi
+if [ ! -r "$token_file" ]; then
+  exit 44
+fi
+if [ "$(/usr/bin/stat -c "%u:%g:%a" "$secrets_dir")" != "0:0:700" ]; then
+  exit 45
+fi
+if [ "$(/usr/bin/stat -c "%u:%g:%a" "$token_file")" != "0:0:600" ]; then
+  exit 46
+fi
+exec /bin/cat -- "$token_file"
+' cf-agent-wechat-token-reader
+    )"; then
+      token_status=0
+    else
+      token_status=$?
+    fi
+    case "$token_status" in
+      0) ;;
+      41) LAST_ERROR="token 文件不存在：${TOKEN_FILE}" ;;
+      42) LAST_ERROR="token 文件不能是符号链接：${TOKEN_FILE}" ;;
+      43) LAST_ERROR="token 路径不是普通文件：${TOKEN_FILE}" ;;
+      44) LAST_ERROR="sudo 无法读取 token 文件：${TOKEN_FILE}" ;;
+      45) LAST_ERROR="secrets 目录必须保持 root:root 700：/srv/storage/cf-agent-wechat/secrets" ;;
+      46) LAST_ERROR="auth-token 必须保持 root:root 600：${TOKEN_FILE}" ;;
+      47) LAST_ERROR="secrets 路径必须是非符号链接目录：/srv/storage/cf-agent-wechat/secrets" ;;
+      *) LAST_ERROR="当前用户无法读取 token，且没有可用的 sudo 权限：${TOKEN_FILE}" ;;
+    esac
+    if [ "$token_status" -ne 0 ]; then
+      return 1
+    fi
   fi
 
-  AUTH_TOKEN="$(<"$TOKEN_FILE")"
+  AUTH_TOKEN="$token_value"
+  export -n AUTH_TOKEN
   if [ -z "$AUTH_TOKEN" ]; then
     LAST_ERROR="token 文件为空：${TOKEN_FILE}"
     return 1
@@ -121,6 +199,8 @@ api_request() {
 
   printf 'Authorization: Bearer %s\nX-Session-Id: %s\n' \
     "$AUTH_TOKEN" "$SESSION_ID" | curl \
+    --disable \
+    --noproxy '*' \
     --request "$method" \
     --fail \
     --silent \
@@ -190,26 +270,91 @@ fetch_auth_status() {
 }
 
 detect_container_status() {
-  local running
+  local inspect_output inspect_status inspect_state error_lower line
 
-  if command -v docker >/dev/null 2>&1; then
-    if running="$(docker inspect --format '{{.State.Running}}' "$CONTAINER_NAME" 2>/dev/null)"; then
-      if [ "$running" = "true" ]; then
-        printf 'running'
-      else
-        printf 'stopped'
-      fi
-      return 0
+  if ! command -v docker >/dev/null 2>&1; then
+    return 1
+  fi
+
+  if inspect_output="$(
+    LC_ALL=C docker inspect --format '{{.State.Running}}' "$CONTAINER_NAME" 2>&1
+  )"; then
+    inspect_status=0
+  else
+    inspect_status=$?
+  fi
+  if [ "$inspect_status" -ne 0 ]; then
+    error_lower="${inspect_output,,}"
+    case "$error_lower" in
+      *permission\ denied*|*access\ denied*|*operation\ not\ permitted*) ;;
+      *) return 1 ;;
+    esac
+    case "$error_lower" in
+      *docker.sock*|*docker\ daemon\ socket*|*docker\ socket*|*connect\ to\ the\ docker\ daemon*) ;;
+      *) return 1 ;;
+    esac
+
+    if ! command -v sudo >/dev/null 2>&1; then
+      return 1
+    fi
+    if ! inspect_output="$(
+      sudo -- docker inspect --format '{{.State.Running}}' "$CONTAINER_NAME" 2>/dev/null
+    )"; then
+      return 1
     fi
   fi
 
-  return 1
+  inspect_state=""
+  while IFS= read -r line; do
+    case "$line" in
+      true|false)
+        if [ -n "$inspect_state" ] && [ "$inspect_state" != "$line" ]; then
+          return 1
+        fi
+        inspect_state="$line"
+        ;;
+    esac
+  done <<< "$inspect_output"
+
+  case "$inspect_state" in
+    true)
+      printf 'running'
+      return 0
+      ;;
+    false)
+      printf 'stopped'
+      return 0
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+validate_venv_location() {
+  if [ -z "$VENV_DIR" ]; then
+    LAST_ERROR="无法确定普通用户 venv 路径；请设置 HOME 或 CF_AGENT_WECHAT_VENV。"
+    return 1
+  fi
+  if [ -e "$VENV_DIR" ] && [ ! -d "$VENV_DIR" ]; then
+    LAST_ERROR="venv 路径不是目录：${VENV_DIR}"
+    return 1
+  fi
+  if [ -d "$VENV_DIR" ] && [ ! -O "$VENV_DIR" ]; then
+    LAST_ERROR="venv 目录不属于当前用户；请修复其所有权：${VENV_DIR}"
+    return 1
+  fi
+  if [ -d "$VENV_DIR" ] && [ ! -w "$VENV_DIR" ]; then
+    LAST_ERROR="venv 目录不可写；请以普通用户修复其所有权：${VENV_DIR}"
+    return 1
+  fi
 }
 
 ensure_login_environment() {
   local requirements_checksum stamp_file current_checksum
 
   if ! resolve_python; then
+    return 1
+  fi
+  if ! validate_venv_location; then
     return 1
   fi
   if [ ! -f "$REQUIREMENTS_FILE" ]; then

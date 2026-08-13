@@ -102,10 +102,9 @@ main() {
   fi
   render_login_response_qr "$login_response"
 
-  if ! "$LOGIN_PYTHON" "$QR_LOGIN_SCRIPT" \
+  if ! printf '%s' "$AUTH_TOKEN" | "$LOGIN_PYTHON" "$QR_LOGIN_SCRIPT" \
     --listen \
     --url "$WS_URL" \
-    --token-file "$TOKEN_FILE" \
     --session-id "$SESSION_ID" \
     --timeout-ms "$LOGIN_TIMEOUT_MS"; then
     return 1

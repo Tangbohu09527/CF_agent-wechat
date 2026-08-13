@@ -11,12 +11,12 @@ import json
 import os
 import shutil
 import sys
-from pathlib import Path
 from typing import Any, Sequence
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 
 NO_QR_DATA = 4
+MAX_TOKEN_BYTES = 8192
 
 
 class LoginToolError(Exception):
@@ -179,16 +179,25 @@ def _read_json_stdin() -> dict[str, Any]:
     return payload
 
 
-def _read_token(token_file: Path) -> str:
-    if token_file.is_symlink():
-        raise LoginToolError(f"token 文件不能是符号链接：{token_file}")
+def _read_token_stdin() -> str:
     try:
-        token = token_file.read_text(encoding="utf-8").strip()
+        raw_token = sys.stdin.buffer.read(MAX_TOKEN_BYTES + 1)
     except OSError as exc:
-        raise LoginToolError(f"无法读取 token 文件：{token_file}") from exc
-    if not token or "\n" in token or "\r" in token:
-        raise LoginToolError("token 文件必须只包含一行非空 token。")
-    return token
+        raise LoginToolError("无法从标准输入读取 token。") from exc
+    if len(raw_token) > MAX_TOKEN_BYTES:
+        raise LoginToolError("token 长度超过安全限制。")
+    if not raw_token:
+        raise LoginToolError("标准输入中没有 token。")
+    if b"\n" in raw_token or b"\r" in raw_token:
+        raise LoginToolError("token 必须只包含一行非空内容。")
+    try:
+        return raw_token.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise LoginToolError("token 不是有效的 UTF-8 文本。") from exc
+
+
+def _redact_token(value: object, token: str) -> str:
+    return str(value).replace(token, "[REDACTED]")
 
 
 def _login_url(url: str, timeout_ms: int) -> str:
@@ -208,7 +217,7 @@ def _event_message(event: dict[str, Any]) -> str:
 
 def listen_for_login(
     url: str,
-    token_file: Path,
+    token: str,
     session_id: str,
     timeout_ms: int,
 ) -> None:
@@ -219,7 +228,6 @@ def listen_for_login(
             "缺少 websocket-client，请通过 requirements.txt 安装依赖。"
         ) from exc
 
-    token = _read_token(token_file)
     headers = [
         f"Authorization: Bearer {token}",
         f"X-Session-Id: {session_id}",
@@ -231,9 +239,12 @@ def listen_for_login(
             _login_url(url, timeout_ms),
             header=headers,
             timeout=socket_timeout,
+            http_no_proxy=["*"],
         )
     except Exception as exc:
-        raise LoginToolError(f"无法连接登录 WebSocket：{exc}") from exc
+        raise LoginToolError(
+            f"无法连接登录 WebSocket：{_redact_token(exc, token)}"
+        ) from exc
 
     terminal_event = False
     try:
@@ -241,7 +252,9 @@ def listen_for_login(
             try:
                 raw_event = connection.recv()
             except Exception as exc:
-                raise LoginToolError(f"读取登录事件失败：{exc}") from exc
+                raise LoginToolError(
+                    f"读取登录事件失败：{_redact_token(exc, token)}"
+                ) from exc
             if raw_event in (None, "", b""):
                 break
             if isinstance(raw_event, bytes):
@@ -259,7 +272,7 @@ def listen_for_login(
 
             event_type = event.get("type")
             if event_type == "status":
-                message = _event_message(event)
+                message = _redact_token(_event_message(event), token)
                 if "navigat" in message.lower() or "login flow" in message.lower():
                     print("正在启动微信登录流程")
                 elif message:
@@ -281,7 +294,9 @@ def listen_for_login(
                 raise LoginToolError("登录超时，请重新执行 ./scripts/login.sh。")
             elif event_type == "error":
                 terminal_event = True
-                message = _event_message(event) or "agent-wechat 返回未知错误。"
+                message = _redact_token(
+                    _event_message(event) or "agent-wechat 返回未知错误。", token
+                )
                 raise LoginToolError(f"登录失败：{message}")
     finally:
         connection.close()
@@ -304,7 +319,6 @@ def parse_args() -> argparse.Namespace:
         help="连接登录 WebSocket 并处理登录事件。",
     )
     parser.add_argument("--url", help="登录 WebSocket URL。")
-    parser.add_argument("--token-file", type=Path, help="认证 token 文件路径。")
     parser.add_argument("--session-id", default="default", help="agent-wechat session ID。")
     parser.add_argument("--timeout-ms", type=int, default=300000, help="登录超时毫秒数。")
     return parser.parse_args()
@@ -314,11 +328,12 @@ def main() -> int:
     args = parse_args()
 
     if args.listen:
-        if not args.url or not args.token_file:
-            raise LoginToolError("--listen 需要 --url 和 --token-file。")
+        if not args.url:
+            raise LoginToolError("--listen 需要 --url。")
         if args.timeout_ms <= 0:
             raise LoginToolError("--timeout-ms 必须大于 0。")
-        listen_for_login(args.url, args.token_file, args.session_id, args.timeout_ms)
+        token = _read_token_stdin()
+        listen_for_login(args.url, token, args.session_id, args.timeout_ms)
         return 0
 
     if args.render_json:

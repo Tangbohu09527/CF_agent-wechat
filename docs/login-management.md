@@ -14,21 +14,35 @@ Rust agent-server、微信启动逻辑或 Docker 运行方式，也不依赖 VNC
 | 登录 WebSocket | `ws://127.0.0.1:6174/api/ws/login` |
 | auth-token | `/srv/storage/cf-agent-wechat/secrets/auth-token` |
 | session | `default` |
-| 容器名 | `cf-agent-wechat-lab` |
+| 容器名 | `cf-agent-wechat` |
 
-脚本只从 token 文件读取密钥，不会把 token 写入仓库或输出到终端。token 文件不得是
-符号链接。若实际部署目录不同，应显式设置 `TOKEN_FILE`，不要复制或重新生成 token：
+保持部署凭据的限制权限：
+
+```text
+/srv/storage/cf-agent-wechat/secrets             root:root 700
+/srv/storage/cf-agent-wechat/secrets/auth-token  root:root 600
+```
+
+不要通过 `chmod 644`、修改所有者、复制到普通用户目录或写入临时文件来绕过权限。
+脚本应由普通用户执行；普通读取失败时，token 读取动作会请求 `sudo`，并在 root
+权限下区分文件不存在与权限不足。Docker socket 权限不足时，容器状态探测也可能
+定点调用 `sudo docker inspect`。脚本不会修改 token 的权限，也不会把 token 放入
+命令行参数、环境变量、仓库或日志。WebSocket 客户端通过标准输入接收已经读取的
+token，不会再次打开 root-only 文件。token 文件不得是符号链接。
+
+若实际部署目录不同，可显式设置 `TOKEN_FILE`，不要复制或重新生成 token。出于安全
+边界考虑，sudo 读取仅支持上面的默认路径；自定义路径必须让当前普通用户本身可读：
 
 ```bash
 TOKEN_FILE=/actual/deployment/secrets/auth-token ./scripts/status.sh
 ```
 
-## 首次部署与登录
+## 使用方式
 
-在仓库根目录执行：
+在仓库根目录以普通用户执行，不要使用 `sudo ./scripts/status.sh` 或
+`sudo ./scripts/login.sh`：
 
 ```bash
-chmod 755 scripts/common.sh scripts/status.sh scripts/login.sh scripts/qr_login.py
 ./scripts/status.sh
 ./scripts/login.sh
 ```
@@ -37,7 +51,8 @@ chmod 755 scripts/common.sh scripts/status.sh scripts/login.sh scripts/qr_login.
 `scripts/requirements.txt` 安装 `Pillow`、`qrcode` 和 `websocket-client`。它不会
 修改系统 Python。默认 venv 位于
 `${XDG_DATA_HOME:-$HOME/.local/share}/cf-agent-wechat/venv`；受控环境可通过
-`CF_AGENT_WECHAT_VENV` 指定其他位置。
+`CF_AGENT_WECHAT_VENV` 指定其他位置。venv、Python 和 pip 全程以执行脚本的普通
+用户身份运行；脚本不会使用 sudo 安装依赖，并会拒绝复用不属于当前用户的 venv。
 
 登录流程如下：
 
@@ -77,8 +92,10 @@ Account:
 ```
 
 `status.sh` 以认证 API 可达作为服务正在运行的直接证据；Docker CLI 可用时，也会在
-接口失败场景中辅助判断容器是 `running` 还是 `stopped`。接口不可达、鉴权失败或
-响应无法解析时脚本返回非零，不会把故障误报为 `logged_out`。
+接口失败场景中辅助判断容器是 `running` 还是 `stopped`。探测会先执行普通
+`docker inspect`，仅在 Docker socket 权限错误时重试 `sudo docker inspect`，无需把
+执行用户加入 docker 组。接口不可达、鉴权失败或响应无法解析时脚本返回非零，不会
+把故障误报为 `logged_out`。
 
 ## 自动恢复与登录失效
 
