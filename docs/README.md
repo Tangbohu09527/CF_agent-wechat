@@ -1,37 +1,53 @@
-# CF_agent-wechat 文档
+# CF_agent-wechat 文档索引
 
-本目录记录 CF_agent-wechat V1 的边界、部署事实、验证结果、接口和运维要求。
-状态统一使用以下标记：
+本目录按“当前权威资料、生产验证记录、历史实验快照”分层。当前生产基线日期为
+2026-08-13；状态统一使用“已实现并实机验证”“已实现但尚未实机验证”“规划中”。
 
-- **Verified**：仅在本文记录的镜像与测试环境中实际验证通过。
-- **Pending**：已进入计划，但尚未完成验证。
-- **Known Issue**：已知限制、环境差异或需要人工处置的风险。
+## 当前权威资料
 
-`Verified` 不代表生产可用，也不能外推到其他镜像 digest、操作系统或部署方式。
-
-## 文档索引
-
-| 文档 | 用途 |
+| 入口 | 用途 |
 | --- | --- |
-| [00_项目说明.md](00_项目说明.md) | 项目目标、范围、上游依赖和 V1 状态 |
-| [01_架构设计.md](01_架构设计.md) | 当前分层架构、V1 Staging 文本链路和系统边界 |
-| [02_部署记录.md](02_部署记录.md) | 已验证环境、部署基线和运行配置差异 |
-| [03_V1验证计划.md](03_V1验证计划.md) | V1 验证范围、已完成文本闭环和后续验收项 |
-| [04_二开规划.md](04_二开规划.md) | Gateway/Hermes 已完成基线与后续扩展路线 |
-| [05_V1验证结果.md](05_V1验证结果.md) | agent-wechat 单体验证及 V1 Staging 联调结果 |
-| [validation.md](validation.md) | 单体与 V1 Staging 验证矩阵、回归检查命令 |
-| [api.md](api.md) | 已验证 REST/WebSocket 接口及初始化流程 |
-| [troubleshooting.md](troubleshooting.md) | 已知故障、原因、处理和复核方式 |
-| [operations.md](operations.md) | 日常运维、备份恢复、升级与交接清单 |
-| [../docker/README.md](../docker/README.md) | Docker 部署操作手册 |
+| [项目说明](00_项目说明.md) | 项目职责、边界、当前状态与安全口径 |
+| [架构设计](01_架构设计.md) | 容器内 Xvfb 链路、组件职责与 Gateway 调用关系 |
+| [CFserver 正式部署](deployment/cfserver-production.md) | 正式 Compose、目录、权限、启停、重建、重启检查和回滚 |
+| [微信登录管理](login-management.md) | `status.sh`、`login.sh`、返回码、权限模型和登录验证矩阵 |
+| [API 边界](api.md) | agent-server 当前生产端点、登录接口和历史能力边界 |
+| [生产运维](operations.md) | 日常检查、启停、备份恢复、升级与交接 |
+| [故障排查](troubleshooting.md) | 容器、健康、Token、登录、进程与项目边界排查 |
+
+> **生产警告：不得在 CFserver 上执行不带 `-f` 的
+> `docker compose down`。** 正式命令必须显式指定
+> `docker/compose.cfserver.yaml`。
+
+## 验证记录
+
+| 入口 | 用途 |
+| --- | --- |
+| [验证总览](validation.md) | 当前三态矩阵、准确表述和回归要求 |
+| [2026-08-13 CFserver 生产验证](validation/2026-08-13-cfserver-production.md) | 当前生产基线的脱敏实机记录 |
+
+## 历史实验记录
+
+以下文件已封存。它们可能包含 VNC/noVNC、x11vnc、XFCE、宿主桌面或旧 Compose
+步骤，均属于历史实验、已废弃、非当前生产方案：
+
+| 入口 | 历史用途 |
+| --- | --- |
+| [02 部署记录](02_部署记录.md) | 早期实验部署与桌面调试记录 |
+| [03 V1 验证计划](03_V1验证计划.md) | 当时的 V1 验证计划 |
+| [04 二开规划](04_二开规划.md) | 当时的扩展规划快照 |
+| [05 V1 验证结果](05_V1验证结果.md) | 早期固定环境的能力验证结果 |
+| [Docker 实验室手册](../docker/README.md) | `docker/docker-compose.yml` 的实验室资料 |
+
+历史记录不得作为 CFserver 生产 runbook。当前事实发生冲突时，以
+[2026-08-13 CFserver 生产验证](validation/2026-08-13-cfserver-production.md) 和
+[CFserver 正式部署](deployment/cfserver-production.md) 为准。
 
 ## 维护规则
 
-1. 镜像升级必须记录 tag、digest、验证环境和回退基线。
-2. 新能力只有完成实际测试后才能从 `Pending` 改为 `Verified`。
-3. API 行为变化时同步更新 `api.md`、验证记录和调用方契约。
-4. 单体入口能力和系统端到端能力必须分别标记，文件识别不得写成文件处理完成。
-5. 部署逻辑与验证环境不一致时必须记录为 `Known Issue`，不能只记录成功结论。
-6. 文档不得包含 auth-token、聊天内容、联系人数据、二维码或私有主机信息。
-
-文档基线更新日期：2026-08-04。
+1. 新验证结论必须记录日期、Commit、环境、动作、结果和未验证范围。
+2. 只有实机通过后，状态才能改为“已实现并实机验证”。
+3. 当前部署命令只维护在生产部署与运维文档，其他页面链接到权威入口。
+4. Gateway 只描述调用关系，不在本仓库展开其内部权限或 Hermes 实现。
+5. 文档不得包含真实账号、联系人、聊天标识、服务器 IP、二维码、Token、指纹、
+   API Key、密码或本地 Windows 绝对路径。

@@ -1,160 +1,129 @@
 # CF_agent-wechat
 
-## 项目介绍
+CF_agent-wechat 是企业 AI 自动化体系的微信入口项目，负责运行 WeChat Linux
+客户端与 agent-server，提供登录管理、消息接口、CFserver 生产部署和本项目运维资料。
+本项目不负责 AI 推理、Gateway 内部权限、Hermes 调度或企业业务逻辑。
 
-CF_agent-wechat 是企业 AI 自动化系统的微信入口层。本仓库负责固化
-agent-wechat 的部署基线、验证结论和企业集成边界，不包含上游源码，也不承载
-AI 推理或企业业务逻辑。
+> **当前生产状态（2026-08-13）：** CFserver 正式部署已运行并完成实机验证。
+> 微信入口、登录管理、消息接口和 Gateway 网络访问已完成实机验证。
 
-> 当前状态：V1 技术验证已完成。本文中的 `Verified` 仅表示指定测试环境和固定
-> 镜像基线已通过验证，不表示生产可用。
+## 当前生产架构
 
-## 架构定位
+CFserver 正式容器为 `cf-agent-wechat`，由
+`docker/compose.cfserver.yaml` 管理。容器内部运行：
 
 ```text
-员工微信
-    ↓
-agent-wechat
-    ↓
-CF Gateway
-    ↓
-Hermes Agent
-    ↓
-Skills（后续阶段）
-    ↓
-企业系统
+Xvfb (:99, 1280x800x24)
+  -> fluxbox / dunst
+  -> WeChat Linux 客户端
+  -> agent-server (:6174)
+  -> CF_agent-gateway
 ```
 
-agent-wechat 负责微信账号运行、消息收发、联系人和聊天管理、图片或文件入口，
-以及微信事件转发。它不负责 AI 推理、Skill 执行、ERP 操作或企业业务逻辑。
-V1 Staging 已由 CF Gateway 接通微信文本消息、Hermes 调用和微信回复回传；Skills
-及企业系统执行仍属于后续阶段。
+生产环境固定 `ENABLE_VNC=0`，使用容器内部 `DISPLAY=:99`。VNC、noVNC、
+x11vnc、websockify、宿主桌面 X11 挂载、宿主 XFCE 和 RDP 均不在当前生产链路中，
+也不需要登录 CFserver 桌面操作微信。
 
-## 环境要求
+`CF_agent-gateway` 通过外部 Docker 网络 `cf-internal` 访问：
 
-已验证基线：
+```text
+http://cf-agent-wechat:6174
+```
 
-| 项目 | 基线 |
-| --- | --- |
-| 虚拟化 | VMware Workstation |
-| 操作系统 | Debian 13 Trixie |
-| Linux kernel | 6.12 |
-| 容器运行时 | Docker CE / Docker Engine 29.x |
-| Compose | Docker Compose v2 |
-| agent-wechat 镜像 | `ghcr.io/thisnick/agent-wechat:0.11.15` |
-| 镜像固定方式 | `ghcr.io/thisnick/agent-wechat@sha256:<verified-digest>` |
+Gateway 是本项目的调用方；其内部权限与上层编排属于另一个项目边界，本文档不展开。
 
-建议至少提供 2 CPU、2 GB RAM 和 10 GB 可用磁盘。端口、权限和持久化要求见
-[Docker 部署手册](docker/README.md)。
+## 正式部署入口
 
-## 快速部署
+生产代码目录：
 
-以下命令用于新的 Debian 部署目录。不要把真实 token、`.env` 或运行数据提交到
-Git；已有数据恢复时，必须同时恢复 `data/` 和 `secrets/auth-token`，不要生成
-新 token。
+```text
+/opt/cf-agent-wechat
+```
+
+所有正式 Compose 操作必须显式指定生产文件：
 
 ```bash
-cd docker
-cp -n .env.example .env
-mkdir -p data wechat-home secrets backups
-test -z "$(find data -mindepth 1 -print -quit)" && \
-  (umask 077; set -o noclobber; openssl rand -hex 32 > secrets/auth-token)
-
-docker pull ghcr.io/thisnick/agent-wechat:0.11.15
-docker image inspect --format '{{index .RepoDigests 0}}' \
-  ghcr.io/thisnick/agent-wechat:0.11.15
+cd /opt/cf-agent-wechat
+sudo docker compose -f docker/compose.cfserver.yaml ps
+sudo docker compose -f docker/compose.cfserver.yaml up -d
+sudo docker compose -f docker/compose.cfserver.yaml logs
+sudo docker compose -f docker/compose.cfserver.yaml down
 ```
 
-将输出的完整 digest 写入 `.env` 的 `AGENT_WECHAT_IMAGE`，然后执行：
+> **警告：不得在 CFserver 上误用不带 `-f` 的
+> `docker compose down`。**
+>
+> `docker/docker-compose.yml` 是实验室或验证配置，不是 CFserver 正式配置。
+
+完整生命周期操作、目录、权限、重建和回滚要求见
+[CFserver 正式部署](docs/deployment/cfserver-production.md)。
+
+## 登录管理
+
+通过 SSH 进入 CFserver 后，以普通用户执行：
 
 ```bash
-chmod 700 data wechat-home secrets backups
-chmod 600 secrets/auth-token
-chmod 755 preflight.sh
-./preflight.sh
-docker compose --env-file .env config
-docker compose --env-file .env up -d
+cd /opt/cf-agent-wechat
+./scripts/status.sh
+./scripts/login.sh
 ```
 
-仓库 Compose 基线仍使用 `restart: "no"`。验证环境的自动恢复结论来自
-`restart: unless-stopped`；两者差异和 VNC 修复依赖见
-[验证记录](docs/validation.md#运行时配置差异)。
+- `status.sh` 区分 `logged_in`、`logged_out`、`app_not_running` 和不可用状态。
+- 已登录时，`login.sh` 会短路成功，不重复触发登录。
+- 未登录时，`login.sh` 启动 HTTP/WebSocket 登录流程并等待手机操作。
+- 默认登录工具 venv 位于 `~/.local/share/cf-agent-wechat/venv`。
+- 普通用户通过受控 sudo 读取 root-only Token；不得放宽 Token 权限。
 
-## 验证方式
+生产 Token 权限必须保持：
 
-```bash
-docker compose --env-file .env ps
-curl --fail --silent --show-error http://127.0.0.1:6174/health
-
-TOKEN="$(cat secrets/auth-token)"
-curl --fail --silent --show-error \
-  -H "Authorization: Bearer ${TOKEN}" \
-  http://127.0.0.1:6174/api/status/auth
-unset TOKEN
+```text
+/srv/storage/cf-agent-wechat/secrets             root:root 700
+/srv/storage/cf-agent-wechat/secrets/auth-token  root:root 600
 ```
 
-微信 GUI 登录不等于 agent-wechat 初始化完成。首次初始化必须连接
-`/api/ws/login`，完成 login flow，等待 `login_success` 并取得 `userId`；之后才将
-联系人、聊天和消息 API 判定为可用。Docker 重启后微信客户端需要重新登录，并应
-通过 `/api/status/auth` 复核 `status=logged_in`。完整步骤见
-[API 文档](docs/api.md)。
+禁止执行 `chmod 644 auth-token`。详细流程、返回码和安全模型见
+[微信登录管理](docs/login-management.md)。
 
-## 当前状态
+## 验证边界
 
-### Verified
+### 已实现并实机验证
 
-- Debian 13 环境部署、Docker/Compose 启动、镜像 digest 固定和容器健康检查。
-- auth-token 配置及 Bearer 认证。
-- 宿主机重启后容器、agent-wechat 和 VNC 恢复（验证环境配置）。
-- `/api/status/auth` 登录状态查询。
-- 按 `chatId` 发送文本，以及包含发送者、内容和时间等字段的消息读取。
-- agent-wechat 入口侧 `txt`、`zip` 文件消息识别和 Base64 获取。
-- 群消息、发送者、群文件以及文本/文件引用上下文读取。
-- 群聊合并转发消息的外层识别、发送者识别和标题读取；内部解析待增强。
-- V1 Staging 通过 Gateway Polling 完成“微信文本消息 → 身份与权限准入 → AIThread
-  → Hermes → 微信文本回复”闭环。
-- Gateway 调用 `POST /api/messages/send` 使用 `{"chatId":"...","text":"..."}`，
-  并在 Polling 层过滤自身消息、推进 checkpoint，避免回复回环。
+- `docker/compose.cfserver.yaml` 配置校验、正式容器启动和健康状态。
+- 容器内 Xvfb `1280x800x24`、`DISPLAY=:99`、fluxbox、dunst、WeChat 和
+  agent-server 运行正常。
+- `ENABLE_VNC=0`，且 x11vnc、websockify 不存在。
+- 普通用户运行 `status.sh` 与 `login.sh`，包括登录状态识别、已登录短路、
+  未登录流程、手机确认、WebSocket 成功事件和登录后状态复核。
+- Docker socket 无权限时的 `sudo docker inspect` fallback、root-only Token
+  受控读取和普通用户 venv 创建。
+- 登录后 90 秒稳定性，健康监控未终止微信进程。
+- Gateway 经 `cf-internal` 访问 `/health`、`/api/status/auth`、
+  `/api/chats` 和 `/api/messages/{chat_id}`。
 
-### Pending
+### 已实现但尚未实机验证
 
-- 图片理解、图片附件传递、文件消息端到端处理、OCR 和压缩包内容解析。
-- 图片发送与通过 API 发送文件。
-- `/api/ws/events` 实时消息事件；连接已建立，但未观察到新消息推送。
-- 企业知识库、Skill 自动执行和生产环境自动部署。
+- 完全新设备在 SSH 终端显示二维码、手机扫码并完成登录。
 
-agent-wechat 单体能够识别并获取部分文件消息，不表示 Gateway 已完成附件传递、文件
-处理或压缩包解析。
+当前实机验证通过的是“已信任设备 -> 手机确认 -> 登录成功”。不得把新设备二维码
+场景写成已验证，也不得据此推导上层 AI 链路已经完成。
 
-### Known Issue
+### 规划中或不在本次验证范围
 
-- 默认 VNC 启动状态不稳定，验证环境依赖 `docker/fix-vnc.sh` 和
-  `cf-wechat-vnc-fix.service` 恢复 interactive x11vnc。
-- 上述 VNC 运维资产尚未纳入当前仓库；重建环境前必须从受控部署记录取得。
-- 仓库 Compose 的重启策略与已验证环境存在差异，不能直接据此声明自动恢复。
-- Docker 重启后微信客户端需要重新登录。
-- 群聊目标上下文应按 `bot + group + sender` 隔离；Gateway V1 当前仍按 whole-room
-  聚合，是已知实现偏差，不代表最终上下文模型。
+历史消息能力、媒体处理和上层自动化的状态以各自验证记录为准。Gateway 内部权限、
+Hermes 和企业业务逻辑不属于本项目的实现与运维边界。
 
-## Roadmap
-
-1. 将 VNC 修复脚本、systemd unit 和 `unless-stopped` 策略纳入正式变更评审。
-2. 验证图片/API 文件发送，并调查 WebSocket 未推送新消息事件的问题。
-3. 收口 CF Gateway 群聊上下文键、消息契约、幂等、重试和审计边界。
-4. 完成备份恢复演练、版本升级回退演练和长期稳定性验证。
-5. 在已接通 Hermes 文本链路的基础上逐步建设 Skills，并保持企业业务逻辑在入口层
-   之外。
-
-## 文档
+## 文档入口
 
 - [文档索引](docs/README.md)
+- [项目说明](docs/00_项目说明.md)
 - [架构设计](docs/01_架构设计.md)
-- [部署记录](docs/02_部署记录.md)
-- [V1 验证结果](docs/05_V1验证结果.md)
-- [V1 回归矩阵](docs/validation.md)
-- [API 文档](docs/api.md)
+- [CFserver 正式部署](docs/deployment/cfserver-production.md)
+- [微信登录管理](docs/login-management.md)
+- [API 边界](docs/api.md)
+- [生产运维](docs/operations.md)
 - [故障排查](docs/troubleshooting.md)
-- [运维与交接](docs/operations.md)
+- [验证总览](docs/validation.md)
+- [2026-08-13 CFserver 生产验证](docs/validation/2026-08-13-cfserver-production.md)
 
-上游项目：<https://github.com/thisnick/agent-wechat>。上游源码不属于本仓库；使用
-前应独立确认其许可证和授权条件。
+上游镜像项目为 [thisnick/agent-wechat](https://github.com/thisnick/agent-wechat)。
+上游源码不属于本仓库；升级镜像前应独立确认许可、版本兼容性与回滚基线。
