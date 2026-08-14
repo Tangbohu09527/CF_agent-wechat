@@ -100,20 +100,67 @@ Token 目录及文件权限必须保持：
 cd /opt/cf-agent-wechat
 ```
 
+## 生产环境变量输入
+
+生产环境变量文件是宿主机上的 Docker Compose **渲染输入**：Compose 在创建容器前
+用它和当前 shell 环境替换 `compose.cfserver.yaml` 中的 `${...}`。其中镜像、容器名、
+宿主端口发布和持久化根目录会改变渲染后的 Compose 模型；`PROXY`、`RUST_LOG` 会
+进一步作为容器环境变量传入。该文件不是 agent-server 的 Token 存储。
+
+按本文命令从 `/opt/cf-agent-wechat` 执行且未显式传入 `--env-file` 时，Compose
+按照自身优先级读取当前 shell 环境和工作目录中的默认 `.env`。若生产运维使用受控的
+`--env-file`，校验、启动、重建和回滚必须始终选择同一份受控文件，不能混用输入源。
+生产变量文件及其实值不进入 Git，也不得粘贴到公开文档或工单。
+
+| 变量 | 要求与默认值 | 对生产 Compose 的作用 |
+| --- | --- | --- |
+| `AGENT_WECHAT_IMAGE` | 必填 | 选择运行镜像；必须使用经批准、可追溯的不可变镜像引用，例如受控 digest，不能使用 `latest` |
+| `AGENT_WECHAT_BIND_IP` | 必填，无默认值 | 决定 6174 端口发布到宿主机的哪个地址；当前生产实值不在公共文档中记录 |
+| `AGENT_WECHAT_PORT` | 可选，默认 `6174` | 决定宿主机发布端口；容器内 agent-server 端口仍固定为 `6174` |
+| `AGENT_WECHAT_CONTAINER_NAME` | 可选，默认 `cf-agent-wechat` | 决定正式容器名 |
+| `CF_AGENT_WECHAT_STORAGE_ROOT` | 可选，默认 `/srv/storage/cf-agent-wechat` | 作为 `data`、`wechat-home` 和 `secrets/auth-token` 三个宿主 bind mount 的根目录 |
+| `PROXY` | 可选，默认空 | 原样传入容器；若值含认证信息，必须按敏感配置保护 |
+| `RUST_LOG` | 可选，默认 `info` | 设置 agent-server 日志过滤级别；提高详细度前应评估敏感信息暴露风险 |
+
+容器内 `AGENT_HOST=0.0.0.0`、`AGENT_PORT=6174`、`AGENT_DB_PATH=/data/agent.db` 和
+`ENABLE_VNC=0` 由生产 Compose 固定，不是生产变量文件中的可选开关。Token 始终是
+宿主机上的 root-only 文件，通过 `/data/auth-token` 只读挂载，禁止写入 `.env`。
+
+> [!WARNING]
+> `docker/.env.example` 是 `cf-wechat-lab` 实验模板，其中包含实验室项目名、
+> `cf-agent-wechat-lab` 容器名、实验回环绑定和 `ENABLE_VNC=1`。不得将它直接复制
+> 为 CFserver 生产配置，也不得据此推断任何当前生产变量值。
+
+脚本请求地址、宿主发布和容器网络是三个独立层次：
+
+- `status.sh`、`login.sh` 的 `API_URL` 默认值是 `http://127.0.0.1:6174`；
+- 宿主发布地址由 `AGENT_WECHAT_BIND_IP` 与 `AGENT_WECHAT_PORT` 决定；
+- Gateway 经 `cf-internal` 使用 `http://cf-agent-wechat:6174`。
+
+不得根据脚本 `API_URL` 推断宿主发布地址。是否将宿主发布地址收紧到
+`127.0.0.1` 是独立的待评审安全项；本文不声明当前绑定值，也不修改真实部署。
+
+使用与实际部署相同的环境输入进行静默渲染校验：
+
+```bash
+cd /opt/cf-agent-wechat
+sudo docker compose -f docker/compose.cfserver.yaml config --quiet
+```
+
+若生产流程显式使用 `--env-file`，在上述命令中加入同一受控文件。`config --quiet`
+只验证解析与变量插值，不输出渲染结果，也不会读取或打印 `auth-token` 内容。不要为
+排查方便执行 `cat .env`、`cat auth-token`，或把完整环境与完整 Compose 渲染结果
+粘贴到日志、工单或公共文档。
+
 ## 首次部署前检查
 
 1. 确认当前代码版本是计划部署的提交。
-2. 确认 `docker/compose.cfserver.yaml` 存在且 Compose 配置可解析。
+2. 确认 `docker/compose.cfserver.yaml` 存在，并已使用与部署相同的环境输入通过
+   `config --quiet`。
 3. 确认 `data/`、`wechat-home/` 和 `secrets/auth-token` 已按生产目录挂载。
 4. 确认 Token 目录和文件所有者、权限分别为 `root:root 700`、
    `root:root 600`。
 5. 确认外部 Docker 网络 `cf-internal` 已存在。
-
-校验 Compose：
-
-```bash
-sudo docker compose -f docker/compose.cfserver.yaml config
-```
 
 检查统一网络：
 
@@ -161,7 +208,7 @@ sudo docker compose -f docker/compose.cfserver.yaml down
 
 ```bash
 cd /opt/cf-agent-wechat
-sudo docker compose -f docker/compose.cfserver.yaml config
+sudo docker compose -f docker/compose.cfserver.yaml config --quiet
 sudo docker compose -f docker/compose.cfserver.yaml pull agent-wechat
 sudo docker compose -f docker/compose.cfserver.yaml up -d --force-recreate agent-wechat
 sudo docker compose -f docker/compose.cfserver.yaml ps

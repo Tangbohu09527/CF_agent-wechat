@@ -17,12 +17,24 @@ VNC、noVNC、RDP 和宿主桌面登录均为历史实验路径，已废弃，�
 
 | 配置 | 默认值 | 说明 |
 | --- | --- | --- |
-| HTTP API | `http://127.0.0.1:6174` | CFserver 本机访问 agent-server |
-| 登录 WebSocket | `ws://127.0.0.1:6174/api/ws/login` | 接收登录事件 |
+| HTTP API | `http://127.0.0.1:6174` | `status.sh`、`login.sh` 的默认请求地址 |
+| 登录 WebSocket | `ws://127.0.0.1:6174/api/ws/login` | 登录脚本默认连接地址 |
 | Token 文件 | `/srv/storage/cf-agent-wechat/secrets/auth-token` | root-only 认证凭据 |
 | Session | `default` | 请求使用的 session 标识 |
 | 容器名 | `cf-agent-wechat` | 辅助判断容器是否运行 |
 | 登录工具 venv | `~/.local/share/cf-agent-wechat/venv` | 普通用户拥有的隔离环境 |
+
+必须区分三类访问路径：
+
+- `status.sh` 和 `login.sh` 默认请求 `http://127.0.0.1:6174`；这是脚本的
+  `API_URL` 默认值，`WS_URL` 默认由它派生。
+- Docker 在宿主机上的发布地址由生产 Compose 的必填变量
+  `AGENT_WECHAT_BIND_IP` 决定，发布端口由 `AGENT_WECHAT_PORT` 决定。
+- Gateway 不使用脚本默认地址，而是经 `cf-internal` 访问
+  `http://cf-agent-wechat:6174`。
+
+不得根据脚本的 `API_URL` 推断 Docker 的宿主发布地址；本文也不记录或虚构当前
+生产环境的 `AGENT_WECHAT_BIND_IP` 实值。
 
 ## 状态检查
 
@@ -231,7 +243,10 @@ sudo docker compose -f docker/compose.cfserver.yaml logs --tail=200
 | `CF_AGENT_WECHAT_VENV` | 登录工具 venv 路径 |
 | `QR_MAX_WIDTH` | 终端二维码最大宽度，最小为 21 |
 
-服务默认只通过 CFserver 回环地址访问。不要把 6174 直接暴露到公网，也不要在命令、日志或文档中写入认证凭据。
+`API_URL` 和 `WS_URL` 只改变登录脚本的请求目标，不会修改 Docker 端口发布。
+不要把 6174 直接暴露到公网，也不要在命令、日志或文档中写入认证凭据。是否将
+宿主发布地址收紧到 `127.0.0.1` 应作为独立安全项评审；本次文档修订不假定当前
+绑定值，也不修改真实部署。
 
 ## 2026-08-13 实机验证矩阵
 

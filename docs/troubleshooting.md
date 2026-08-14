@@ -213,10 +213,11 @@ sudo docker exec cf-agent-wechat ps -ef |
 ```bash
 sudo docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' \
   cf-agent-wechat | grep '^ENABLE_VNC='
-sudo docker compose -f docker/compose.cfserver.yaml config
+sudo docker compose -f docker/compose.cfserver.yaml config --quiet
 ```
 
-预期为 `ENABLE_VNC=0`。不要在公开故障单中粘贴未经检查的完整环境变量输出。
+预期为 `ENABLE_VNC=0`，且静默 Compose 校验成功。不要在公开故障单中粘贴未经
+检查的完整环境变量或 Compose 渲染输出。
 
 ## Gateway 或 Hermes 问题不属于本项目边界
 

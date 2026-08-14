@@ -1,8 +1,15 @@
 # CF_agent-wechat Docker 部署手册
 
+> [!CAUTION]
+> **V1 实验室部署，已废弃，非 CFserver 当前生产方案。**
+> 本文包含 VNC/noVNC 等历史实验步骤，严禁在 CFserver 上作为生产 runbook 使用。
+> 当前生产入口为
+> [CFserver 正式部署](../docs/deployment/cfserver-production.md)。
+
 本目录提供 V1 容器部署基线。镜像 `ghcr.io/thisnick/agent-wechat:0.11.15` 已在
 Debian 13 环境完成基础部署和 API 验证，但仓库 Compose 与验证环境在重启策略和
-VNC 修复资产上仍有差异。详细结论见 [V1 验证记录](../docs/validation.md)。
+VNC 修复资产上仍有差异。详细结论见
+[V1 验证记录](../docs/05_V1验证结果.md)。
 
 ## 文件
 
@@ -37,7 +44,7 @@ UID 为 `1000`；每次升级 digest 后重新确认。
 ## 网络与安全
 
 - 服务监听容器内 `0.0.0.0:6174`。
-- 默认发布到宿主机 `127.0.0.1:6174`。
+- 本 V1 实验模板将服务发布到宿主机 `127.0.0.1:6174`。
 - noVNC 通过 `/vnc/` 访问，不对外开放 5900 或 6080。
 - 服务没有 TLS；远程访问使用 SSH 隧道。
 - 不得把 6174 暴露到公网。
