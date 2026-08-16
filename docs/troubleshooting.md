@@ -229,6 +229,17 @@ sudo docker compose -f docker/compose.cfserver.yaml config --quiet
 - agent-server 健康、认证、聊天和消息接口正常。
 - 容器已加入 `cf-internal`。
 
+### 消息可读但没有 AI 回复
+
+若容器为 `healthy`、`status.sh` 为 `logged_in`，且目标微信消息可以通过
+`GET /api/messages/{chat_id}` 读取，但机器人没有 AI 回复，应把问题转交
+Gateway/Hermes 下游链路排查。这组现象说明微信入口和 agent-wechat 读取链路正常，
+不能据此判定微信登录失败。
+
+不要为此重装 agent-wechat、重新登录微信、替换 Token 或修改生产 Compose。先保留
+去敏的健康、登录和消息可读证据；本项目只负责完成边界确认，不记录下游数据库或
+AI 服务的内部修复过程。
+
 若这些检查正常，但 Gateway 的权限、路由、轮询、消息存储或 Hermes 调度失败，应转交
 对应项目排查。本仓库文档不提供 Gateway/Hermes 内部修复步骤，也不要为处理其故障而
 修改本项目 Token、微信数据或生产 Compose。

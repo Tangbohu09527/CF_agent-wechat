@@ -1,7 +1,9 @@
 # CF_agent-wechat 文档索引
 
-本目录按“当前权威资料、生产验证记录、历史实验快照”分层。当前生产基线日期为
-2026-08-13；状态统一使用“已实现并实机验证”“已实现但尚未实机验证”“规划中”。
+本目录按“当前权威资料、生产验证记录、历史实验快照”分层。部署与登录生产基线日期为
+2026-08-13，最新消息与媒体生产证据日期为 2026-08-14；状态区分“已实现并
+实机验证”“已实现但尚未实机验证”“规划中”。证据不足以判断实现状态时，只写
+“尚未完成生产实机验证”，不强行归类。
 
 ## 当前权威资料
 
@@ -23,8 +25,9 @@
 
 | 入口 | 用途 |
 | --- | --- |
-| [验证总览](validation.md) | 当前三态矩阵、准确表述和回归要求 |
-| [2026-08-13 CFserver 生产验证](validation/2026-08-13-cfserver-production.md) | 当前生产基线的脱敏实机记录 |
+| [验证总览](validation.md) | 当前状态矩阵、准确表述和回归要求 |
+| [2026-08-13 CFserver 生产验证](validation/2026-08-13-cfserver-production.md) | 部署、登录和基础接口的脱敏实机记录 |
+| [2026-08-14 消息与媒体生产验证](validation/2026-08-14-message-media-production.md) | 文本发送、群消息字段、引用和图片 media 的脱敏实机记录 |
 
 ## 历史实验记录
 
@@ -40,7 +43,7 @@
 | [Docker 实验室手册](../docker/README.md) | `docker/docker-compose.yml` 的实验室资料 |
 
 历史记录不得作为 CFserver 生产 runbook。当前事实发生冲突时，以
-[2026-08-13 CFserver 生产验证](validation/2026-08-13-cfserver-production.md) 和
+[验证总览](validation.md)、对应日期的生产验证记录和
 [CFserver 正式部署](deployment/cfserver-production.md) 为准。
 
 ## 维护规则

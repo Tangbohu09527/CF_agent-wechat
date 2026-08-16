@@ -347,3 +347,7 @@ CFserver 生产环境需要桌面登录。
 
 完全新设备通过 SSH 终端显示二维码并扫码登录尚未完成实机验证。验证记录见
 [2026-08-13 CFserver 生产验证](../validation/2026-08-13-cfserver-production.md)。
+
+2026-08-14 新增的文本发送、群消息字段、引用和图片 media 证据见
+[2026-08-14 消息与媒体生产验证](../validation/2026-08-14-message-media-production.md)；
+合并后的当前状态见 [验证总览](../validation.md)。
