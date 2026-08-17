@@ -14,6 +14,16 @@ fi
 
 if [ "${CF_AUDIT_DOCKER_RUNTIME_MOCK:-}" = "1" ]; then
   case "${1:-}" in
+    info|compose|exec|inspect)
+      if [ "${CF_AUDIT_DOCKER_VIA_SUDO:-0}" != "1" ]; then
+        printf '%s\n' \
+          'permission denied while connecting to docker.sock' >&2
+        exit 1
+      fi
+      ;;
+  esac
+
+  case "${1:-}" in
     info)
       exit 0
       ;;

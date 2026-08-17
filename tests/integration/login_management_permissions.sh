@@ -176,6 +176,47 @@ assert_docker_fallback_order() {
     fail "Docker inspect order was not ordinary then sudo"
 }
 
+assert_runtime_mock_requires_sudo() {
+  local label="$1"
+  local error_file
+  shift
+  error_file="${TEST_ROOT}/runtime-docker-${label}.error"
+
+  if "$REAL_SUDO" -u "$TEST_USER" -H env \
+    PATH="$AUDIT_PATH" \
+    CF_AUDIT_LOG="$AUDIT_LOG" \
+    CF_AUDIT_REAL_DOCKER="$REAL_DOCKER" \
+    CF_AUDIT_DOCKER_RUNTIME_MOCK=1 \
+    CF_AUDIT_DOCKER_VIA_SUDO=0 \
+    docker "$@" > /dev/null 2> "$error_file"; then
+    fail "bare runtime Docker ${label} unexpectedly succeeded"
+  fi
+  if ! grep -Eqi \
+    'permission denied.*docker[.]sock|docker[.]sock.*permission denied' \
+    "$error_file"; then
+    fail "bare runtime Docker ${label} lacked a socket permission error"
+  fi
+}
+
+assert_status_sudo_paths() {
+  local expected="${TEST_ROOT}/status-sudo-expected.log"
+  local actual="${TEST_ROOT}/status-sudo-actual.log"
+
+  printf '%s\n' \
+    $'sudo\tdocker-info' \
+    $'sudo\tdocker-compose' \
+    $'sudo\tdocker-compose' \
+    $'sudo\tdocker-compose' \
+    $'sudo\tdocker-exec' \
+    $'sudo\tdocker-inspect' \
+    $'sudo\ttoken-reader' \
+    $'sudo\tdocker-exec' > "$expected"
+  awk -F '\t' '$1 == "sudo" { print $1 "\t" $2 }' "$AUDIT_LOG" > "$actual"
+  if ! diff -u "$expected" "$actual"; then
+    fail "status.sh sudo path sequence differed from the expected fallback"
+  fi
+}
+
 : > "$LOG_FILE"
 printf '%s\n' '{}' > "$SCENARIO_FILE"
 
@@ -308,6 +349,7 @@ run_script_as() {
     CF_AUDIT_REAL_DOCKER="$REAL_DOCKER" \
     CF_AUDIT_REAL_SUDO="$REAL_SUDO" \
     CF_AUDIT_DOCKER_RUNTIME_MOCK=1 \
+    CF_AUDIT_DOCKER_VIA_SUDO=0 \
     CONTAINER_NAME="$TEST_CONTAINER" \
     CF_AGENT_WECHAT_COMPOSE_FILE="$AGENT_COMPOSE_FILE" \
     CF_AGENT_GATEWAY_COMPOSE_FILE="$GATEWAY_COMPOSE_FILE" \
@@ -384,6 +426,15 @@ fi
 assert_no_sudo_python "non-permission Docker error"
 printf 'PASS non-permission Docker error does not use sudo\n'
 
+reset_audit
+assert_runtime_mock_requires_sudo info info
+assert_runtime_mock_requires_sudo compose \
+  compose --project-directory "$TEST_REPO" -f "$AGENT_COMPOSE_FILE" \
+  ps --all --quiet agent-wechat
+assert_runtime_mock_requires_sudo exec exec "$TEST_CONTAINER" true
+assert_runtime_mock_requires_sudo inspect inspect "$TEST_CONTAINER"
+printf 'PASS runtime Docker mock requires the sudo fallback\n'
+
 python3 "${REPO_ROOT}/tests/helpers/mock_agent_wechat.py" \
   --token-file "$TOKEN_FILE" \
   --state-file "$STATE_FILE" \
@@ -417,9 +468,7 @@ if grep -q 'account-fixture-not-for-output' "$STATUS_OUTPUT"; then
 fi
 assert_file_has_no_token "$STATUS_OUTPUT"
 assert_secret_permissions
-assert_token_read_once "status.sh"
-assert_only_token_sudo "successful management script"
-assert_no_sudo_python "status.sh"
+assert_status_sudo_paths
 printf 'PASS root-only token with ordinary-user status.sh\n'
 
 printf '%s\n' '--verbose' > "${TEST_HOME}/.curlrc"
@@ -435,6 +484,7 @@ if sudo -u "$TEST_USER" -H env \
   CF_AUDIT_REAL_DOCKER="$REAL_DOCKER" \
   CF_AUDIT_REAL_SUDO="$REAL_SUDO" \
   CF_AUDIT_DOCKER_RUNTIME_MOCK=1 \
+  CF_AUDIT_DOCKER_VIA_SUDO=0 \
   CONTAINER_NAME="$TEST_CONTAINER" \
   CF_AGENT_WECHAT_COMPOSE_FILE="$AGENT_COMPOSE_FILE" \
   CF_AGENT_GATEWAY_COMPOSE_FILE="$GATEWAY_COMPOSE_FILE" \
