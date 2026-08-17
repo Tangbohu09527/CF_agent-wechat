@@ -14,6 +14,33 @@ fi
 
 if [ "${CF_AUDIT_DOCKER_RUNTIME_MOCK:-}" = "1" ]; then
   case "${1:-}" in
+    info)
+      exit 0
+      ;;
+    compose)
+      compose_command=""
+      for argument in "$@"; do
+        if [ "$argument" = "ps" ]; then
+          compose_command="ps"
+          break
+        fi
+      done
+      if [ "$compose_command" != "ps" ]; then
+        printf '%s\n' 'unexpected runtime Compose command' >&2
+        exit 64
+      fi
+      service="${*: -1}"
+      case "$service" in
+        agent-wechat|wechat-worker)
+          printf 'runtime-fixture-%s\n' "$service"
+          exit 0
+          ;;
+        *)
+          printf '%s\n' 'unexpected runtime Compose service' >&2
+          exit 65
+          ;;
+      esac
+      ;;
     exec)
       printf '%s\n' '4242:9001'
       exit 0

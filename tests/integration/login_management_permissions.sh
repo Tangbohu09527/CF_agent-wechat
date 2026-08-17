@@ -88,6 +88,9 @@ SCENARIO_FILE="${TEST_ROOT}/scenario.json"
 AUDIT_BIN="${TEST_ROOT}/audit-bin"
 AUDIT_LOG="${TEST_ROOT}/audit.log"
 AUDIT_PATH="${AUDIT_BIN}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+AGENT_COMPOSE_FILE="${TEST_ROOT}/agent-compose.yaml"
+GATEWAY_PROJECT_DIR="${TEST_ROOT}/gateway"
+GATEWAY_COMPOSE_FILE="${GATEWAY_PROJECT_DIR}/compose.yaml"
 
 install -d -o root -g root -m 755 "${TEST_REPO}/scripts"
 install -o root -g root -m 755 \
@@ -105,6 +108,10 @@ install -o root -g root -m 755 \
   "${REPO_ROOT}/tests/helpers/audit_docker.sh" "${AUDIT_BIN}/docker"
 install -o root -g root -m 755 \
   "${REPO_ROOT}/tests/helpers/audit_sudo.sh" "${AUDIT_BIN}/sudo"
+install -d -o root -g root -m 755 "$GATEWAY_PROJECT_DIR"
+printf '%s\n' 'services:' '  agent-wechat: {}' > "$AGENT_COMPOSE_FILE"
+printf '%s\n' 'services:' '  wechat-worker: {}' > "$GATEWAY_COMPOSE_FILE"
+chmod 644 "$AGENT_COMPOSE_FILE" "$GATEWAY_COMPOSE_FILE"
 
 useradd --create-home --home-dir "$TEST_HOME" --shell /bin/bash "$TEST_USER"
 useradd --create-home --home-dir "$NO_SUDO_HOME" --shell /bin/bash "$NO_SUDO_USER"
@@ -188,6 +195,24 @@ token = Path(sys.argv[1]).read_bytes().rstrip(b"\n")
 content = Path(sys.argv[2]).read_bytes()
 if token in content:
     raise SystemExit(f"token leaked into {sys.argv[2]}")
+PY
+}
+
+print_redacted_file() {
+  python3 - "$TOKEN_FILE" "$1" <<'PY'
+import sys
+from pathlib import Path
+
+token = Path(sys.argv[1]).read_bytes().rstrip(b"\n")
+path = Path(sys.argv[2])
+content = path.read_bytes() if path.exists() else b"<missing output>\n"
+for sensitive, replacement in (
+    (token, b"<redacted-token>"),
+    (b"account-fixture-not-for-output", b"<redacted-account>"),
+    (b"chat-fixture-not-for-output", b"<redacted-chat>"),
+):
+    content = content.replace(sensitive, replacement)
+sys.stderr.buffer.write(content)
 PY
 }
 
@@ -284,6 +309,9 @@ run_script_as() {
     CF_AUDIT_REAL_SUDO="$REAL_SUDO" \
     CF_AUDIT_DOCKER_RUNTIME_MOCK=1 \
     CONTAINER_NAME="$TEST_CONTAINER" \
+    CF_AGENT_WECHAT_COMPOSE_FILE="$AGENT_COMPOSE_FILE" \
+    CF_AGENT_GATEWAY_COMPOSE_FILE="$GATEWAY_COMPOSE_FILE" \
+    CF_AGENT_GATEWAY_PROJECT_DIR="$GATEWAY_PROJECT_DIR" \
     "$@" \
     /bin/bash -c '
 cd "$1"
@@ -376,7 +404,13 @@ WS_PORT="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["ws_p
 
 reset_audit
 STATUS_OUTPUT="${TEST_ROOT}/status.out"
-run_script_as "$TEST_USER" status.sh > "$STATUS_OUTPUT" 2>&1
+if ! run_script_as "$TEST_USER" status.sh > "$STATUS_OUTPUT" 2>&1; then
+  printf '%s\n' 'status.sh failure output (token redacted):' >&2
+  print_redacted_file "$STATUS_OUTPUT"
+  printf '%s\n' 'status.sh audit log:' >&2
+  cat "$AUDIT_LOG" >&2
+  fail "ordinary-user status.sh failed"
+fi
 grep -q 'logged_in' "$STATUS_OUTPUT" || fail "status.sh did not report logged_in"
 if grep -q 'account-fixture-not-for-output' "$STATUS_OUTPUT"; then
   fail "status.sh exposed the account identifier"
@@ -391,7 +425,7 @@ printf 'PASS root-only token with ordinary-user status.sh\n'
 printf '%s\n' '--verbose' > "${TEST_HOME}/.curlrc"
 chown "$TEST_USER:$TEST_USER" "${TEST_HOME}/.curlrc"
 TRACE_OUTPUT="${TEST_ROOT}/trace.out"
-sudo -u "$TEST_USER" -H env \
+if sudo -u "$TEST_USER" -H env \
   API_URL="http://127.0.0.1:${HTTP_PORT}" \
   WS_URL="ws://127.0.0.1:${WS_PORT}/api/ws/login" \
   TOKEN_FILE="$TOKEN_FILE" \
@@ -402,8 +436,17 @@ sudo -u "$TEST_USER" -H env \
   CF_AUDIT_REAL_SUDO="$REAL_SUDO" \
   CF_AUDIT_DOCKER_RUNTIME_MOCK=1 \
   CONTAINER_NAME="$TEST_CONTAINER" \
+  CF_AGENT_WECHAT_COMPOSE_FILE="$AGENT_COMPOSE_FILE" \
+  CF_AGENT_GATEWAY_COMPOSE_FILE="$GATEWAY_COMPOSE_FILE" \
+  CF_AGENT_GATEWAY_PROJECT_DIR="$GATEWAY_PROJECT_DIR" \
   NO_PROXY=127.0.0.1,localhost \
-  /bin/bash -x "${TEST_REPO}/scripts/status.sh" > "$TRACE_OUTPUT" 2>&1
+  /bin/bash -x "${TEST_REPO}/scripts/status.sh" > "$TRACE_OUTPUT" 2>&1; then
+  :
+else
+  printf '%s\n' 'traced status.sh failure output (token redacted):' >&2
+  print_redacted_file "$TRACE_OUTPUT"
+  fail "traced ordinary-user status.sh failed"
+fi
 assert_file_has_no_token "$TRACE_OUTPUT"
 if grep -q 'Authorization: Bearer' "$TRACE_OUTPUT"; then
   fail "curlrc or shell tracing exposed the Authorization header"

@@ -2,8 +2,8 @@
 
 set +x
 
-RUNTIME_SCRIPTS_DIR="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
-RUNTIME_REPO_ROOT="$(CDPATH= cd -- "${RUNTIME_SCRIPTS_DIR}/.." && pwd -P)"
+RUNTIME_SCRIPTS_DIR="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+RUNTIME_REPO_ROOT="$(CDPATH='' cd -- "${RUNTIME_SCRIPTS_DIR}/.." && pwd -P)"
 
 AGENT_COMPOSE_FILE="${CF_AGENT_WECHAT_COMPOSE_FILE:-${RUNTIME_REPO_ROOT}/docker/compose.cfserver.yaml}"
 STORAGE_ROOT="${CF_AGENT_WECHAT_STORAGE_ROOT:-/srv/storage/cf-agent-wechat}"
@@ -15,7 +15,10 @@ RUNTIME_LOCK_FILE="${CF_AGENT_WECHAT_LOCK_FILE:-/run/lock/cf-agent-wechat-qr-run
 GATEWAY_COMPOSE_FILE="${CF_AGENT_GATEWAY_COMPOSE_FILE:-/opt/cf-agent-gateway/docker/compose.cfserver.yaml}"
 GATEWAY_PROJECT_DIR="${CF_AGENT_GATEWAY_PROJECT_DIR:-/opt/cf-agent-gateway}"
 
+# These globals are validated indirectly and consumed by start-qr-login.sh.
+# shellcheck disable=SC2034
 RUNTIME_DEFAULT_UID="${CF_AGENT_WECHAT_RUNTIME_UID:-1000}"
+# shellcheck disable=SC2034
 RUNTIME_DEFAULT_GID="${CF_AGENT_WECHAT_RUNTIME_GID:-1000}"
 RUNTIME_DEFAULT_MODE="${CF_AGENT_WECHAT_RUNTIME_MODE:-700}"
 SERVER_READY_TIMEOUT="${SERVER_READY_TIMEOUT:-120}"
@@ -468,6 +471,8 @@ runtime_acquire_lock() {
   local lock_size
 
   if ! runtime_path_exists "$RUNTIME_LOCK_FILE"; then
+    # Positional parameters are expanded by the privileged child shell.
+    # shellcheck disable=SC2016
     if ! runtime_privileged sh -c '
       umask 022
       set -C
@@ -669,6 +674,8 @@ start_agent_container() {
 }
 
 runtime_wechat_process_identity() {
+  # Variables in this snippet are expanded by the shell inside the container.
+  # shellcheck disable=SC2016
   runtime_docker exec "$CONTAINER_NAME" sh -c '
 for process_dir in /proc/[0-9]*; do
   [ "$(readlink "$process_dir/exe" 2>/dev/null || true)" = /usr/bin/wechat ] ||
@@ -706,6 +713,8 @@ wait_for_stable_wechat_process() {
       sleep "$WECHAT_STABLE_SECONDS"
       if second_identity="$(runtime_wechat_process_identity)" &&
         [ "$second_identity" = "$first_identity" ]; then
+        # Read by start-qr-login.sh after this shared function returns.
+        # shellcheck disable=SC2034
         STABLE_WECHAT_IDENTITY="$second_identity"
         return 0
       fi

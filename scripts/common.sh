@@ -4,7 +4,7 @@
 set +x
 set +a
 
-SCRIPTS_DIR="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+SCRIPTS_DIR="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 
 API_URL="${API_URL:-http://127.0.0.1:6174}"
 API_URL="${API_URL%/}"
@@ -41,7 +41,6 @@ unset AUTH_TOKEN
 AUTH_TOKEN=""
 export -n AUTH_TOKEN
 AUTH_STATUS=""
-AUTH_ACCOUNT=""
 LAST_ERROR=""
 LOGIN_PYTHON=""
 
@@ -244,8 +243,9 @@ sys.stdout.write(status)
     return 1
   fi
 
+  # Read by the scripts that source this shared library.
+  # shellcheck disable=SC2034
   AUTH_STATUS="$parsed"
-  AUTH_ACCOUNT=""
 }
 
 fetch_auth_status() {
@@ -415,6 +415,8 @@ docker_readonly_capture() {
 }
 
 get_wechat_process_identity() {
+  # Variables in this snippet are expanded by the shell inside the container.
+  # shellcheck disable=SC2016
   docker_readonly_capture exec "$CONTAINER_NAME" sh -c '
 for process_dir in /proc/[0-9]*; do
   [ "$(readlink "$process_dir/exe" 2>/dev/null || true)" = /usr/bin/wechat ] ||
@@ -566,6 +568,8 @@ ensure_login_environment() {
     if ! "$LOGIN_PYTHON" -m pip install \
       --disable-pip-version-check \
       --requirement "$REQUIREMENTS_FILE"; then
+      # Read by the scripts that call this shared function.
+      # shellcheck disable=SC2034
       LAST_ERROR="登录工具依赖安装失败。"
       return 1
     fi

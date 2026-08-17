@@ -34,6 +34,7 @@ jobs:
           scripts/start-qr-login.sh
           scripts/stop-qr-runtime.sh
           tests/helpers/audit_docker.sh
+          tests/helpers/audit_sudo.sh
           tests/helpers/mock_docker.sh
           tests/helpers/mock_sudo.sh
           tests/helpers/mock_date.sh
