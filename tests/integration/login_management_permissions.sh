@@ -84,6 +84,7 @@ LOG_FILE="${TEST_ROOT}/mock.log"
 READY_FILE="${TEST_ROOT}/mock.ready"
 PAUSE_FILE="${TEST_ROOT}/ws.pause"
 CONTINUE_FILE="${TEST_ROOT}/ws.continue"
+SCENARIO_FILE="${TEST_ROOT}/scenario.json"
 AUDIT_BIN="${TEST_ROOT}/audit-bin"
 AUDIT_LOG="${TEST_ROOT}/audit.log"
 AUDIT_PATH="${AUDIT_BIN}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
@@ -91,6 +92,7 @@ AUDIT_PATH="${AUDIT_BIN}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin
 install -d -o root -g root -m 755 "${TEST_REPO}/scripts"
 install -o root -g root -m 755 \
   "${REPO_ROOT}/scripts/common.sh" \
+  "${REPO_ROOT}/scripts/qr-runtime-common.sh" \
   "${REPO_ROOT}/scripts/status.sh" \
   "${REPO_ROOT}/scripts/login.sh" \
   "${REPO_ROOT}/scripts/qr_login.py" \
@@ -168,6 +170,7 @@ assert_docker_fallback_order() {
 }
 
 : > "$LOG_FILE"
+printf '%s\n' '{}' > "$SCENARIO_FILE"
 
 assert_secret_permissions() {
   [ "$(stat -c '%U:%G %a' "$SECRETS_DIR")" = "root:root 700" ] || \
@@ -279,8 +282,16 @@ run_script_as() {
     CF_AUDIT_LOG="$AUDIT_LOG" \
     CF_AUDIT_REAL_DOCKER="$REAL_DOCKER" \
     CF_AUDIT_REAL_SUDO="$REAL_SUDO" \
+    CF_AUDIT_DOCKER_RUNTIME_MOCK=1 \
+    CONTAINER_NAME="$TEST_CONTAINER" \
     "$@" \
-    /bin/bash -c 'cd "$1" && exec "./scripts/$2"' \
+    /bin/bash -c '
+cd "$1"
+if [ "${CF_TEST_FORCE_QR:-0}" = "1" ]; then
+  exec "./scripts/$2" --force-qr
+fi
+exec "./scripts/$2"
+' \
     cf-agent-wechat-test "$TEST_REPO" "$script_name"
 }
 
@@ -351,7 +362,8 @@ python3 "${REPO_ROOT}/tests/helpers/mock_agent_wechat.py" \
   --log-file "$LOG_FILE" \
   --ready-file "$READY_FILE" \
   --pause-file "$PAUSE_FILE" \
-  --continue-file "$CONTINUE_FILE" &
+  --continue-file "$CONTINUE_FILE" \
+  --scenario-file "$SCENARIO_FILE" &
 MOCK_PID=$!
 for _attempt in $(seq 1 100); do
   [ -s "$READY_FILE" ] && break
@@ -366,7 +378,9 @@ reset_audit
 STATUS_OUTPUT="${TEST_ROOT}/status.out"
 run_script_as "$TEST_USER" status.sh > "$STATUS_OUTPUT" 2>&1
 grep -q 'logged_in' "$STATUS_OUTPUT" || fail "status.sh did not report logged_in"
-grep -q 'wxid_permissions_test' "$STATUS_OUTPUT" || fail "status.sh did not report account"
+if grep -q 'account-fixture-not-for-output' "$STATUS_OUTPUT"; then
+  fail "status.sh exposed the account identifier"
+fi
 assert_file_has_no_token "$STATUS_OUTPUT"
 assert_secret_permissions
 assert_token_read_once "status.sh"
@@ -382,6 +396,12 @@ sudo -u "$TEST_USER" -H env \
   WS_URL="ws://127.0.0.1:${WS_PORT}/api/ws/login" \
   TOKEN_FILE="$TOKEN_FILE" \
   PYTHON_BIN=python3 \
+  PATH="$AUDIT_PATH" \
+  CF_AUDIT_LOG="$AUDIT_LOG" \
+  CF_AUDIT_REAL_DOCKER="$REAL_DOCKER" \
+  CF_AUDIT_REAL_SUDO="$REAL_SUDO" \
+  CF_AUDIT_DOCKER_RUNTIME_MOCK=1 \
+  CONTAINER_NAME="$TEST_CONTAINER" \
   NO_PROXY=127.0.0.1,localhost \
   /bin/bash -x "${TEST_REPO}/scripts/status.sh" > "$TRACE_OUTPUT" 2>&1
 assert_file_has_no_token "$TRACE_OUTPUT"
@@ -470,16 +490,72 @@ assert_tmp_has_no_token
 assert_secret_permissions
 printf 'PASS ordinary-user login.sh phone confirmation flow and user-owned venv\n'
 
+printf '%s\n' 'logged_out' > "$STATE_FILE"
+printf '%s\n' \
+  '{"emit_qr":true,"require_new_account":true,"record_ws_query":true}' \
+  > "$SCENARIO_FILE"
+: > "$LOG_FILE"
+reset_audit
+rm -f "$PAUSE_FILE" "$CONTINUE_FILE"
+FORCE_OUTPUT="${TEST_ROOT}/force-qr.out"
+run_script_as "$TEST_USER" login.sh CF_TEST_FORCE_QR=1 \
+  > "$FORCE_OUTPUT" 2>&1 &
+LOGIN_PID=$!
+for _attempt in $(seq 1 900); do
+  [ -e "$PAUSE_FILE" ] && break
+  kill -0 "$LOGIN_PID" 2>/dev/null || {
+    cat "$FORCE_OUTPUT" >&2
+    fail "login.sh --force-qr exited before WebSocket pause"
+  }
+  sleep 0.1
+done
+[ -e "$PAUSE_FILE" ] || fail "force-QR login did not reach WebSocket"
+touch "$CONTINUE_FILE"
+if ! wait "$LOGIN_PID"; then
+  cat "$FORCE_OUTPUT" >&2
+  fail "ordinary-user login.sh --force-qr failed"
+fi
+LOGIN_PID=""
+grep -q '请使用手机微信扫描二维码' "$FORCE_OUTPUT" || \
+  fail "force-QR flow did not render a terminal QR code"
+grep -q '登录成功。' "$FORCE_OUTPUT" || \
+  fail "force-QR flow did not report login success"
+grep -q '^WS /api/ws/login newAccount=true$' "$LOG_FILE" || \
+  fail "force-QR WebSocket did not use newAccount=true"
+if grep -qi 'logout' "$LOG_FILE"; then
+  fail "force-QR flow unexpectedly called logout"
+fi
+FORCE_EXPECTED_LOG="${TEST_ROOT}/force-expected.log"
+printf '%s\n' \
+  'GET /api/status/auth' \
+  'POST /api/status/login' \
+  'WS /api/ws/login newAccount=true' \
+  'EVENT qr' \
+  'EVENT phone_confirm' \
+  'EVENT login_success' \
+  'GET /api/status/auth' > "$FORCE_EXPECTED_LOG"
+diff -u "$FORCE_EXPECTED_LOG" "$LOG_FILE" || \
+  fail "force-QR request/event order differs"
+assert_token_read_once "force-QR login.sh"
+assert_only_token_sudo "force-QR login.sh"
+assert_no_sudo_python "force-QR login.sh"
+assert_file_has_no_token "$FORCE_OUTPUT"
+if grep -q 'account-fixture-not-for-output' "$FORCE_OUTPUT"; then
+  fail "force-QR output exposed the account identifier"
+fi
+printf '%s\n' '{}' > "$SCENARIO_FILE"
+printf 'PASS forced new-device QR rendering and newAccount WebSocket flow\n'
+
 reset_audit
 mv "$TOKEN_FILE" "${TOKEN_FILE}.saved"
 MISSING_OUTPUT="${TEST_ROOT}/missing.out"
-if run_script_as "$TEST_USER" status.sh > "$MISSING_OUTPUT" 2>&1; then
-  fail "status.sh unexpectedly accepted a missing token"
+if run_script_as "$TEST_USER" login.sh > "$MISSING_OUTPUT" 2>&1; then
+  fail "login.sh unexpectedly accepted a missing token"
 fi
 grep -q 'token 文件不存在' "$MISSING_OUTPUT" || \
   fail "missing token was not distinguished from a permission failure"
-assert_token_read_once "missing-token status.sh"
-assert_no_sudo_python "missing-token status.sh"
+assert_token_read_once "missing-token login.sh"
+assert_no_sudo_python "missing-token login.sh"
 mv "${TOKEN_FILE}.saved" "$TOKEN_FILE"
 assert_secret_permissions
 printf 'PASS missing root-only token distinction\n'
@@ -493,10 +569,10 @@ if timeout 15s sudo -u "$NO_SUDO_USER" -H env \
   NO_COLOR=1 \
   NO_PROXY=127.0.0.1,localhost \
   no_proxy=127.0.0.1,localhost \
-  /bin/bash -c 'cd "$1" && exec ./scripts/status.sh' \
+  /bin/bash -c 'cd "$1" && exec ./scripts/login.sh' \
   cf-agent-wechat-test "$TEST_REPO" \
   > "$NO_SUDO_OUTPUT" 2>&1 </dev/null; then
-  fail "status.sh unexpectedly read root-only token without sudo permission"
+  fail "login.sh unexpectedly read root-only token without sudo permission"
 fi
 grep -q '没有可用的 sudo 权限' "$NO_SUDO_OUTPUT" || \
   fail "missing sudo authorization did not produce a clear error"

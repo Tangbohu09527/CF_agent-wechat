@@ -4,6 +4,13 @@ on:
   push:
     paths:
       - ".github/workflows/login-management-permissions.yml"
+      - "docker/compose.cfserver.yaml"
+      - "scripts/**"
+      - "tests/**"
+  pull_request:
+    paths:
+      - ".github/workflows/login-management-permissions.yml"
+      - "docker/compose.cfserver.yaml"
       - "scripts/**"
       - "tests/**"
   workflow_dispatch:
@@ -12,6 +19,52 @@ permissions:
   contents: read
 
 jobs:
+  forced-qr-runtime:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check Bash syntax
+        run: >-
+          bash -n
+          scripts/common.sh
+          scripts/qr-runtime-common.sh
+          scripts/login.sh
+          scripts/status.sh
+          scripts/start-qr-login.sh
+          scripts/stop-qr-runtime.sh
+          tests/helpers/audit_docker.sh
+          tests/helpers/mock_docker.sh
+          tests/helpers/mock_sudo.sh
+          tests/helpers/mock_date.sh
+          tests/helpers/mock_login_python.sh
+          tests/integration/login_management_permissions.sh
+      - name: Run ShellCheck when available
+        shell: bash
+        run: |
+          if command -v shellcheck >/dev/null 2>&1; then
+            cd scripts
+            shellcheck --external-sources \
+              common.sh \
+              qr-runtime-common.sh \
+              login.sh \
+              status.sh \
+              start-qr-login.sh \
+              stop-qr-runtime.sh
+          else
+            echo "ShellCheck is not available on this runner."
+          fi
+      - name: Run dependency-free unit tests
+        run: python3 -m unittest discover -s tests/unit -p "test_*.py" -v
+      - name: Run isolated forced-QR lifecycle tests
+        run: python3 tests/integration/test_qr_runtime.py
+      - name: Parse production Compose configuration
+        env:
+          AGENT_WECHAT_IMAGE: >-
+            ghcr.io/example/agent-wechat@sha256:0000000000000000000000000000000000000000000000000000000000000000
+          AGENT_WECHAT_BIND_IP: 127.0.0.1
+        run: docker compose -f docker/compose.cfserver.yaml config --quiet
+
   linux-permissions:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
