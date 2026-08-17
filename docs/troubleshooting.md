@@ -53,6 +53,16 @@ worker，并在锁获取
 - Token 是否为独立文件且权限正确；
 - Gateway worker 控制配置是否完整。
 
+Gateway 默认 Compose、环境文件和项目目录分别为
+`/opt/cf-agent-gateway/deploy/compose.yaml`、
+`/opt/cf-agent-gateway/deploy/.env` 和
+`/opt/cf-agent-gateway/deploy`。标准布局下直接运行
+`cd /opt/cf-agent-wechat` 后的 `./scripts/start-qr-login.sh`，无需导出变量。
+若现场路径不同，检查 `CF_AGENT_GATEWAY_COMPOSE_FILE`、
+`CF_AGENT_GATEWAY_ENV_FILE` 和 `CF_AGENT_GATEWAY_PROJECT_DIR` 覆盖值；
+运维检查只确认 `.env` 是否位于预期路径及其元数据。生命周期脚本不自行解析、
+复制或输出其内容；Docker Compose 通过 `--env-file` 将该文件作为插值/配置输入使用。
+
 不要通过创建假 Token、放宽权限、修改其他仓库或跳过检查继续启动。
 
 ## 登录锁已占用

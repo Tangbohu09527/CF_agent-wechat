@@ -71,6 +71,17 @@ Gateway 经 `cf-internal` 访问 `http://cf-agent-wechat:6174`。启动脚本只
     └── login.sh
 ```
 
+Gateway 标准 Compose 输入：
+
+```text
+/opt/cf-agent-gateway/deploy/
+├── compose.yaml
+└── .env
+```
+
+其 Compose 项目目录为 `/opt/cf-agent-gateway/deploy`。标准布局下从
+`/opt/cf-agent-wechat` 运行生命周期脚本无需导出 Gateway 路径变量。
+
 存储目录：
 
 ```text
@@ -142,8 +153,9 @@ Token 继续使用独立只读挂载：
 | `CF_AGENT_WECHAT_RUNTIME_ROOT` | 默认 `/srv/storage/cf-agent-wechat/runtime` |
 | `CF_AGENT_WECHAT_ARCHIVE_ROOT` | 默认 `/srv/storage/cf-agent-wechat/session-archive`，必须与 runtime 位于同一文件系统 |
 | `CF_AGENT_WECHAT_COMPOSE_FILE` | 默认使用本仓库 `docker/compose.cfserver.yaml` |
-| `CF_AGENT_GATEWAY_COMPOSE_FILE` | 默认 `/opt/cf-agent-gateway/docker/compose.cfserver.yaml`；只用于控制 `wechat-worker` |
-| `CF_AGENT_GATEWAY_PROJECT_DIR` | 默认 `/opt/cf-agent-gateway`，用于读取 Gateway 自己的 Compose 输入 |
+| `CF_AGENT_GATEWAY_COMPOSE_FILE` | 默认 `/opt/cf-agent-gateway/deploy/compose.yaml`；只用于控制 `wechat-worker` |
+| `CF_AGENT_GATEWAY_ENV_FILE` | 默认 `/opt/cf-agent-gateway/deploy/.env`；只作为 Gateway Compose 的环境文件 |
+| `CF_AGENT_GATEWAY_PROJECT_DIR` | 默认 `/opt/cf-agent-gateway/deploy`；Gateway Compose 项目目录 |
 | `CF_AGENT_WECHAT_RUNTIME_UID` / `GID` | 仅在没有旧目录可继承时使用，默认 `1000:1000` |
 | `CF_AGENT_WECHAT_RUNTIME_MODE` | 仅在没有旧目录可继承时使用，默认 `700` |
 | `CF_AGENT_WECHAT_LOCK_FILE` | 默认 `/run/lock/cf-agent-wechat-qr-runtime.lock`；start/stop 共用 |
@@ -151,7 +163,13 @@ Token 继续使用独立只读挂载：
 | `PROXY` | 可选；若含认证信息按敏感配置保护 |
 | `RUST_LOG` | 默认 `info`；提高详细度前评估泄露风险 |
 
-Token 禁止写入 `.env`。生产变量实值不得粘贴到文档、工单或日志。
+标准布局使用 `/opt/cf-agent-gateway/deploy/.env`，直接运行
+`./scripts/start-qr-login.sh` 时无需 `export`。路径不同时保留
+`CF_AGENT_GATEWAY_COMPOSE_FILE`、`CF_AGENT_GATEWAY_ENV_FILE` 和
+`CF_AGENT_GATEWAY_PROJECT_DIR` 覆盖能力。生命周期脚本不自行解析、复制或输出
+Gateway `.env` 内容；Docker Compose 通过 `--env-file` 将该文件作为插值/配置
+输入使用。Token 禁止写入本仓库或 Gateway 的任何 `.env`；生产变量实值不得粘贴
+到文档、工单或日志。
 
 使用与实际部署相同的环境输入做静态校验：
 
@@ -175,8 +193,11 @@ sudo docker compose -f docker/compose.cfserver.yaml config --quiet
 6. 确认旧 runtime 的 UID、GID 和权限可继承；首次运行没有旧目录时，确认
    `CF_AGENT_WECHAT_RUNTIME_UID/GID/MODE` 的默认 `1000:1000/700` 与镜像匹配，
    不匹配时必须显式覆盖后再运行。
-7. 确认 Gateway Compose 文件和项目目录与现场布局一致，且只控制
-   `wechat-worker`；路径不同时必须通过上述变量显式覆盖。
+7. 确认 Gateway 默认 Compose、环境文件和项目目录依次为
+   `/opt/cf-agent-gateway/deploy/compose.yaml`、
+   `/opt/cf-agent-gateway/deploy/.env` 和
+   `/opt/cf-agent-gateway/deploy`，且只控制 `wechat-worker`；标准布局无需
+   导出变量，路径不同时必须通过上述变量显式覆盖。
 8. 在 CFserver 实机确认 Gateway restart policy/Compose/systemd boot stop gate，确保
    Debian 启动至人工运行脚本前 `wechat-worker` 持续停止；本仓库未修改 Gateway。
 9. 确认 Python 3、curl、Docker Compose 及二维码依赖可用。

@@ -12,6 +12,16 @@
 - 唯一启动入口：`./scripts/start-qr-login.sh`
 - 停止入口：`./scripts/stop-qr-runtime.sh`
 
+Gateway 标准布局为 Compose
+`/opt/cf-agent-gateway/deploy/compose.yaml`、环境文件
+`/opt/cf-agent-gateway/deploy/.env`，Compose 项目目录为
+`/opt/cf-agent-gateway/deploy`。使用该布局时，在
+`/opt/cf-agent-wechat` 直接运行启动或停止脚本即可，无需导出变量。非标准布局
+继续使用 `CF_AGENT_GATEWAY_COMPOSE_FILE`、
+`CF_AGENT_GATEWAY_ENV_FILE` 和 `CF_AGENT_GATEWAY_PROJECT_DIR` 覆盖；
+运维检查只确认 `.env` 的路径和元数据。生命周期脚本不自行解析、复制或输出其
+内容；Docker Compose 通过 `--env-file` 将该文件作为插值/配置输入使用。
+
 `docker/docker-compose.yml` 是实验或验证配置，不得用于 CFserver。生产环境不再恢复旧
 微信登录会话；每次 Debian 重启、容器重建或人工重新启动都需要 SSH 人工扫码。
 

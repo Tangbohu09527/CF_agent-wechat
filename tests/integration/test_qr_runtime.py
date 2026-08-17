@@ -23,6 +23,7 @@ HELPERS = REPO_ROOT / "tests" / "helpers"
 SENSITIVE_TOKEN_PREFIX = "token-fixture-sensitive-"
 SENSITIVE_ACCOUNT_PREFIX = "account-fixture-sensitive-"
 SENSITIVE_CHAT_PREFIX = "chat fixture/sensitive?"
+SENSITIVE_GATEWAY_ENV_PREFIX = "gateway-env-fixture-sensitive-"
 
 
 def tree_digest(path: Path) -> str:
@@ -45,6 +46,18 @@ def tree_digest(path: Path) -> str:
     return digest.hexdigest()
 
 
+def metadata_without_contents(path: Path) -> tuple[int, int, int, int, int, int]:
+    metadata = path.lstat()
+    return (
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_uid,
+        metadata.st_gid,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+    )
+
+
 class RuntimeFixture:
     def __init__(self, name: str) -> None:
         self.root = Path(tempfile.mkdtemp(prefix=f"cf-qr-{name}-"))
@@ -55,6 +68,7 @@ class RuntimeFixture:
         self.gateway_dir = self.root / "gateway"
         self.agent_compose = self.root / "agent-compose.yaml"
         self.gateway_compose = self.gateway_dir / "compose.yaml"
+        self.gateway_env = self.gateway_dir / ".env"
         self.fake_bin = self.root / "bin"
         self.docker_state = self.root / "docker-state"
         self.home = self.root / "home"
@@ -74,6 +88,7 @@ class RuntimeFixture:
         self.token = f"{SENSITIVE_TOKEN_PREFIX}{name}"
         self.account = f"{SENSITIVE_ACCOUNT_PREFIX}{name}"
         self.chat = f"{SENSITIVE_CHAT_PREFIX}{name}#/id"
+        self.gateway_env_sentinel = f"{SENSITIVE_GATEWAY_ENV_PREFIX}{name}"
         self._create_layout()
         self.env = self._build_environment()
         self.set_scenario()
@@ -100,6 +115,10 @@ class RuntimeFixture:
         self.gateway_dir.mkdir()
         self.agent_compose.write_text("services: {}\n", encoding="utf-8")
         self.gateway_compose.write_text("services: {}\n", encoding="utf-8")
+        self.gateway_env.write_text(
+            self.gateway_env_sentinel + "\n", encoding="utf-8"
+        )
+        os.chmod(self.gateway_env, 0o600)
         self.fake_bin.mkdir()
         self.docker_state.mkdir()
         self.home.mkdir()
@@ -164,6 +183,7 @@ class RuntimeFixture:
                 "CF_AGENT_WECHAT_COMPOSE_FILE": str(self.agent_compose),
                 "CF_AGENT_GATEWAY_COMPOSE_FILE": str(self.gateway_compose),
                 "CF_AGENT_GATEWAY_PROJECT_DIR": str(self.gateway_dir),
+                "CF_AGENT_GATEWAY_ENV_FILE": str(self.gateway_env),
                 "CF_AGENT_WECHAT_RUNTIME_UID": current_uid,
                 "CF_AGENT_WECHAT_RUNTIME_GID": current_gid,
                 "CF_AGENT_WECHAT_RUNTIME_MODE": "700",
@@ -181,6 +201,7 @@ class RuntimeFixture:
                 "MOCK_DOCKER_LOG": str(self.audit_log),
                 "MOCK_DOCKER_MUTATION_LOG": str(self.mutation_log),
                 "MOCK_GATEWAY_COMPOSE_FILE": str(self.gateway_compose),
+                "MOCK_GATEWAY_ENV_FILE": str(self.gateway_env),
                 "MOCK_LOGIN_LOG": str(self.login_log),
                 "MOCK_AUTH_STATE_FILE": str(self.auth_state),
                 "MOCK_LOGIN_PAUSE_FILE": str(self.login_pause_file),
@@ -329,8 +350,29 @@ class RuntimeFixture:
         self, testcase: unittest.TestCase, *values: str
     ) -> None:
         combined = "\n".join(values)
-        for sensitive in (self.token, self.account, self.chat):
+        for sensitive in (
+            self.token,
+            self.account,
+            self.chat,
+            self.gateway_env_sentinel,
+        ):
             testcase.assertNotIn(sensitive, combined)
+
+    def assert_tree_has_no_sensitive_text(
+        self, testcase: unittest.TestCase, root: Path
+    ) -> None:
+        sensitive_values = (
+            self.token,
+            self.account,
+            self.chat,
+            self.gateway_env_sentinel,
+        )
+        for path in root.rglob("*"):
+            if not path.is_file() or path.is_symlink():
+                continue
+            content = path.read_bytes()
+            for sensitive in sensitive_values:
+                testcase.assertNotIn(sensitive.encode(), content)
 
     def close(self) -> None:
         for process in self.background:
@@ -369,22 +411,50 @@ class ForcedQrRuntimeTests(unittest.TestCase):
 
     def assert_failed(self, result: subprocess.CompletedProcess[str]) -> None:
         self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assert_result_is_redacted(result)
 
     def assert_succeeded(self, result: subprocess.CompletedProcess[str]) -> None:
         self.assertEqual(result.returncode, 0, result.stdout)
+        self.assert_result_is_redacted(result)
+
+    def assert_result_is_redacted(
+        self, result: subprocess.CompletedProcess[str]
+    ) -> None:
+        self.fixture.assert_no_sensitive_text(
+            self,
+            result.stdout,
+            self.fixture.audit_log.read_text(encoding="utf-8"),
+            self.fixture.mutation_log.read_text(encoding="utf-8"),
+            self.fixture.login_log.read_text(encoding="utf-8"),
+        )
 
     def test_dry_run_changes_nothing(self) -> None:
         before = tree_digest(self.fixture.storage)
+        gateway_env_before = metadata_without_contents(
+            self.fixture.gateway_env
+        )
         start = self.fixture.run("start-qr-login.sh", "--dry-run")
         self.assert_succeeded(start)
         self.assertEqual(tree_digest(self.fixture.storage), before)
+        self.assertEqual(
+            metadata_without_contents(self.fixture.gateway_env),
+            gateway_env_before,
+        )
         self.assertEqual(self.fixture.mutation_lines(), [])
         self.assertEqual(self.fixture.read_state("gateway_running"), "1")
         self.assertEqual(self.fixture.read_state("agent_running"), "1")
+        self.assertIn(
+            "gateway compose env-file verified",
+            self.fixture.audit_lines(),
+        )
 
         stop = self.fixture.run("stop-qr-runtime.sh", "--dry-run")
         self.assert_succeeded(stop)
         self.assertEqual(tree_digest(self.fixture.storage), before)
+        self.assertEqual(
+            metadata_without_contents(self.fixture.gateway_env),
+            gateway_env_before,
+        )
         self.assertEqual(self.fixture.mutation_lines(), [])
 
     def test_success_archives_atomically_preserves_permissions_and_gates_worker(
@@ -435,9 +505,7 @@ class ForcedQrRuntimeTests(unittest.TestCase):
             ).hexdigest(),
             token_hash,
         )
-        for archived_file in archived.rglob("*"):
-            if archived_file.is_file():
-                self.assertNotIn(self.fixture.token.encode(), archived_file.read_bytes())
+        self.fixture.assert_tree_has_no_sensitive_text(self, archived)
 
         self.assertEqual(
             self.fixture.mutation_lines(),
@@ -506,11 +574,7 @@ class ForcedQrRuntimeTests(unittest.TestCase):
             ),
             token_before,
         )
-        for archived_file in archived.rglob("*"):
-            if archived_file.is_file():
-                self.assertNotIn(
-                    self.fixture.token.encode(), archived_file.read_bytes()
-                )
+        self.fixture.assert_tree_has_no_sensitive_text(self, archived)
 
     def test_legacy_home_move_failure_rolls_data_back_without_split(self) -> None:
         self.fixture.create_legacy_layout(remove_runtime=True)
@@ -592,6 +656,79 @@ class ForcedQrRuntimeTests(unittest.TestCase):
         self.assertEqual(self.fixture.read_state("agent_running"), "1")
         self.assertIn("legacy", result.stdout.lower())
         self.assertIn("runtime", result.stdout.lower())
+
+    def test_gateway_env_missing_or_symlink_fails_before_any_mutation(
+        self,
+    ) -> None:
+        cases = (
+            ("start-qr-login.sh", "missing"),
+            ("start-qr-login.sh", "symlink"),
+            ("stop-qr-runtime.sh", "missing"),
+            ("stop-qr-runtime.sh", "symlink"),
+        )
+        for index, (script_name, mode) in enumerate(cases):
+            if index:
+                self.fixture.close()
+                self.fixture = RuntimeFixture(
+                    f"{self._testMethodName}-{script_name}-{mode}"
+                )
+            with self.subTest(script=script_name, mode=mode):
+                self.fixture.gateway_env.unlink()
+                external_target: Path | None = None
+                target_before: tuple[int, int, int, int, int, int] | None = None
+                if mode == "symlink":
+                    external_target = (
+                        self.fixture.root / "external-gateway.env"
+                    )
+                    external_target.write_text(
+                        self.fixture.gateway_env_sentinel + "\n",
+                        encoding="utf-8",
+                    )
+                    os.chmod(external_target, 0o640)
+                    target_before = metadata_without_contents(external_target)
+                    os.symlink(external_target, self.fixture.gateway_env)
+
+                storage_before = tree_digest(self.fixture.storage)
+                gateway_dir_before = metadata_without_contents(
+                    self.fixture.gateway_dir
+                )
+                result = self.fixture.run(script_name)
+                self.assert_failed(result)
+
+                self.assertEqual(
+                    tree_digest(self.fixture.storage), storage_before
+                )
+                self.assertEqual(
+                    metadata_without_contents(self.fixture.gateway_dir),
+                    gateway_dir_before,
+                )
+                if mode == "missing":
+                    self.assertFalse(self.fixture.gateway_env.exists())
+                else:
+                    self.assertIsNotNone(external_target)
+                    self.assertIsNotNone(target_before)
+                    self.assertTrue(self.fixture.gateway_env.is_symlink())
+                    self.assertEqual(
+                        self.fixture.gateway_env.resolve(),
+                        external_target.resolve(),
+                    )
+                    self.assertEqual(
+                        metadata_without_contents(external_target),
+                        target_before,
+                    )
+
+                self.assertEqual(self.fixture.mutation_lines(), [])
+                self.assertEqual(self.fixture.audit_lines(), [])
+                self.assertEqual(
+                    self.fixture.read_state("gateway_running"), "1"
+                )
+                self.assertEqual(
+                    self.fixture.read_state("agent_running"), "1"
+                )
+                self.assertEqual(self.fixture.archive_dirs(), [])
+                self.assertFalse(
+                    (self.fixture.root / "qr-runtime.lock").exists()
+                )
 
     def test_runtime_child_symlink_fails_before_any_mutation(self) -> None:
         for index, child_name in enumerate(("data", "wechat-home")):
@@ -740,6 +877,8 @@ class ForcedQrRuntimeTests(unittest.TestCase):
         self.assertTrue(
             (archives[1] / "data" / "second-state.marker").is_file()
         )
+        for archived in archives:
+            self.fixture.assert_tree_has_no_sensitive_text(self, archived)
 
     def test_concurrent_start_allows_only_one_lock_holder(self) -> None:
         self.fixture.env["MOCK_LOGIN_MODE"] = "block"
@@ -765,6 +904,13 @@ class ForcedQrRuntimeTests(unittest.TestCase):
         self.fixture.login_continue_file.touch()
         output, _ = first.communicate(timeout=10)
         self.assertEqual(first.returncode, 0, output)
+        self.fixture.assert_no_sensitive_text(
+            self,
+            output,
+            self.fixture.audit_log.read_text(encoding="utf-8"),
+            self.fixture.mutation_log.read_text(encoding="utf-8"),
+            self.fixture.login_log.read_text(encoding="utf-8"),
+        )
         self.assertEqual(len(self.fixture.archive_dirs()), 1)
         self.assertEqual(
             self.fixture.mutation_lines().count("gateway worker start"), 1

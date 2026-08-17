@@ -91,6 +91,8 @@ AUDIT_PATH="${AUDIT_BIN}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin
 AGENT_COMPOSE_FILE="${TEST_ROOT}/agent-compose.yaml"
 GATEWAY_PROJECT_DIR="${TEST_ROOT}/gateway"
 GATEWAY_COMPOSE_FILE="${GATEWAY_PROJECT_DIR}/compose.yaml"
+GATEWAY_ENV_FILE="${GATEWAY_PROJECT_DIR}/.env"
+GATEWAY_ENV_SENTINEL="gateway-env-fixture-sensitive-permissions-$$"
 
 install -d -o root -g root -m 755 "${TEST_REPO}/scripts"
 install -o root -g root -m 755 \
@@ -112,6 +114,9 @@ install -d -o root -g root -m 755 "$GATEWAY_PROJECT_DIR"
 printf '%s\n' 'services:' '  agent-wechat: {}' > "$AGENT_COMPOSE_FILE"
 printf '%s\n' 'services:' '  wechat-worker: {}' > "$GATEWAY_COMPOSE_FILE"
 chmod 644 "$AGENT_COMPOSE_FILE" "$GATEWAY_COMPOSE_FILE"
+printf '%s\n' "$GATEWAY_ENV_SENTINEL" > "$GATEWAY_ENV_FILE"
+chown root:root "$GATEWAY_ENV_FILE"
+chmod 600 "$GATEWAY_ENV_FILE"
 
 useradd --create-home --home-dir "$TEST_HOME" --shell /bin/bash "$TEST_USER"
 useradd --create-home --home-dir "$NO_SUDO_HOME" --shell /bin/bash "$NO_SUDO_USER"
@@ -134,6 +139,10 @@ chown root:root "$TOKEN_FILE"
 chmod 600 "$TOKEN_FILE"
 printf 'logged_in\n' > "$STATE_FILE"
 reset_audit() {
+  if [ -s "$AUDIT_LOG" ] &&
+    grep -Fq -- "$GATEWAY_ENV_SENTINEL" "$AUDIT_LOG"; then
+    fail "Gateway environment sentinel leaked into the audit log"
+  fi
   : > "$AUDIT_LOG"
 }
 
@@ -225,30 +234,39 @@ assert_secret_permissions() {
     fail "secrets directory permissions changed"
   [ "$(stat -c '%U:%G %a' "$TOKEN_FILE")" = "root:root 600" ] || \
     fail "auth-token permissions changed"
+  [ "$(stat -c '%U:%G %a' "$GATEWAY_ENV_FILE")" = "root:root 600" ] || \
+    fail "Gateway environment file permissions changed"
 }
 
 assert_file_has_no_token() {
-  python3 - "$TOKEN_FILE" "$1" <<'PY'
+  python3 - "$TOKEN_FILE" "$GATEWAY_ENV_SENTINEL" "$1" <<'PY'
 import sys
 from pathlib import Path
 
 token = Path(sys.argv[1]).read_bytes().rstrip(b"\n")
-content = Path(sys.argv[2]).read_bytes()
-if token in content:
-    raise SystemExit(f"token leaked into {sys.argv[2]}")
+gateway_env_sentinel = sys.argv[2].encode()
+content = Path(sys.argv[3]).read_bytes()
+for name, sensitive in (
+    ("token", token),
+    ("Gateway environment sentinel", gateway_env_sentinel),
+):
+    if sensitive in content:
+        raise SystemExit(f"{name} leaked into {sys.argv[3]}")
 PY
 }
 
 print_redacted_file() {
-  python3 - "$TOKEN_FILE" "$1" <<'PY'
+  python3 - "$TOKEN_FILE" "$GATEWAY_ENV_SENTINEL" "$1" <<'PY'
 import sys
 from pathlib import Path
 
 token = Path(sys.argv[1]).read_bytes().rstrip(b"\n")
-path = Path(sys.argv[2])
+gateway_env_sentinel = sys.argv[2].encode()
+path = Path(sys.argv[3])
 content = path.read_bytes() if path.exists() else b"<missing output>\n"
 for sensitive, replacement in (
     (token, b"<redacted-token>"),
+    (gateway_env_sentinel, b"<redacted-gateway-env>"),
     (b"account-fixture-not-for-output", b"<redacted-account>"),
     (b"chat-fixture-not-for-output", b"<redacted-chat>"),
 ):
@@ -350,10 +368,12 @@ run_script_as() {
     CF_AUDIT_REAL_SUDO="$REAL_SUDO" \
     CF_AUDIT_DOCKER_RUNTIME_MOCK=1 \
     CF_AUDIT_DOCKER_VIA_SUDO=0 \
+    CF_AUDIT_GATEWAY_ENV_FILE="$GATEWAY_ENV_FILE" \
     CONTAINER_NAME="$TEST_CONTAINER" \
     CF_AGENT_WECHAT_COMPOSE_FILE="$AGENT_COMPOSE_FILE" \
     CF_AGENT_GATEWAY_COMPOSE_FILE="$GATEWAY_COMPOSE_FILE" \
     CF_AGENT_GATEWAY_PROJECT_DIR="$GATEWAY_PROJECT_DIR" \
+    CF_AGENT_GATEWAY_ENV_FILE="$GATEWAY_ENV_FILE" \
     "$@" \
     /bin/bash -c '
 cd "$1"
@@ -459,7 +479,7 @@ if ! run_script_as "$TEST_USER" status.sh > "$STATUS_OUTPUT" 2>&1; then
   printf '%s\n' 'status.sh failure output (token redacted):' >&2
   print_redacted_file "$STATUS_OUTPUT"
   printf '%s\n' 'status.sh audit log:' >&2
-  cat "$AUDIT_LOG" >&2
+  print_redacted_file "$AUDIT_LOG"
   fail "ordinary-user status.sh failed"
 fi
 grep -q 'logged_in' "$STATUS_OUTPUT" || fail "status.sh did not report logged_in"
@@ -485,10 +505,12 @@ if sudo -u "$TEST_USER" -H env \
   CF_AUDIT_REAL_SUDO="$REAL_SUDO" \
   CF_AUDIT_DOCKER_RUNTIME_MOCK=1 \
   CF_AUDIT_DOCKER_VIA_SUDO=0 \
+  CF_AUDIT_GATEWAY_ENV_FILE="$GATEWAY_ENV_FILE" \
   CONTAINER_NAME="$TEST_CONTAINER" \
   CF_AGENT_WECHAT_COMPOSE_FILE="$AGENT_COMPOSE_FILE" \
   CF_AGENT_GATEWAY_COMPOSE_FILE="$GATEWAY_COMPOSE_FILE" \
   CF_AGENT_GATEWAY_PROJECT_DIR="$GATEWAY_PROJECT_DIR" \
+  CF_AGENT_GATEWAY_ENV_FILE="$GATEWAY_ENV_FILE" \
   NO_PROXY=127.0.0.1,localhost \
   /bin/bash -x "${TEST_REPO}/scripts/status.sh" > "$TRACE_OUTPUT" 2>&1; then
   :
@@ -549,7 +571,7 @@ LOGIN_PID=$!
 for _attempt in $(seq 1 900); do
   [ -e "$PAUSE_FILE" ] && break
   kill -0 "$LOGIN_PID" 2>/dev/null || {
-    cat "$LOGIN_OUTPUT" >&2
+    print_redacted_file "$LOGIN_OUTPUT"
     fail "login.sh exited before WebSocket pause"
   }
   sleep 0.1
@@ -558,7 +580,7 @@ done
 assert_user_processes_have_no_token
 touch "$CONTINUE_FILE"
 if ! wait "$LOGIN_PID"; then
-  cat "$LOGIN_OUTPUT" >&2
+  print_redacted_file "$LOGIN_OUTPUT"
   fail "ordinary-user login.sh failed"
 fi
 LOGIN_PID=""
@@ -597,7 +619,7 @@ LOGIN_PID=$!
 for _attempt in $(seq 1 900); do
   [ -e "$PAUSE_FILE" ] && break
   kill -0 "$LOGIN_PID" 2>/dev/null || {
-    cat "$FORCE_OUTPUT" >&2
+    print_redacted_file "$FORCE_OUTPUT"
     fail "login.sh --force-qr exited before WebSocket pause"
   }
   sleep 0.1
@@ -605,7 +627,7 @@ done
 [ -e "$PAUSE_FILE" ] || fail "force-QR login did not reach WebSocket"
 touch "$CONTINUE_FILE"
 if ! wait "$LOGIN_PID"; then
-  cat "$FORCE_OUTPUT" >&2
+  print_redacted_file "$FORCE_OUTPUT"
   fail "ordinary-user login.sh --force-qr failed"
 fi
 LOGIN_PID=""
@@ -650,6 +672,7 @@ grep -q 'token 文件不存在' "$MISSING_OUTPUT" || \
 assert_token_read_once "missing-token login.sh"
 assert_no_sudo_python "missing-token login.sh"
 mv "${TOKEN_FILE}.saved" "$TOKEN_FILE"
+assert_file_has_no_token "$MISSING_OUTPUT"
 assert_secret_permissions
 printf 'PASS missing root-only token distinction\n'
 
@@ -673,6 +696,8 @@ if grep -q 'token 文件不存在' "$NO_SUDO_OUTPUT"; then
   fail "permission failure was incorrectly reported as a missing token"
 fi
 assert_file_has_no_token "$NO_SUDO_OUTPUT"
+assert_file_has_no_token "$AUDIT_LOG"
+assert_file_has_no_token "$LOG_FILE"
 assert_secret_permissions
 printf 'PASS explicit no-sudo permission error\n'
 

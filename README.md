@@ -18,6 +18,18 @@ cd /opt/cf-agent-wechat
 ./scripts/start-qr-login.sh
 ```
 
+CFserver 的 Gateway 标准布局为：
+
+- Compose：`/opt/cf-agent-gateway/deploy/compose.yaml`
+- 环境文件：`/opt/cf-agent-gateway/deploy/.env`
+- Compose 项目目录：`/opt/cf-agent-gateway/deploy`
+
+在该标准布局下，上述命令可直接运行，无需导出任何变量。非标准部署仍可通过
+`CF_AGENT_GATEWAY_COMPOSE_FILE`、`CF_AGENT_GATEWAY_ENV_FILE` 和
+`CF_AGENT_GATEWAY_PROJECT_DIR` 覆盖 Gateway 路径。生命周期脚本不自行解析、
+复制或输出环境文件内容；Docker Compose 通过 `--env-file` 将该文件作为插值/配置
+输入使用。
+
 固定流程如下：
 
 ```text

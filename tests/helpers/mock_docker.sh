@@ -101,8 +101,13 @@ esac
 
 shift
 compose_file=""
+compose_env_file=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
+    --env-file)
+      compose_env_file="$2"
+      shift 2
+      ;;
     --project-directory)
       shift 2
       ;;
@@ -121,8 +126,17 @@ command_name="${1:-}"
 shift
 if [ "$compose_file" = "${MOCK_GATEWAY_COMPOSE_FILE:?}" ]; then
   compose_kind="gateway"
+  if [ "$compose_env_file" != "${MOCK_GATEWAY_ENV_FILE:?}" ]; then
+    record "gateway compose env-file invalid"
+    exit 67
+  fi
+  record "gateway compose env-file verified"
 else
   compose_kind="agent"
+  if [ -n "$compose_env_file" ]; then
+    record "agent compose unexpected env-file"
+    exit 67
+  fi
 fi
 
 case "$command_name" in

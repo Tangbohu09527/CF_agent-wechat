@@ -29,10 +29,20 @@ if [ "${CF_AUDIT_DOCKER_RUNTIME_MOCK:-}" = "1" ]; then
       ;;
     compose)
       compose_command=""
+      compose_env_file=""
+      expect_env_file=0
       for argument in "$@"; do
+        if [ "$expect_env_file" -eq 1 ]; then
+          compose_env_file="$argument"
+          expect_env_file=0
+          continue
+        fi
+        if [ "$argument" = "--env-file" ]; then
+          expect_env_file=1
+          continue
+        fi
         if [ "$argument" = "ps" ]; then
           compose_command="ps"
-          break
         fi
       done
       if [ "$compose_command" != "ps" ]; then
@@ -41,7 +51,15 @@ if [ "${CF_AUDIT_DOCKER_RUNTIME_MOCK:-}" = "1" ]; then
       fi
       service="${*: -1}"
       case "$service" in
-        agent-wechat|wechat-worker)
+        agent-wechat)
+          printf 'runtime-fixture-%s\n' "$service"
+          exit 0
+          ;;
+        wechat-worker)
+          if [ "$compose_env_file" != "${CF_AUDIT_GATEWAY_ENV_FILE:?}" ]; then
+            printf '%s\n' 'Gateway env-file argument mismatch' >&2
+            exit 67
+          fi
           printf 'runtime-fixture-%s\n' "$service"
           exit 0
           ;;

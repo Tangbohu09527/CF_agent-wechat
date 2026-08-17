@@ -12,8 +12,9 @@ ARCHIVE_ROOT="${CF_AGENT_WECHAT_ARCHIVE_ROOT:-${STORAGE_ROOT}/session-archive}"
 LEGACY_DATA_ROOT="${STORAGE_ROOT}/data"
 LEGACY_WECHAT_HOME_ROOT="${STORAGE_ROOT}/wechat-home"
 RUNTIME_LOCK_FILE="${CF_AGENT_WECHAT_LOCK_FILE:-/run/lock/cf-agent-wechat-qr-runtime.lock}"
-GATEWAY_COMPOSE_FILE="${CF_AGENT_GATEWAY_COMPOSE_FILE:-/opt/cf-agent-gateway/docker/compose.cfserver.yaml}"
-GATEWAY_PROJECT_DIR="${CF_AGENT_GATEWAY_PROJECT_DIR:-/opt/cf-agent-gateway}"
+GATEWAY_COMPOSE_FILE="${CF_AGENT_GATEWAY_COMPOSE_FILE:-/opt/cf-agent-gateway/deploy/compose.yaml}"
+GATEWAY_PROJECT_DIR="${CF_AGENT_GATEWAY_PROJECT_DIR:-/opt/cf-agent-gateway/deploy}"
+GATEWAY_ENV_FILE="${CF_AGENT_GATEWAY_ENV_FILE:-/opt/cf-agent-gateway/deploy/.env}"
 
 # These globals are validated indirectly and consumed by start-qr-login.sh.
 # shellcheck disable=SC2034
@@ -157,6 +158,7 @@ agent_compose() {
 
 gateway_compose() {
   runtime_docker compose \
+    --env-file "$GATEWAY_ENV_FILE" \
     --project-directory "$GATEWAY_PROJECT_DIR" \
     -f "$GATEWAY_COMPOSE_FILE" "$@"
 }
@@ -251,7 +253,8 @@ runtime_validate_configuration() {
 
   for required_path in \
     "$AGENT_COMPOSE_FILE" "$STORAGE_ROOT" "$RUNTIME_ROOT" "$ARCHIVE_ROOT" \
-    "$GATEWAY_COMPOSE_FILE" "$GATEWAY_PROJECT_DIR" "$TOKEN_FILE" \
+    "$GATEWAY_COMPOSE_FILE" "$GATEWAY_PROJECT_DIR" "$GATEWAY_ENV_FILE" \
+    "$TOKEN_FILE" \
     "$RUNTIME_LOCK_FILE"; do
     case "$required_path" in
       /*) ;;
@@ -268,6 +271,10 @@ runtime_validate_configuration() {
       return 1
     fi
   done
+  if [ -L "$GATEWAY_ENV_FILE" ] || [ ! -f "$GATEWAY_ENV_FILE" ]; then
+    LAST_ERROR="Gateway environment file must be an existing non-symlink regular file: $GATEWAY_ENV_FILE"
+    return 1
+  fi
   if runtime_privileged test -L "$STORAGE_ROOT" ||
     ! runtime_privileged test -d "$STORAGE_ROOT"; then
     LAST_ERROR="Storage root must be an existing non-symlink directory."
@@ -405,7 +412,7 @@ runtime_validate_stop_configuration() {
   fi
   for required_path in \
     "$AGENT_COMPOSE_FILE" "$STORAGE_ROOT" "$GATEWAY_COMPOSE_FILE" \
-    "$GATEWAY_PROJECT_DIR" "$RUNTIME_LOCK_FILE"; do
+    "$GATEWAY_PROJECT_DIR" "$GATEWAY_ENV_FILE" "$RUNTIME_LOCK_FILE"; do
     case "$required_path" in
       /*) ;;
       *)
@@ -420,6 +427,10 @@ runtime_validate_stop_configuration() {
       return 1
     fi
   done
+  if [ -L "$GATEWAY_ENV_FILE" ] || [ ! -f "$GATEWAY_ENV_FILE" ]; then
+    LAST_ERROR="Gateway environment file must be an existing non-symlink regular file: $GATEWAY_ENV_FILE"
+    return 1
+  fi
   if runtime_privileged test -L "$STORAGE_ROOT" ||
     ! runtime_privileged test -d "$STORAGE_ROOT"; then
     LAST_ERROR="Storage root must be an existing non-symlink directory."
