@@ -57,7 +57,8 @@ Debian 启动
 3. 新 `runtime/data` 和 `runtime/wechat-home` 权限正确。
 4. Token 不进入 runtime、归档或 manifest。
 5. 登录失败时 `wechat-worker` 不启动。
-6. `/usr/bin/wechat` 进程不存在时启动失败。
+6. `/usr/bin/wechat` 为符号链接时解析 canonical executable；目标进程缺失，或同名
+   进程、命令行含 `wechat` 但 executable 不匹配时启动失败。
 7. auth 为 `logged_in` 但 chats API 不可读时启动失败。
 8. chats 非空且 messages API 正常时才启动 worker。
 9. 重复执行创建不同归档，不覆盖历史目录。
@@ -69,7 +70,8 @@ Debian 启动
 15. 首次上线把 legacy `${STORAGE_ROOT}/data` 与 `wechat-home` 迁入同一个归档。
 16. runtime 与任一 legacy 目录并存时，在任何状态变更前 fail-fast。
 17. forced login 未在 SSH 实际渲染至少一个 QR 时拒绝 `login_success`。
-18. 登录后 auth/chats/messages 在有界窗口内轮询，超时或进程替换时失败。
+18. 登录后 auth/chats/messages 在有界窗口内轮询，并跟踪同一 `PID:start_time`；
+    超时、`PID:start_time` 身份变化或 canonical executable 不再匹配时失败。
 19. start/stop 共用指定 `flock`；并发只有一个流程获得锁。
 
 ### 静态质量检查
@@ -111,7 +113,8 @@ Debian 启动
 - [ ] 确认 manifest 只有时间、权限和脱敏结果，不含敏感内容。
 - [ ] 确认新 data 和 wechat-home 的 UID、GID、权限正确。
 - [ ] 确认 agent-server 可访问。
-- [ ] 确认 `/usr/bin/wechat` 进程存在并稳定。
+- [ ] 确认 launcher 的 canonical executable 精确匹配，且同一 `PID:start_time`
+  身份稳定。
 - [ ] 确认 SSH 终端实际渲染至少一个全新 QR，并用手机扫码；仅成功事件不算证据。
 - [ ] 确认登录后 API 在 `POST_LOGIN_READY_TIMEOUT` 有界窗口内就绪。
 - [ ] 确认 auth 为 `logged_in`。

@@ -28,6 +28,16 @@ mutate() {
   printf '%s\n' "$1" >> "$MOCK_DOCKER_MUTATION_LOG"
 }
 
+require_process_contract_fragment() {
+  case "$1" in
+    *"$2"*) ;;
+    *)
+      printf '%s\n' 'wechat process identity contract mismatch' >&2
+      exit 65
+      ;;
+  esac
+}
+
 case "${1:-}" in
   info)
     record "docker info"
@@ -35,6 +45,22 @@ case "${1:-}" in
     ;;
   exec)
     record "docker exec wechat-process-check"
+    process_script="${5:-}"
+    require_process_contract_fragment "$process_script" 'readlink -f /usr/bin/wechat'
+    require_process_contract_fragment "$process_script" 'case "$launcher_real" in'
+    require_process_contract_fragment "$process_script" 'proc_exe="$(readlink "$process_dir/exe"'
+    require_process_contract_fragment "$process_script" '[ "$proc_exe" = "$launcher_real" ] || continue'
+    require_process_contract_fragment "$process_script" 'printf "%s:%s\n" "$process_id" "$start_time"'
+    if [ "$(state_get wechat_launcher_resolves 1)" != "1" ]; then
+      exit 1
+    fi
+    launcher_real="$(state_get wechat_launcher_real /opt/wechat/wechat)"
+    case "$launcher_real" in
+      /*) ;;
+      *) exit 1 ;;
+    esac
+    proc_exe="$(state_get wechat_proc_exe /opt/wechat/wechat)"
+    [ "$proc_exe" = "$launcher_real" ] || exit 1
     calls="$(state_get wechat_calls 0)"
     calls=$((calls + 1))
     state_set wechat_calls "$calls"
@@ -63,6 +89,14 @@ case "${1:-}" in
           printf '%s\n' '4242:9001'
         else
           printf '%s\n' '5252:9002'
+        fi
+        exit 0
+        ;;
+      same_pid_new_start_on_final_check)
+        if [ "$calls" -le 5 ]; then
+          printf '%s\n' '4242:9001'
+        else
+          printf '%s\n' '4242:9002'
         fi
         exit 0
         ;;

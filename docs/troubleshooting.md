@@ -156,10 +156,15 @@ sudo docker exec cf-agent-wechat \
 重启；保留现场后重新运行完整入口。`restart: on-failure:3` 已限制容器失败重试，不应
 改回 `always` 或 `unless-stopped`。
 
-## WeChat 进程不存在或崩溃
+## WeChat 进程不存在、被替换或身份不匹配
 
 即使 agent-server 可访问或 auth 显示 `logged_in`，`/usr/bin/wechat` 真实进程不存在
 也必须判定失败。检查：
+
+`/usr/bin/wechat` 是 launcher 路径，可能是符号链接。生命周期脚本先将其解析为
+canonical executable，只接受 `/proc/<pid>/exe` 的链接目标与该路径精确一致的进程。
+不得仅凭 `comm`、basename、进程名或命令行包含 `wechat` 做宽松匹配；`ps -ef`
+只能辅助排查，不能作为 worker 放行证据。
 
 ```bash
 sudo docker exec cf-agent-wechat ps -ef
@@ -170,8 +175,11 @@ sudo docker compose \
   logs --since=15m agent-wechat
 ```
 
-只确认进程路径和稳定性，不在工单中粘贴可能包含账号信息的完整输出。排查 Xvfb、窗口
-管理器、资源不足和上游客户端崩溃。进程不存在或持续重启时，`wechat-worker` 不得启动。
+脚本使用 `PID:start_time` 标识已验证进程，其中 `start_time` 来自
+`/proc/<pid>/stat`。稳定等待、登录后验证和最终验证都必须保持同一身份且 executable
+仍精确匹配；PID 消失、PID 复用后 start time 改变或 executable 不匹配都视为退出或
+替换。不要在工单中粘贴可能包含账号信息的完整输出。排查 Xvfb、窗口管理器、资源不足
+和上游客户端崩溃；任一身份检查失败时 `wechat-worker` 不得启动。
 
 ## 状态为 `logged_out`
 
@@ -198,7 +206,7 @@ runtime is not clean; use start-qr-login.sh
 1. 保持 SSH 会话和终端宽度足够。
 2. 扫描最后显示的二维码，旧二维码可能已经过期。
 3. 检查 WebSocket 是否出现 `qr`、`phone_confirm`、超时或脱敏错误事件。
-4. 确认 `/usr/bin/wechat` 在等待期间持续存在。
+4. 确认 canonical executable 对应的同一 `PID:start_time` 身份在等待期间持续存在。
 5. 当前流程退出后，再运行完整启动入口。
 
 强制模式必须实际在 SSH 终端渲染至少一个 QR；未渲染 QR 即使收到 `login_success`
@@ -212,7 +220,7 @@ runtime is not clean; use start-qr-login.sh
 WebSocket 成功事件不是最终生产可用证明。启动流程会在
 `POST_LOGIN_READY_TIMEOUT`（默认 120 秒）的有界窗口内轮询并确认：
 
-1. `/usr/bin/wechat` 进程持续存在；
+1. canonical executable 对应的同一 `PID:start_time` 身份持续存在；
 2. `/api/status/auth` 返回 `logged_in`；
 3. `/api/chats` 成功且至少返回一个聊天；
 4. 对 API 返回的一个聊天执行消息读取成功。

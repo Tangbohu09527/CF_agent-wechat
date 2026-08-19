@@ -4,6 +4,16 @@ set -euo pipefail
 : "${CF_AUDIT_LOG:?}"
 : "${CF_AUDIT_REAL_DOCKER:?}"
 
+require_process_contract_fragment() {
+  case "$1" in
+    *"$2"*) ;;
+    *)
+      printf '%s\n' 'wechat process identity contract mismatch' >&2
+      exit 65
+      ;;
+  esac
+}
+
 if [ "${1:-}" = "inspect" ]; then
   printf 'docker\tinspect\n' >> "$CF_AUDIT_LOG"
   if [ "${CF_AUDIT_DOCKER_MODE:-}" = "nonpermission" ]; then
@@ -74,6 +84,12 @@ if [ "${CF_AUDIT_DOCKER_RUNTIME_MOCK:-}" = "1" ]; then
       esac
       ;;
     exec)
+      process_script="${5:-}"
+      require_process_contract_fragment "$process_script" 'readlink -f /usr/bin/wechat'
+      require_process_contract_fragment "$process_script" 'case "$launcher_real" in'
+      require_process_contract_fragment "$process_script" 'proc_exe="$(readlink "$process_dir/exe"'
+      require_process_contract_fragment "$process_script" '[ "$proc_exe" = "$launcher_real" ] || continue'
+      require_process_contract_fragment "$process_script" 'printf "%s:%s\n" "$process_id" "$start_time"'
       printf '%s\n' '4242:9001'
       exit 0
       ;;

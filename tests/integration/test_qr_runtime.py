@@ -136,6 +136,9 @@ class RuntimeFixture:
             "agent_running": "1",
             "wechat_mode": "stable",
             "wechat_calls": "0",
+            "wechat_launcher_resolves": "1",
+            "wechat_launcher_real": "/opt/wechat/wechat",
+            "wechat_proc_exe": "/opt/wechat/wechat",
         }.items():
             (self.docker_state / name).write_text(value + "\n", encoding="ascii")
 
@@ -494,6 +497,14 @@ class ForcedQrRuntimeTests(unittest.TestCase):
     def test_success_archives_atomically_preserves_permissions_and_gates_worker(
         self,
     ) -> None:
+        self.assertNotEqual(
+            self.fixture.read_state("wechat_launcher_real"),
+            "/usr/bin/wechat",
+        )
+        self.assertEqual(
+            self.fixture.read_state("wechat_proc_exe"),
+            self.fixture.read_state("wechat_launcher_real"),
+        )
         old_inode = self.fixture.runtime.stat().st_ino
         token_hash = hashlib.sha256(
             (self.fixture.secrets / "auth-token").read_bytes()
@@ -568,6 +579,7 @@ class ForcedQrRuntimeTests(unittest.TestCase):
 
         traced_status = self.fixture.run("status.sh", trace=True)
         self.assert_succeeded(traced_status)
+        self.assertIn("WeChat Process:\n  running", traced_status.stdout)
         self.fixture.assert_no_sensitive_text(self, traced_status.stdout)
 
     def test_first_start_archives_the_complete_legacy_layout(self) -> None:
@@ -916,13 +928,66 @@ class ForcedQrRuntimeTests(unittest.TestCase):
         )
 
     def test_missing_or_unstable_wechat_process_fails_before_login(self) -> None:
-        self.fixture.write_state("wechat_mode", "missing")
-        result = self.fixture.run("start-qr-login.sh")
-        self.assert_failed(result)
-        self.assertEqual(self.fixture.read_state("gateway_running"), "0")
-        self.assertEqual(self.fixture.login_log.read_text(), "")
-        self.assertNotIn("gateway worker start", self.fixture.mutation_lines())
-        self.assertIn("/usr/bin/wechat did not remain stable", result.stdout)
+        for index, mode in enumerate(("missing", "unstable")):
+            if index:
+                self.fixture.close()
+                self.fixture = RuntimeFixture(
+                    f"{self._testMethodName}-{mode}"
+                )
+            with self.subTest(mode=mode):
+                self.fixture.write_state("wechat_mode", mode)
+                result = self.fixture.run("start-qr-login.sh")
+                self.assert_failed(result)
+                self.assertEqual(
+                    self.fixture.read_state("gateway_running"), "0"
+                )
+                self.assertEqual(self.fixture.login_log.read_text(), "")
+                self.assertNotIn(
+                    "gateway worker start", self.fixture.mutation_lines()
+                )
+                self.assertIn(
+                    "/usr/bin/wechat did not remain stable", result.stdout
+                )
+                for archived in self.fixture.archive_dirs():
+                    self.fixture.assert_tree_has_no_sensitive_text(
+                        self, archived
+                    )
+
+    def test_launcher_and_executable_mismatches_fail_closed(self) -> None:
+        cases = (
+            {"wechat_launcher_resolves": "0"},
+            {"wechat_launcher_real": "opt/wechat/wechat"},
+            {
+                "wechat_proc_exe": "/opt/wechat/not-wechat",
+                "wechat_comm": "wechat",
+                "wechat_cmdline": "/usr/bin/wechat --fixture",
+            },
+        )
+        for index, state in enumerate(cases):
+            if index:
+                self.fixture.close()
+                self.fixture = RuntimeFixture(
+                    f"{self._testMethodName}-{index}"
+                )
+            with self.subTest(state=state):
+                for name, value in state.items():
+                    self.fixture.write_state(name, value)
+                result = self.fixture.run("start-qr-login.sh")
+                self.assert_failed(result)
+                self.assertEqual(
+                    self.fixture.read_state("gateway_running"), "0"
+                )
+                self.assertEqual(self.fixture.login_log.read_text(), "")
+                self.assertNotIn(
+                    "gateway worker start", self.fixture.mutation_lines()
+                )
+                self.assertIn(
+                    "/usr/bin/wechat did not remain stable", result.stdout
+                )
+                for archived in self.fixture.archive_dirs():
+                    self.fixture.assert_tree_has_no_sensitive_text(
+                        self, archived
+                    )
 
     def test_logged_in_with_unreadable_chats_never_starts_worker(self) -> None:
         self.fixture.set_scenario(chats_mode="error")
@@ -971,14 +1036,30 @@ class ForcedQrRuntimeTests(unittest.TestCase):
     def test_process_identity_change_after_api_validation_blocks_worker(
         self,
     ) -> None:
-        self.fixture.write_state("wechat_mode", "change_on_final_check")
-        result = self.fixture.run("start-qr-login.sh")
-        self.assert_failed(result)
-        self.assertIn(
-            "GET /api/messages/<redacted>", self.fixture.audit_lines()
+        modes = (
+            "change_on_final_check",
+            "same_pid_new_start_on_final_check",
         )
-        self.assertNotIn("gateway worker start", self.fixture.mutation_lines())
-        self.assertEqual(self.fixture.read_state("gateway_running"), "0")
+        for index, mode in enumerate(modes):
+            if index:
+                self.fixture.close()
+                self.fixture = RuntimeFixture(
+                    f"{self._testMethodName}-{mode}"
+                )
+            with self.subTest(mode=mode):
+                self.fixture.write_state("wechat_mode", mode)
+                result = self.fixture.run("start-qr-login.sh")
+                self.assert_failed(result)
+                self.assertIn(
+                    "GET /api/messages/<redacted>",
+                    self.fixture.audit_lines(),
+                )
+                self.assertNotIn(
+                    "gateway worker start", self.fixture.mutation_lines()
+                )
+                self.assertEqual(
+                    self.fixture.read_state("gateway_running"), "0"
+                )
 
     def test_repeated_start_never_overwrites_an_archive(self) -> None:
         first = self.fixture.run("start-qr-login.sh")
@@ -1089,6 +1170,16 @@ class ForcedQrRuntimeTests(unittest.TestCase):
         missing_process = self.fixture.run("status.sh")
         self.assert_failed(missing_process)
         self.assertIn("/usr/bin/wechat is not running", missing_process.stdout)
+
+        self.fixture.write_state("wechat_calls", "0")
+        self.fixture.write_state("wechat_mode", "unstable")
+        replaced_process = self.fixture.run("status.sh")
+        self.assert_failed(replaced_process)
+        self.assertIn(
+            "WeChat Process:\n  exited_or_replaced",
+            replaced_process.stdout,
+        )
+        self.assertEqual(self.fixture.mutation_lines(), [])
 
     def test_gateway_compose_ps_error_is_not_reported_as_stopped_or_success(
         self,

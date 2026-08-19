@@ -447,6 +447,32 @@ assert_no_sudo_python "Docker permission fallback"
 printf 'PASS ordinary then sudo Docker socket permission fallback\n'
 
 reset_audit
+COMMON_IDENTITY_OUTPUT="${TEST_ROOT}/common-identity.out"
+if ! "$REAL_SUDO" -u "$TEST_USER" -H env \
+  PATH="$AUDIT_PATH" \
+  CF_AUDIT_LOG="$AUDIT_LOG" \
+  CF_AUDIT_REAL_DOCKER="$REAL_DOCKER" \
+  CF_AUDIT_REAL_SUDO="$REAL_SUDO" \
+  CF_AUDIT_DOCKER_RUNTIME_MOCK=1 \
+  CF_AUDIT_DOCKER_VIA_SUDO=0 \
+  CF_AUDIT_AGENT_ENV_FILE="$AGENT_ENV_FILE" \
+  CF_AUDIT_GATEWAY_ENV_FILE="$GATEWAY_ENV_FILE" \
+  CONTAINER_NAME="$TEST_CONTAINER" /bin/bash -c \
+  'cd "$1"; source scripts/common.sh; get_wechat_process_identity' \
+  cf-agent-wechat-test "$TEST_REPO" \
+  > "$COMMON_IDENTITY_OUTPUT" 2>&1; then
+  print_redacted_file "$COMMON_IDENTITY_OUTPUT"
+  fail "common WeChat identity check did not use the sudo Docker fallback"
+fi
+[ "$(cat "$COMMON_IDENTITY_OUTPUT")" = "4242:9001" ] || \
+  fail "common WeChat identity check returned an unexpected identity"
+[ "$(audit_count sudo docker-exec)" -eq 1 ] || \
+  fail "common WeChat identity check did not use exactly one sudo Docker exec"
+assert_no_sudo_python "common WeChat identity Docker fallback"
+assert_file_has_no_token "$COMMON_IDENTITY_OUTPUT"
+printf 'PASS canonical WeChat identity with sudo Docker fallback\n'
+
+reset_audit
 if NONPERMISSION_OUTPUT="$("$REAL_SUDO" -u "$TEST_USER" -H env \
   PATH="$AUDIT_PATH" \
   CF_AUDIT_LOG="$AUDIT_LOG" \

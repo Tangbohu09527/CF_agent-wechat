@@ -240,12 +240,15 @@ cd /opt/cf-agent-wechat
    `data`/`wechat-home` 时，将两者迁入同一个归档。mixed layout 在步骤 2 前失败。
 5. 创建全新的 `runtime/data` 与 `runtime/wechat-home`，继承正确 UID、GID 和权限。
 6. 启动容器并等待 agent-server 可访问。
-7. 等待 `/usr/bin/wechat` 进程存在且稳定，并进入 `logged_out` 或二维码界面。
+7. 解析 `/usr/bin/wechat` launcher（包括符号链接）得到 canonical executable，
+   只接受 `/proc/<pid>/exe` 的链接目标精确匹配 canonical executable 的进程，记录
+   其 `PID:start_time` 并等待稳定；不使用进程名或命令行字符串宽松匹配。
 8. 调用 `login.sh --force-qr`，以 `newAccount=true` 请求二维码；SSH 终端必须实际
    渲染至少一个 QR，否则不接受登录成功。
 9. 等待手机扫码和 `logged_in`。
-10. 在 `POST_LOGIN_READY_TIMEOUT` 有界窗口内等待 WeChat 进程持续存在、auth 为
-    `logged_in`、chats 至少返回一个聊天，并对 API 返回的一个聊天读取 messages。
+10. 在 `POST_LOGIN_READY_TIMEOUT` 有界窗口内等待同一 `PID:start_time` 身份持续
+    存在且 canonical executable 仍精确匹配、auth 为 `logged_in`、chats 至少返回
+    一个聊天，并对 API 返回的一个聊天读取 messages。
 11. 只有全部通过才启动 `wechat-worker`，随后输出最终状态。
 
 worker 停止已经确认后，后续失败会保持停止、保留归档且不启动 AI 调度。若初始 stop
@@ -303,8 +306,10 @@ runtime is not clean; use start-qr-login.sh
 - `Message API`
 - `Gateway WeChat Worker`
 
-WeChat 进程不存在或 `/api/chats` 不可读时必须非零退出。只有进程存在、auth 为
-`logged_in` 且 chats 可读时，状态才为生产可用。账号和聊天 ID 不得输出。
+`WeChat Process` 仅表示 canonical executable 精确匹配且同一 `PID:start_time`
+身份稳定；同名进程、仅 PID 相同或命令行包含 `wechat` 均不足以通过。进程身份不存在
+或 `/api/chats` 不可读时必须非零退出。只有进程身份、auth 和 chats 都通过时，状态
+才为生产可用。账号和聊天 ID 不得输出。
 
 容器 `healthy`、WebSocket `login_success` 或 auth `logged_in` 任一单项都不足以证明
 生产可用。worker 放行还要求 chats 非空和 messages 读取成功。

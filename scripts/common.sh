@@ -418,9 +418,15 @@ get_wechat_process_identity() {
   # Variables in this snippet are expanded by the shell inside the container.
   # shellcheck disable=SC2016
   docker_readonly_capture exec "$CONTAINER_NAME" sh -c '
+launcher_real="$(readlink -f /usr/bin/wechat 2>/dev/null || true)"
+case "$launcher_real" in
+  /*) ;;
+  *) exit 1 ;;
+esac
+
 for process_dir in /proc/[0-9]*; do
-  [ "$(readlink "$process_dir/exe" 2>/dev/null || true)" = /usr/bin/wechat ] ||
-    continue
+  proc_exe="$(readlink "$process_dir/exe" 2>/dev/null || true)"
+  [ "$proc_exe" = "$launcher_real" ] || continue
   process_id="${process_dir##*/}"
   start_time="$(awk "{ print \$22 }" "$process_dir/stat" 2>/dev/null || true)"
   [ -n "$start_time" ] || continue
