@@ -6,11 +6,18 @@
 
 - 工作目录：`/opt/cf-agent-wechat`
 - 正式 Compose：`docker/compose.cfserver.yaml`
+- 正式环境文件：`docker/.env`
 - 容器：`cf-agent-wechat`
 - Docker 网络：`cf-internal`
 - 显示环境：`DISPLAY=:99`，`ENABLE_VNC=0`
 - 唯一启动入口：`./scripts/start-qr-login.sh`
 - 停止入口：`./scripts/stop-qr-runtime.sh`
+
+agent-wechat 标准 Compose 输入为
+`/opt/cf-agent-wechat/docker/compose.cfserver.yaml` 和
+`/opt/cf-agent-wechat/docker/.env`，Compose 项目目录保持
+`/opt/cf-agent-wechat`。生命周期脚本显式通过 `--env-file` 使用该文件；非标准
+环境文件路径通过 `CF_AGENT_WECHAT_ENV_FILE` 覆盖。
 
 Gateway 标准布局为 Compose
 `/opt/cf-agent-gateway/deploy/compose.yaml`、环境文件
@@ -19,8 +26,10 @@ Gateway 标准布局为 Compose
 `/opt/cf-agent-wechat` 直接运行启动或停止脚本即可，无需导出变量。非标准布局
 继续使用 `CF_AGENT_GATEWAY_COMPOSE_FILE`、
 `CF_AGENT_GATEWAY_ENV_FILE` 和 `CF_AGENT_GATEWAY_PROJECT_DIR` 覆盖；
-运维检查只确认 `.env` 的路径和元数据。生命周期脚本不自行解析、复制或输出其
-内容；Docker Compose 通过 `--env-file` 将该文件作为插值/配置输入使用。
+运维检查只确认环境文件的路径和元数据。生命周期脚本不自行读取、解析、复制或输出
+内容；Docker Compose 通过 `--env-file` 将对应文件作为插值/配置输入使用。
+start/stop 在任何容器、worker、runtime、归档或锁变更前，要求 agent-wechat 环境文件
+路径为绝对路径，且为已存在的普通非符号链接文件。
 
 `docker/docker-compose.yml` 是实验或验证配置，不得用于 CFserver。生产环境不再恢复旧
 微信登录会话；每次 Debian 重启、容器重建或人工重新启动都需要 SSH 人工扫码。
@@ -30,8 +39,16 @@ Gateway 标准布局为 Compose
 ```bash
 cd /opt/cf-agent-wechat
 ./scripts/status.sh
-sudo docker compose -f docker/compose.cfserver.yaml ps
-sudo docker compose -f docker/compose.cfserver.yaml logs --tail=200 agent-wechat
+sudo docker compose \
+  --env-file /opt/cf-agent-wechat/docker/.env \
+  --project-directory /opt/cf-agent-wechat \
+  -f /opt/cf-agent-wechat/docker/compose.cfserver.yaml \
+  ps
+sudo docker compose \
+  --env-file /opt/cf-agent-wechat/docker/.env \
+  --project-directory /opt/cf-agent-wechat \
+  -f /opt/cf-agent-wechat/docker/compose.cfserver.yaml \
+  logs --tail=200 agent-wechat
 ```
 
 `status.sh` 至少显示 `Container`、`Agent Server`、`WeChat Process`、`Auth`、
@@ -126,8 +143,16 @@ Debian 重启后，`agent-wechat` 不应自动复用旧会话并投入工作。�
 
 ```bash
 cd /opt/cf-agent-wechat
-sudo docker compose -f docker/compose.cfserver.yaml config --quiet
-sudo docker compose -f docker/compose.cfserver.yaml pull agent-wechat
+sudo docker compose \
+  --env-file /opt/cf-agent-wechat/docker/.env \
+  --project-directory /opt/cf-agent-wechat \
+  -f /opt/cf-agent-wechat/docker/compose.cfserver.yaml \
+  config --quiet
+sudo docker compose \
+  --env-file /opt/cf-agent-wechat/docker/.env \
+  --project-directory /opt/cf-agent-wechat \
+  -f /opt/cf-agent-wechat/docker/compose.cfserver.yaml \
+  pull agent-wechat
 ```
 
 不要在拉取后直接用 `up -d --force-recreate` 投入工作。升级、重建和镜像回滚完成后都

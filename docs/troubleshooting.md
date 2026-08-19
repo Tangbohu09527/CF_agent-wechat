@@ -16,7 +16,8 @@ cd /opt/cf-agent-wechat
 ## 排查顺序
 
 1. 确认没有另一个 `start-qr-login.sh` 持有登录锁。
-2. 确认正式 Compose、Token 元数据、runtime 和归档根配置正确。
+2. 确认正式 Compose、agent-wechat 环境文件、Token 元数据、runtime 和归档根配置
+   正确。
 3. 查看 `./scripts/status.sh` 的七个状态项。
 4. 确认 `/usr/bin/wechat` 真实进程存在且稳定。
 5. 区分 auth、chats 和 messages 三层 API 结果。
@@ -28,8 +29,16 @@ cd /opt/cf-agent-wechat
 ```bash
 cd /opt/cf-agent-wechat
 ./scripts/status.sh
-sudo docker compose -f docker/compose.cfserver.yaml ps
-sudo docker compose -f docker/compose.cfserver.yaml logs --tail=200 agent-wechat
+sudo docker compose \
+  --env-file /opt/cf-agent-wechat/docker/.env \
+  --project-directory /opt/cf-agent-wechat \
+  -f /opt/cf-agent-wechat/docker/compose.cfserver.yaml \
+  ps
+sudo docker compose \
+  --env-file /opt/cf-agent-wechat/docker/.env \
+  --project-directory /opt/cf-agent-wechat \
+  -f /opt/cf-agent-wechat/docker/compose.cfserver.yaml \
+  logs --tail=200 agent-wechat
 ```
 
 `docker/docker-compose.yml` 是实验配置，不得用于 CFserver。
@@ -48,10 +57,17 @@ worker，并在锁获取
 按错误提示检查：
 
 - `docker/compose.cfserver.yaml` 是否存在并可静态渲染；
+- agent-wechat 环境文件路径是否为绝对路径，文件是否存在、是否为普通文件且不是符号
+  链接；标准路径为 `/opt/cf-agent-wechat/docker/.env`；
 - 必要命令和外部 `cf-internal` 网络是否存在；
 - runtime、archive 和 secrets 父目录是否为预期类型；
 - Token 是否为独立文件且权限正确；
 - Gateway worker 控制配置是否完整。
+
+生命周期脚本显式通过 `--env-file` 使用 agent-wechat 环境文件，Compose 项目目录
+仍为 `/opt/cf-agent-wechat`。非标准路径检查 `CF_AGENT_WECHAT_ENV_FILE` 覆盖值。
+校验失败会明确指出 agent-wechat environment file，并在任何容器、worker、runtime、
+归档或锁变更前返回。
 
 Gateway 默认 Compose、环境文件和项目目录分别为
 `/opt/cf-agent-gateway/deploy/compose.yaml`、
@@ -60,8 +76,9 @@ Gateway 默认 Compose、环境文件和项目目录分别为
 `cd /opt/cf-agent-wechat` 后的 `./scripts/start-qr-login.sh`，无需导出变量。
 若现场路径不同，检查 `CF_AGENT_GATEWAY_COMPOSE_FILE`、
 `CF_AGENT_GATEWAY_ENV_FILE` 和 `CF_AGENT_GATEWAY_PROJECT_DIR` 覆盖值；
-运维检查只确认 `.env` 是否位于预期路径及其元数据。生命周期脚本不自行解析、
-复制或输出其内容；Docker Compose 通过 `--env-file` 将该文件作为插值/配置输入使用。
+运维检查只确认 agent-wechat 和 Gateway 环境文件是否位于预期路径及其元数据。
+生命周期脚本不自行读取、解析、复制或输出内容；Docker Compose 通过 `--env-file`
+使用对应文件。
 
 不要通过创建假 Token、放宽权限、修改其他仓库或跳过检查继续启动。
 
@@ -121,8 +138,16 @@ legacy 目录并存属于 mixed layout，校验会在停止 worker/容器前 fai
 `start-qr-login.sh` 会启动容器并等待 agent-server。超时或健康失败时查看：
 
 ```bash
-sudo docker compose -f docker/compose.cfserver.yaml ps
-sudo docker compose -f docker/compose.cfserver.yaml logs --tail=300 agent-wechat
+sudo docker compose \
+  --env-file /opt/cf-agent-wechat/docker/.env \
+  --project-directory /opt/cf-agent-wechat \
+  -f /opt/cf-agent-wechat/docker/compose.cfserver.yaml \
+  ps
+sudo docker compose \
+  --env-file /opt/cf-agent-wechat/docker/.env \
+  --project-directory /opt/cf-agent-wechat \
+  -f /opt/cf-agent-wechat/docker/compose.cfserver.yaml \
+  logs --tail=300 agent-wechat
 sudo docker exec cf-agent-wechat \
   curl --fail --silent --show-error http://127.0.0.1:6174/health
 ```
@@ -138,7 +163,11 @@ sudo docker exec cf-agent-wechat \
 
 ```bash
 sudo docker exec cf-agent-wechat ps -ef
-sudo docker compose -f docker/compose.cfserver.yaml logs --since=15m agent-wechat
+sudo docker compose \
+  --env-file /opt/cf-agent-wechat/docker/.env \
+  --project-directory /opt/cf-agent-wechat \
+  -f /opt/cf-agent-wechat/docker/compose.cfserver.yaml \
+  logs --since=15m agent-wechat
 ```
 
 只确认进程路径和稳定性，不在工单中粘贴可能包含账号信息的完整输出。排查 Xvfb、窗口

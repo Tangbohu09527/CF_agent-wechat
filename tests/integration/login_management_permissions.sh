@@ -89,6 +89,8 @@ AUDIT_BIN="${TEST_ROOT}/audit-bin"
 AUDIT_LOG="${TEST_ROOT}/audit.log"
 AUDIT_PATH="${AUDIT_BIN}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 AGENT_COMPOSE_FILE="${TEST_ROOT}/agent-compose.yaml"
+AGENT_ENV_FILE="${TEST_ROOT}/agent.env"
+AGENT_ENV_SENTINEL="agent-env-fixture-sensitive-permissions-$$"
 GATEWAY_PROJECT_DIR="${TEST_ROOT}/gateway"
 GATEWAY_COMPOSE_FILE="${GATEWAY_PROJECT_DIR}/compose.yaml"
 GATEWAY_ENV_FILE="${GATEWAY_PROJECT_DIR}/.env"
@@ -112,11 +114,12 @@ install -o root -g root -m 755 \
   "${REPO_ROOT}/tests/helpers/audit_sudo.sh" "${AUDIT_BIN}/sudo"
 install -d -o root -g root -m 755 "$GATEWAY_PROJECT_DIR"
 printf '%s\n' 'services:' '  agent-wechat: {}' > "$AGENT_COMPOSE_FILE"
+printf 'AGENT_ENV_FIXTURE=%s\n' "$AGENT_ENV_SENTINEL" > "$AGENT_ENV_FILE"
 printf '%s\n' 'services:' '  wechat-worker: {}' > "$GATEWAY_COMPOSE_FILE"
 chmod 644 "$AGENT_COMPOSE_FILE" "$GATEWAY_COMPOSE_FILE"
 printf '%s\n' "$GATEWAY_ENV_SENTINEL" > "$GATEWAY_ENV_FILE"
-chown root:root "$GATEWAY_ENV_FILE"
-chmod 600 "$GATEWAY_ENV_FILE"
+chown root:root "$AGENT_ENV_FILE" "$GATEWAY_ENV_FILE"
+chmod 600 "$AGENT_ENV_FILE" "$GATEWAY_ENV_FILE"
 
 useradd --create-home --home-dir "$TEST_HOME" --shell /bin/bash "$TEST_USER"
 useradd --create-home --home-dir "$NO_SUDO_HOME" --shell /bin/bash "$NO_SUDO_USER"
@@ -139,6 +142,10 @@ chown root:root "$TOKEN_FILE"
 chmod 600 "$TOKEN_FILE"
 printf 'logged_in\n' > "$STATE_FILE"
 reset_audit() {
+  if [ -s "$AUDIT_LOG" ] &&
+    grep -Fq -- "$AGENT_ENV_SENTINEL" "$AUDIT_LOG"; then
+    fail "agent-wechat environment sentinel leaked into the audit log"
+  fi
   if [ -s "$AUDIT_LOG" ] &&
     grep -Fq -- "$GATEWAY_ENV_SENTINEL" "$AUDIT_LOG"; then
     fail "Gateway environment sentinel leaked into the audit log"
@@ -195,6 +202,8 @@ assert_runtime_mock_requires_sudo() {
     PATH="$AUDIT_PATH" \
     CF_AUDIT_LOG="$AUDIT_LOG" \
     CF_AUDIT_REAL_DOCKER="$REAL_DOCKER" \
+    CF_AUDIT_AGENT_ENV_FILE="$AGENT_ENV_FILE" \
+    CF_AUDIT_GATEWAY_ENV_FILE="$GATEWAY_ENV_FILE" \
     CF_AUDIT_DOCKER_RUNTIME_MOCK=1 \
     CF_AUDIT_DOCKER_VIA_SUDO=0 \
     docker "$@" > /dev/null 2> "$error_file"; then
@@ -234,38 +243,46 @@ assert_secret_permissions() {
     fail "secrets directory permissions changed"
   [ "$(stat -c '%U:%G %a' "$TOKEN_FILE")" = "root:root 600" ] || \
     fail "auth-token permissions changed"
+  [ "$(stat -c '%U:%G %a' "$AGENT_ENV_FILE")" = "root:root 600" ] || \
+    fail "agent-wechat environment file permissions changed"
   [ "$(stat -c '%U:%G %a' "$GATEWAY_ENV_FILE")" = "root:root 600" ] || \
     fail "Gateway environment file permissions changed"
 }
 
 assert_file_has_no_token() {
-  python3 - "$TOKEN_FILE" "$GATEWAY_ENV_SENTINEL" "$1" <<'PY'
+  python3 - "$TOKEN_FILE" "$AGENT_ENV_SENTINEL" \
+    "$GATEWAY_ENV_SENTINEL" "$1" <<'PY'
 import sys
 from pathlib import Path
 
 token = Path(sys.argv[1]).read_bytes().rstrip(b"\n")
-gateway_env_sentinel = sys.argv[2].encode()
-content = Path(sys.argv[3]).read_bytes()
+agent_env_sentinel = sys.argv[2].encode()
+gateway_env_sentinel = sys.argv[3].encode()
+content = Path(sys.argv[4]).read_bytes()
 for name, sensitive in (
     ("token", token),
+    ("agent-wechat environment sentinel", agent_env_sentinel),
     ("Gateway environment sentinel", gateway_env_sentinel),
 ):
     if sensitive in content:
-        raise SystemExit(f"{name} leaked into {sys.argv[3]}")
+        raise SystemExit(f"{name} leaked into {sys.argv[4]}")
 PY
 }
 
 print_redacted_file() {
-  python3 - "$TOKEN_FILE" "$GATEWAY_ENV_SENTINEL" "$1" <<'PY'
+  python3 - "$TOKEN_FILE" "$AGENT_ENV_SENTINEL" \
+    "$GATEWAY_ENV_SENTINEL" "$1" <<'PY'
 import sys
 from pathlib import Path
 
 token = Path(sys.argv[1]).read_bytes().rstrip(b"\n")
-gateway_env_sentinel = sys.argv[2].encode()
-path = Path(sys.argv[3])
+agent_env_sentinel = sys.argv[2].encode()
+gateway_env_sentinel = sys.argv[3].encode()
+path = Path(sys.argv[4])
 content = path.read_bytes() if path.exists() else b"<missing output>\n"
 for sensitive, replacement in (
     (token, b"<redacted-token>"),
+    (agent_env_sentinel, b"<redacted-agent-env>"),
     (gateway_env_sentinel, b"<redacted-gateway-env>"),
     (b"account-fixture-not-for-output", b"<redacted-account>"),
     (b"chat-fixture-not-for-output", b"<redacted-chat>"),
@@ -368,9 +385,11 @@ run_script_as() {
     CF_AUDIT_REAL_SUDO="$REAL_SUDO" \
     CF_AUDIT_DOCKER_RUNTIME_MOCK=1 \
     CF_AUDIT_DOCKER_VIA_SUDO=0 \
+    CF_AUDIT_AGENT_ENV_FILE="$AGENT_ENV_FILE" \
     CF_AUDIT_GATEWAY_ENV_FILE="$GATEWAY_ENV_FILE" \
     CONTAINER_NAME="$TEST_CONTAINER" \
     CF_AGENT_WECHAT_COMPOSE_FILE="$AGENT_COMPOSE_FILE" \
+    CF_AGENT_WECHAT_ENV_FILE="$AGENT_ENV_FILE" \
     CF_AGENT_GATEWAY_COMPOSE_FILE="$GATEWAY_COMPOSE_FILE" \
     CF_AGENT_GATEWAY_PROJECT_DIR="$GATEWAY_PROJECT_DIR" \
     CF_AGENT_GATEWAY_ENV_FILE="$GATEWAY_ENV_FILE" \
@@ -449,7 +468,8 @@ printf 'PASS non-permission Docker error does not use sudo\n'
 reset_audit
 assert_runtime_mock_requires_sudo info info
 assert_runtime_mock_requires_sudo compose \
-  compose --project-directory "$TEST_REPO" -f "$AGENT_COMPOSE_FILE" \
+  compose --env-file "$AGENT_ENV_FILE" \
+  --project-directory "$TEST_REPO" -f "$AGENT_COMPOSE_FILE" \
   ps --all --quiet agent-wechat
 assert_runtime_mock_requires_sudo exec exec "$TEST_CONTAINER" true
 assert_runtime_mock_requires_sudo inspect inspect "$TEST_CONTAINER"
@@ -505,9 +525,11 @@ if sudo -u "$TEST_USER" -H env \
   CF_AUDIT_REAL_SUDO="$REAL_SUDO" \
   CF_AUDIT_DOCKER_RUNTIME_MOCK=1 \
   CF_AUDIT_DOCKER_VIA_SUDO=0 \
+  CF_AUDIT_AGENT_ENV_FILE="$AGENT_ENV_FILE" \
   CF_AUDIT_GATEWAY_ENV_FILE="$GATEWAY_ENV_FILE" \
   CONTAINER_NAME="$TEST_CONTAINER" \
   CF_AGENT_WECHAT_COMPOSE_FILE="$AGENT_COMPOSE_FILE" \
+  CF_AGENT_WECHAT_ENV_FILE="$AGENT_ENV_FILE" \
   CF_AGENT_GATEWAY_COMPOSE_FILE="$GATEWAY_COMPOSE_FILE" \
   CF_AGENT_GATEWAY_PROJECT_DIR="$GATEWAY_PROJECT_DIR" \
   CF_AGENT_GATEWAY_ENV_FILE="$GATEWAY_ENV_FILE" \

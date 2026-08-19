@@ -6,6 +6,7 @@ RUNTIME_SCRIPTS_DIR="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pw
 RUNTIME_REPO_ROOT="$(CDPATH='' cd -- "${RUNTIME_SCRIPTS_DIR}/.." && pwd -P)"
 
 AGENT_COMPOSE_FILE="${CF_AGENT_WECHAT_COMPOSE_FILE:-${RUNTIME_REPO_ROOT}/docker/compose.cfserver.yaml}"
+AGENT_ENV_FILE="${CF_AGENT_WECHAT_ENV_FILE:-${RUNTIME_REPO_ROOT}/docker/.env}"
 STORAGE_ROOT="${CF_AGENT_WECHAT_STORAGE_ROOT:-/srv/storage/cf-agent-wechat}"
 RUNTIME_ROOT="${CF_AGENT_WECHAT_RUNTIME_ROOT:-${STORAGE_ROOT}/runtime}"
 ARCHIVE_ROOT="${CF_AGENT_WECHAT_ARCHIVE_ROOT:-${STORAGE_ROOT}/session-archive}"
@@ -147,10 +148,12 @@ runtime_privileged() {
 agent_compose() {
   if [ "$RUNTIME_DOCKER_USES_SUDO" -eq 1 ]; then
     sudo -- env "CF_AGENT_WECHAT_RUNTIME_ROOT=$RUNTIME_ROOT" docker compose \
+      --env-file "$AGENT_ENV_FILE" \
       --project-directory "$RUNTIME_REPO_ROOT" \
       -f "$AGENT_COMPOSE_FILE" "$@"
   else
     env "CF_AGENT_WECHAT_RUNTIME_ROOT=$RUNTIME_ROOT" docker compose \
+      --env-file "$AGENT_ENV_FILE" \
       --project-directory "$RUNTIME_REPO_ROOT" \
       -f "$AGENT_COMPOSE_FILE" "$@"
   fi
@@ -248,6 +251,18 @@ runtime_validate_configuration() {
     [ "$WECHAT_STABLE_SECONDS" -eq 0 ] ||
     [ "$POST_LOGIN_READY_TIMEOUT" -eq 0 ]; then
     LAST_ERROR="Runtime readiness timeouts must be greater than zero."
+    return 1
+  fi
+
+  case "$AGENT_ENV_FILE" in
+    /*) ;;
+    *)
+      LAST_ERROR="agent-wechat environment file path must be absolute: $AGENT_ENV_FILE"
+      return 1
+      ;;
+  esac
+  if [ -L "$AGENT_ENV_FILE" ] || [ ! -f "$AGENT_ENV_FILE" ]; then
+    LAST_ERROR="agent-wechat environment file must be an existing non-symlink regular file: $AGENT_ENV_FILE"
     return 1
   fi
 
@@ -410,6 +425,18 @@ runtime_validate_stop_configuration() {
   if [ "$(id -u)" -ne 0 ]; then
     runtime_require_command sudo || return 1
   fi
+  case "$AGENT_ENV_FILE" in
+    /*) ;;
+    *)
+      LAST_ERROR="agent-wechat environment file path must be absolute: $AGENT_ENV_FILE"
+      return 1
+      ;;
+  esac
+  if [ -L "$AGENT_ENV_FILE" ] || [ ! -f "$AGENT_ENV_FILE" ]; then
+    LAST_ERROR="agent-wechat environment file must be an existing non-symlink regular file: $AGENT_ENV_FILE"
+    return 1
+  fi
+
   for required_path in \
     "$AGENT_COMPOSE_FILE" "$STORAGE_ROOT" "$GATEWAY_COMPOSE_FILE" \
     "$GATEWAY_PROJECT_DIR" "$GATEWAY_ENV_FILE" "$RUNTIME_LOCK_FILE"; do

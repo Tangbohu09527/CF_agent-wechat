@@ -60,11 +60,19 @@ jobs:
       - name: Run isolated forced-QR lifecycle tests
         run: python3 tests/integration/test_qr_runtime.py
       - name: Parse production Compose configuration
-        env:
-          AGENT_WECHAT_IMAGE: >-
-            ghcr.io/example/agent-wechat@sha256:0000000000000000000000000000000000000000000000000000000000000000
-          AGENT_WECHAT_BIND_IP: 127.0.0.1
-        run: docker compose -f docker/compose.cfserver.yaml config --quiet
+        shell: bash
+        run: |
+          agent_env_file="$(mktemp)"
+          trap 'rm -f "$agent_env_file"' EXIT
+          chmod 600 "$agent_env_file"
+          printf '%s\n' \
+            'AGENT_WECHAT_IMAGE=ghcr.io/example/agent-wechat@sha256:0000000000000000000000000000000000000000000000000000000000000000' \
+            'AGENT_WECHAT_BIND_IP=127.0.0.1' > "$agent_env_file"
+          docker compose \
+            --env-file "$agent_env_file" \
+            --project-directory "$GITHUB_WORKSPACE" \
+            -f "$GITHUB_WORKSPACE/docker/compose.cfserver.yaml" \
+            config --quiet
 
   linux-permissions:
     runs-on: ubuntu-24.04

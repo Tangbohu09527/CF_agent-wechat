@@ -52,6 +52,10 @@ if [ "${CF_AUDIT_DOCKER_RUNTIME_MOCK:-}" = "1" ]; then
       service="${*: -1}"
       case "$service" in
         agent-wechat)
+          if [ "$compose_env_file" != "${CF_AUDIT_AGENT_ENV_FILE:?}" ]; then
+            printf '%s\n' 'agent-wechat env-file argument mismatch' >&2
+            exit 67
+          fi
           printf 'runtime-fixture-%s\n' "$service"
           exit 0
           ;;

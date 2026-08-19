@@ -133,10 +133,11 @@ if [ "$compose_file" = "${MOCK_GATEWAY_COMPOSE_FILE:?}" ]; then
   record "gateway compose env-file verified"
 else
   compose_kind="agent"
-  if [ -n "$compose_env_file" ]; then
-    record "agent compose unexpected env-file"
+  if [ "$compose_env_file" != "${MOCK_AGENT_ENV_FILE:?}" ]; then
+    record "agent compose env-file invalid"
     exit 67
   fi
+  record "agent compose env-file verified"
 fi
 
 case "$command_name" in

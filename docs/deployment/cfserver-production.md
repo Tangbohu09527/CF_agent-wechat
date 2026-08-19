@@ -1,7 +1,8 @@
 # CFserver 生产部署与运维
 
 本文是 `CF_agent-wechat` 在 CFserver 上的生产部署权威说明。正式 Compose 为
-`docker/compose.cfserver.yaml`，正式容器名为 `cf-agent-wechat`。
+`docker/compose.cfserver.yaml`，正式环境文件为 `docker/.env`，正式容器名为
+`cf-agent-wechat`。
 
 > [!IMPORTANT]
 > 生产环境不再恢复旧微信登录会话。Debian 重启、容器重建或人工重新启动微信入口后，
@@ -14,6 +15,7 @@
 ## 生产状态
 
 - 正式 Compose：`docker/compose.cfserver.yaml`
+- 正式环境文件：`docker/.env`
 - 正式容器：`cf-agent-wechat`
 - 镜像：经批准的不可变 digest
 - 容器显示：Xvfb `:99`，`1280x800x24`
@@ -63,13 +65,18 @@ Gateway 经 `cf-internal` 访问 `http://cf-agent-wechat:6174`。启动脚本只
 ```text
 /opt/cf-agent-wechat/
 ├── docker/
-│   └── compose.cfserver.yaml
+│   ├── compose.cfserver.yaml
+│   └── .env
 └── scripts/
     ├── start-qr-login.sh
     ├── stop-qr-runtime.sh
     ├── status.sh
     └── login.sh
 ```
+
+agent-wechat 的 Compose 项目目录保持 `/opt/cf-agent-wechat`。生命周期脚本显式通过
+`--env-file` 使用 `/opt/cf-agent-wechat/docker/.env`；非标准环境文件路径通过
+`CF_AGENT_WECHAT_ENV_FILE` 覆盖，不得把项目目录改成 `docker/`。
 
 Gateway 标准 Compose 输入：
 
@@ -153,6 +160,7 @@ Token 继续使用独立只读挂载：
 | `CF_AGENT_WECHAT_RUNTIME_ROOT` | 默认 `/srv/storage/cf-agent-wechat/runtime` |
 | `CF_AGENT_WECHAT_ARCHIVE_ROOT` | 默认 `/srv/storage/cf-agent-wechat/session-archive`，必须与 runtime 位于同一文件系统 |
 | `CF_AGENT_WECHAT_COMPOSE_FILE` | 默认使用本仓库 `docker/compose.cfserver.yaml` |
+| `CF_AGENT_WECHAT_ENV_FILE` | 默认使用仓库根目录下 `docker/.env` |
 | `CF_AGENT_GATEWAY_COMPOSE_FILE` | 默认 `/opt/cf-agent-gateway/deploy/compose.yaml`；只用于控制 `wechat-worker` |
 | `CF_AGENT_GATEWAY_ENV_FILE` | 默认 `/opt/cf-agent-gateway/deploy/.env`；只作为 Gateway Compose 的环境文件 |
 | `CF_AGENT_GATEWAY_PROJECT_DIR` | 默认 `/opt/cf-agent-gateway/deploy`；Gateway Compose 项目目录 |
@@ -163,28 +171,38 @@ Token 继续使用独立只读挂载：
 | `PROXY` | 可选；若含认证信息按敏感配置保护 |
 | `RUST_LOG` | 默认 `info`；提高详细度前评估泄露风险 |
 
-标准布局使用 `/opt/cf-agent-gateway/deploy/.env`，直接运行
-`./scripts/start-qr-login.sh` 时无需 `export`。路径不同时保留
+标准布局分别使用 `/opt/cf-agent-wechat/docker/.env` 和
+`/opt/cf-agent-gateway/deploy/.env`，直接运行 `./scripts/start-qr-login.sh`
+时无需 `export`。路径不同时保留 `CF_AGENT_WECHAT_ENV_FILE` 以及
 `CF_AGENT_GATEWAY_COMPOSE_FILE`、`CF_AGENT_GATEWAY_ENV_FILE` 和
-`CF_AGENT_GATEWAY_PROJECT_DIR` 覆盖能力。生命周期脚本不自行解析、复制或输出
-Gateway `.env` 内容；Docker Compose 通过 `--env-file` 将该文件作为插值/配置
-输入使用。Token 禁止写入本仓库或 Gateway 的任何 `.env`；生产变量实值不得粘贴
-到文档、工单或日志。
+`CF_AGENT_GATEWAY_PROJECT_DIR` 覆盖能力。start/stop 在任何容器、worker、runtime、
+归档或锁变更前，要求 agent-wechat 环境文件路径为绝对路径，且为已存在的普通非符号
+链接文件。生命周期脚本只检查环境文件路径和元数据，不自行读取、解析、复制或输出其
+内容；Docker Compose 通过 `--env-file` 使用对应文件。Token 禁止写入本仓库或
+Gateway 的任何 `.env`；生产变量实值不得粘贴到文档、工单或日志。
 
 使用与实际部署相同的环境输入做静态校验：
 
 ```bash
 cd /opt/cf-agent-wechat
-sudo docker compose -f docker/compose.cfserver.yaml config --quiet
+sudo docker compose \
+  --env-file /opt/cf-agent-wechat/docker/.env \
+  --project-directory /opt/cf-agent-wechat \
+  -f /opt/cf-agent-wechat/docker/compose.cfserver.yaml \
+  config --quiet
 ```
 
-若使用受控 `--env-file`，静态校验和实际启动必须使用同一份输入。不要输出完整 Compose
-渲染结果或完整环境。
+静态校验和生命周期脚本必须使用同一份环境输入。不要输出完整 Compose 渲染结果或
+完整环境。
 
 ## 首次部署前检查
 
 1. 确认代码处于批准 Commit，镜像为批准 digest。
-2. 使用实际环境输入运行 Compose `config --quiet`。
+2. 确认 agent-wechat Compose、环境文件和项目目录依次为
+   `/opt/cf-agent-wechat/docker/compose.cfserver.yaml`、
+   `/opt/cf-agent-wechat/docker/.env` 和 `/opt/cf-agent-wechat`；环境文件路径
+   必须为绝对路径，且为已存在的普通非符号链接文件。使用相同输入运行 Compose
+   `config --quiet`。
 3. 确认 `cf-internal` 已存在。
 4. 检查 runtime 与 legacy `data`/`wechat-home` 布局；mixed layout 必须先保留现场并
    明确受控来源，不能让脚本猜测或自动合并。

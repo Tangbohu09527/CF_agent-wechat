@@ -23,6 +23,7 @@ HELPERS = REPO_ROOT / "tests" / "helpers"
 SENSITIVE_TOKEN_PREFIX = "token-fixture-sensitive-"
 SENSITIVE_ACCOUNT_PREFIX = "account-fixture-sensitive-"
 SENSITIVE_CHAT_PREFIX = "chat fixture/sensitive?"
+SENSITIVE_AGENT_ENV_PREFIX = "agent-env-fixture-sensitive-"
 SENSITIVE_GATEWAY_ENV_PREFIX = "gateway-env-fixture-sensitive-"
 
 
@@ -67,6 +68,7 @@ class RuntimeFixture:
         self.secrets = self.storage / "secrets"
         self.gateway_dir = self.root / "gateway"
         self.agent_compose = self.root / "agent-compose.yaml"
+        self.agent_env = self.root / "agent.env"
         self.gateway_compose = self.gateway_dir / "compose.yaml"
         self.gateway_env = self.gateway_dir / ".env"
         self.fake_bin = self.root / "bin"
@@ -88,6 +90,7 @@ class RuntimeFixture:
         self.token = f"{SENSITIVE_TOKEN_PREFIX}{name}"
         self.account = f"{SENSITIVE_ACCOUNT_PREFIX}{name}"
         self.chat = f"{SENSITIVE_CHAT_PREFIX}{name}#/id"
+        self.agent_env_sentinel = f"{SENSITIVE_AGENT_ENV_PREFIX}{name}"
         self.gateway_env_sentinel = f"{SENSITIVE_GATEWAY_ENV_PREFIX}{name}"
         self._create_layout()
         self.env = self._build_environment()
@@ -114,6 +117,11 @@ class RuntimeFixture:
 
         self.gateway_dir.mkdir()
         self.agent_compose.write_text("services: {}\n", encoding="utf-8")
+        self.agent_env.write_text(
+            f"AGENT_ENV_FIXTURE={self.agent_env_sentinel}\n",
+            encoding="utf-8",
+        )
+        os.chmod(self.agent_env, 0o600)
         self.gateway_compose.write_text("services: {}\n", encoding="utf-8")
         self.gateway_env.write_text(
             self.gateway_env_sentinel + "\n", encoding="utf-8"
@@ -181,6 +189,7 @@ class RuntimeFixture:
                     self.root / "qr-runtime.lock"
                 ),
                 "CF_AGENT_WECHAT_COMPOSE_FILE": str(self.agent_compose),
+                "CF_AGENT_WECHAT_ENV_FILE": str(self.agent_env),
                 "CF_AGENT_GATEWAY_COMPOSE_FILE": str(self.gateway_compose),
                 "CF_AGENT_GATEWAY_PROJECT_DIR": str(self.gateway_dir),
                 "CF_AGENT_GATEWAY_ENV_FILE": str(self.gateway_env),
@@ -200,6 +209,7 @@ class RuntimeFixture:
                 "MOCK_DOCKER_STATE_DIR": str(self.docker_state),
                 "MOCK_DOCKER_LOG": str(self.audit_log),
                 "MOCK_DOCKER_MUTATION_LOG": str(self.mutation_log),
+                "MOCK_AGENT_ENV_FILE": str(self.agent_env),
                 "MOCK_GATEWAY_COMPOSE_FILE": str(self.gateway_compose),
                 "MOCK_GATEWAY_ENV_FILE": str(self.gateway_env),
                 "MOCK_LOGIN_LOG": str(self.login_log),
@@ -354,6 +364,7 @@ class RuntimeFixture:
             self.token,
             self.account,
             self.chat,
+            self.agent_env_sentinel,
             self.gateway_env_sentinel,
         ):
             testcase.assertNotIn(sensitive, combined)
@@ -365,6 +376,7 @@ class RuntimeFixture:
             self.token,
             self.account,
             self.chat,
+            self.agent_env_sentinel,
             self.gateway_env_sentinel,
         )
         for path in root.rglob("*"):
@@ -430,12 +442,17 @@ class ForcedQrRuntimeTests(unittest.TestCase):
 
     def test_dry_run_changes_nothing(self) -> None:
         before = tree_digest(self.fixture.storage)
+        agent_env_before = metadata_without_contents(self.fixture.agent_env)
         gateway_env_before = metadata_without_contents(
             self.fixture.gateway_env
         )
         start = self.fixture.run("start-qr-login.sh", "--dry-run")
         self.assert_succeeded(start)
         self.assertEqual(tree_digest(self.fixture.storage), before)
+        self.assertEqual(
+            metadata_without_contents(self.fixture.agent_env),
+            agent_env_before,
+        )
         self.assertEqual(
             metadata_without_contents(self.fixture.gateway_env),
             gateway_env_before,
@@ -444,18 +461,35 @@ class ForcedQrRuntimeTests(unittest.TestCase):
         self.assertEqual(self.fixture.read_state("gateway_running"), "1")
         self.assertEqual(self.fixture.read_state("agent_running"), "1")
         self.assertIn(
+            "agent compose env-file verified",
+            self.fixture.audit_lines(),
+        )
+        self.assertIn(
             "gateway compose env-file verified",
             self.fixture.audit_lines(),
         )
 
+        agent_env_calls_before_stop = self.fixture.audit_lines().count(
+            "agent compose env-file verified"
+        )
         stop = self.fixture.run("stop-qr-runtime.sh", "--dry-run")
         self.assert_succeeded(stop)
         self.assertEqual(tree_digest(self.fixture.storage), before)
+        self.assertEqual(
+            metadata_without_contents(self.fixture.agent_env),
+            agent_env_before,
+        )
         self.assertEqual(
             metadata_without_contents(self.fixture.gateway_env),
             gateway_env_before,
         )
         self.assertEqual(self.fixture.mutation_lines(), [])
+        self.assertGreater(
+            self.fixture.audit_lines().count(
+                "agent compose env-file verified"
+            ),
+            agent_env_calls_before_stop,
+        )
 
     def test_success_archives_atomically_preserves_permissions_and_gates_worker(
         self,
@@ -724,6 +758,96 @@ class ForcedQrRuntimeTests(unittest.TestCase):
                 )
                 self.assertEqual(
                     self.fixture.read_state("agent_running"), "1"
+                )
+                self.assertEqual(self.fixture.archive_dirs(), [])
+                self.assertFalse(
+                    (self.fixture.root / "qr-runtime.lock").exists()
+                )
+
+    def test_agent_env_validation_fails_before_any_mutation(self) -> None:
+        cases = tuple(
+            (script_name, mode)
+            for script_name in (
+                "start-qr-login.sh",
+                "stop-qr-runtime.sh",
+            )
+            for mode in ("missing", "symlink", "relative", "directory")
+        )
+        for index, (script_name, mode) in enumerate(cases):
+            if index:
+                self.fixture.close()
+                self.fixture = RuntimeFixture(
+                    f"{self._testMethodName}-{script_name}-{mode}"
+                )
+            with self.subTest(script=script_name, mode=mode):
+                external_target: Path | None = None
+                target_before: tuple[int, int, int, int, int, int] | None = None
+                env_path_before: (
+                    tuple[int, int, int, int, int, int] | None
+                ) = None
+
+                if mode in ("missing", "symlink", "directory"):
+                    self.fixture.agent_env.unlink()
+                if mode == "symlink":
+                    external_target = self.fixture.root / "external-agent.env"
+                    external_target.write_text(
+                        f"AGENT_ENV_FIXTURE="
+                        f"{self.fixture.agent_env_sentinel}\n",
+                        encoding="utf-8",
+                    )
+                    os.chmod(external_target, 0o640)
+                    target_before = metadata_without_contents(external_target)
+                    os.symlink(external_target, self.fixture.agent_env)
+                elif mode == "relative":
+                    self.fixture.env["CF_AGENT_WECHAT_ENV_FILE"] = (
+                        "relative-agent.env"
+                    )
+                elif mode == "directory":
+                    self.fixture.agent_env.mkdir()
+
+                if mode != "missing":
+                    env_path_before = metadata_without_contents(
+                        self.fixture.agent_env
+                    )
+                storage_before = tree_digest(self.fixture.storage)
+                result = self.fixture.run(script_name)
+                self.assert_failed(result)
+
+                self.assertIn(
+                    "agent-wechat environment file",
+                    result.stdout.lower(),
+                )
+                self.assertEqual(
+                    tree_digest(self.fixture.storage),
+                    storage_before,
+                )
+                if mode == "missing":
+                    self.assertFalse(self.fixture.agent_env.exists())
+                else:
+                    self.assertIsNotNone(env_path_before)
+                    self.assertEqual(
+                        metadata_without_contents(self.fixture.agent_env),
+                        env_path_before,
+                    )
+                if mode == "symlink":
+                    self.assertIsNotNone(external_target)
+                    self.assertIsNotNone(target_before)
+                    self.assertTrue(self.fixture.agent_env.is_symlink())
+                    self.assertEqual(
+                        metadata_without_contents(external_target),
+                        target_before,
+                    )
+
+                self.assertEqual(self.fixture.mutation_lines(), [])
+                self.assertEqual(self.fixture.audit_lines(), [])
+                self.assertEqual(self.fixture.login_log.read_text(), "")
+                self.assertEqual(
+                    self.fixture.read_state("gateway_running"),
+                    "1",
+                )
+                self.assertEqual(
+                    self.fixture.read_state("agent_running"),
+                    "1",
                 )
                 self.assertEqual(self.fixture.archive_dirs(), [])
                 self.assertFalse(

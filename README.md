@@ -18,17 +18,26 @@ cd /opt/cf-agent-wechat
 ./scripts/start-qr-login.sh
 ```
 
+CFserver 的 agent-wechat 标准 Compose 输入为：
+
+- Compose：`/opt/cf-agent-wechat/docker/compose.cfserver.yaml`
+- 环境文件：`/opt/cf-agent-wechat/docker/.env`
+- Compose 项目目录：`/opt/cf-agent-wechat`
+
+生命周期脚本显式通过 `--env-file` 使用上述 agent-wechat 环境文件，并保持仓库根目录为
+Compose 项目目录。非标准部署可通过 `CF_AGENT_WECHAT_ENV_FILE` 覆盖环境文件路径。
+
 CFserver 的 Gateway 标准布局为：
 
 - Compose：`/opt/cf-agent-gateway/deploy/compose.yaml`
 - 环境文件：`/opt/cf-agent-gateway/deploy/.env`
 - Compose 项目目录：`/opt/cf-agent-gateway/deploy`
 
-在该标准布局下，上述命令可直接运行，无需导出任何变量。非标准部署仍可通过
+在两套标准布局下，上述命令可直接运行，无需导出任何变量。非标准部署仍可通过
 `CF_AGENT_GATEWAY_COMPOSE_FILE`、`CF_AGENT_GATEWAY_ENV_FILE` 和
 `CF_AGENT_GATEWAY_PROJECT_DIR` 覆盖 Gateway 路径。生命周期脚本不自行解析、
-复制或输出环境文件内容；Docker Compose 通过 `--env-file` 将该文件作为插值/配置
-输入使用。
+读取、复制或输出环境文件内容，只检查路径和元数据；Docker Compose 通过
+`--env-file` 将对应文件作为插值/配置输入使用。
 
 固定流程如下：
 
