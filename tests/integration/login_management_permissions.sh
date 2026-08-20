@@ -84,13 +84,23 @@ LOG_FILE="${TEST_ROOT}/mock.log"
 READY_FILE="${TEST_ROOT}/mock.ready"
 PAUSE_FILE="${TEST_ROOT}/ws.pause"
 CONTINUE_FILE="${TEST_ROOT}/ws.continue"
+SCENARIO_FILE="${TEST_ROOT}/scenario.json"
 AUDIT_BIN="${TEST_ROOT}/audit-bin"
 AUDIT_LOG="${TEST_ROOT}/audit.log"
 AUDIT_PATH="${AUDIT_BIN}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+AGENT_COMPOSE_FILE="${TEST_ROOT}/agent-compose.yaml"
+AGENT_ENV_FILE="${TEST_ROOT}/agent.env"
+AGENT_ENV_SENTINEL="agent-env-fixture-sensitive-permissions-$$"
+GATEWAY_PROJECT_DIR="${TEST_ROOT}/gateway"
+GATEWAY_COMPOSE_FILE="${GATEWAY_PROJECT_DIR}/compose.yaml"
+GATEWAY_ENV_FILE="${GATEWAY_PROJECT_DIR}/.env"
+GATEWAY_ENV_SENTINEL="gateway-env-fixture-sensitive-permissions-$$"
+AGENT_STATE_FILE="${TEST_ROOT}/agent-state"
 
 install -d -o root -g root -m 755 "${TEST_REPO}/scripts"
 install -o root -g root -m 755 \
   "${REPO_ROOT}/scripts/common.sh" \
+  "${REPO_ROOT}/scripts/qr-runtime-common.sh" \
   "${REPO_ROOT}/scripts/status.sh" \
   "${REPO_ROOT}/scripts/login.sh" \
   "${REPO_ROOT}/scripts/qr_login.py" \
@@ -103,9 +113,20 @@ install -o root -g root -m 755 \
   "${REPO_ROOT}/tests/helpers/audit_docker.sh" "${AUDIT_BIN}/docker"
 install -o root -g root -m 755 \
   "${REPO_ROOT}/tests/helpers/audit_sudo.sh" "${AUDIT_BIN}/sudo"
+install -d -o root -g root -m 755 "$GATEWAY_PROJECT_DIR"
+printf '%s\n' 'services:' '  agent-wechat: {}' > "$AGENT_COMPOSE_FILE"
+printf 'AGENT_ENV_FIXTURE=%s\n' "$AGENT_ENV_SENTINEL" > "$AGENT_ENV_FILE"
+printf '%s\n' 'services:' '  wechat-worker: {}' > "$GATEWAY_COMPOSE_FILE"
+chmod 644 "$AGENT_COMPOSE_FILE" "$GATEWAY_COMPOSE_FILE"
+printf '%s\n' "$GATEWAY_ENV_SENTINEL" > "$GATEWAY_ENV_FILE"
+chown root:root "$AGENT_ENV_FILE" "$GATEWAY_ENV_FILE"
+chmod 600 "$AGENT_ENV_FILE" "$GATEWAY_ENV_FILE"
+printf '%s\n' 'running' > "$AGENT_STATE_FILE"
 
 useradd --create-home --home-dir "$TEST_HOME" --shell /bin/bash "$TEST_USER"
 useradd --create-home --home-dir "$NO_SUDO_HOME" --shell /bin/bash "$NO_SUDO_USER"
+chown "$TEST_USER:$TEST_USER" "$AGENT_STATE_FILE"
+chmod 600 "$AGENT_STATE_FILE"
 : > "$AUDIT_LOG"
 chown "$TEST_USER:$TEST_USER" "$AUDIT_LOG"
 chmod 600 "$AUDIT_LOG"
@@ -125,6 +146,14 @@ chown root:root "$TOKEN_FILE"
 chmod 600 "$TOKEN_FILE"
 printf 'logged_in\n' > "$STATE_FILE"
 reset_audit() {
+  if [ -s "$AUDIT_LOG" ] &&
+    grep -Fq -- "$AGENT_ENV_SENTINEL" "$AUDIT_LOG"; then
+    fail "agent-wechat environment sentinel leaked into the audit log"
+  fi
+  if [ -s "$AUDIT_LOG" ] &&
+    grep -Fq -- "$GATEWAY_ENV_SENTINEL" "$AUDIT_LOG"; then
+    fail "Gateway environment sentinel leaked into the audit log"
+  fi
   : > "$AUDIT_LOG"
 }
 
@@ -167,24 +196,103 @@ assert_docker_fallback_order() {
     fail "Docker inspect order was not ordinary then sudo"
 }
 
+assert_runtime_mock_requires_sudo() {
+  local label="$1"
+  local error_file
+  shift
+  error_file="${TEST_ROOT}/runtime-docker-${label}.error"
+
+  if "$REAL_SUDO" -u "$TEST_USER" -H env \
+    PATH="$AUDIT_PATH" \
+    CF_AUDIT_LOG="$AUDIT_LOG" \
+    CF_AUDIT_REAL_DOCKER="$REAL_DOCKER" \
+    CF_AUDIT_AGENT_ENV_FILE="$AGENT_ENV_FILE" \
+    CF_AUDIT_GATEWAY_ENV_FILE="$GATEWAY_ENV_FILE" \
+    CF_AUDIT_DOCKER_RUNTIME_MOCK=1 \
+    CF_AUDIT_DOCKER_VIA_SUDO=0 \
+    docker "$@" > /dev/null 2> "$error_file"; then
+    fail "bare runtime Docker ${label} unexpectedly succeeded"
+  fi
+  if ! grep -Eqi \
+    'permission denied.*docker[.]sock|docker[.]sock.*permission denied' \
+    "$error_file"; then
+    fail "bare runtime Docker ${label} lacked a socket permission error"
+  fi
+}
+
+assert_status_sudo_paths() {
+  local expected="${TEST_ROOT}/status-sudo-expected.log"
+  local actual="${TEST_ROOT}/status-sudo-actual.log"
+
+  printf '%s\n' \
+    $'sudo\tdocker-info' \
+    $'sudo\tdocker-compose' \
+    $'sudo\tdocker-compose' \
+    $'sudo\tdocker-compose' \
+    $'sudo\tdocker-exec' \
+    $'sudo\tdocker-inspect' \
+    $'sudo\ttoken-reader' \
+    $'sudo\tdocker-exec' > "$expected"
+  awk -F '\t' '$1 == "sudo" { print $1 "\t" $2 }' "$AUDIT_LOG" > "$actual"
+  if ! diff -u "$expected" "$actual"; then
+    fail "status.sh sudo path sequence differed from the expected fallback"
+  fi
+}
+
 : > "$LOG_FILE"
+printf '%s\n' '{}' > "$SCENARIO_FILE"
 
 assert_secret_permissions() {
   [ "$(stat -c '%U:%G %a' "$SECRETS_DIR")" = "root:root 700" ] || \
     fail "secrets directory permissions changed"
   [ "$(stat -c '%U:%G %a' "$TOKEN_FILE")" = "root:root 600" ] || \
     fail "auth-token permissions changed"
+  [ "$(stat -c '%U:%G %a' "$AGENT_ENV_FILE")" = "root:root 600" ] || \
+    fail "agent-wechat environment file permissions changed"
+  [ "$(stat -c '%U:%G %a' "$GATEWAY_ENV_FILE")" = "root:root 600" ] || \
+    fail "Gateway environment file permissions changed"
 }
 
 assert_file_has_no_token() {
-  python3 - "$TOKEN_FILE" "$1" <<'PY'
+  python3 - "$TOKEN_FILE" "$AGENT_ENV_SENTINEL" \
+    "$GATEWAY_ENV_SENTINEL" "$1" <<'PY'
 import sys
 from pathlib import Path
 
 token = Path(sys.argv[1]).read_bytes().rstrip(b"\n")
-content = Path(sys.argv[2]).read_bytes()
-if token in content:
-    raise SystemExit(f"token leaked into {sys.argv[2]}")
+agent_env_sentinel = sys.argv[2].encode()
+gateway_env_sentinel = sys.argv[3].encode()
+content = Path(sys.argv[4]).read_bytes()
+for name, sensitive in (
+    ("token", token),
+    ("agent-wechat environment sentinel", agent_env_sentinel),
+    ("Gateway environment sentinel", gateway_env_sentinel),
+):
+    if sensitive in content:
+        raise SystemExit(f"{name} leaked into {sys.argv[4]}")
+PY
+}
+
+print_redacted_file() {
+  python3 - "$TOKEN_FILE" "$AGENT_ENV_SENTINEL" \
+    "$GATEWAY_ENV_SENTINEL" "$1" <<'PY'
+import sys
+from pathlib import Path
+
+token = Path(sys.argv[1]).read_bytes().rstrip(b"\n")
+agent_env_sentinel = sys.argv[2].encode()
+gateway_env_sentinel = sys.argv[3].encode()
+path = Path(sys.argv[4])
+content = path.read_bytes() if path.exists() else b"<missing output>\n"
+for sensitive, replacement in (
+    (token, b"<redacted-token>"),
+    (agent_env_sentinel, b"<redacted-agent-env>"),
+    (gateway_env_sentinel, b"<redacted-gateway-env>"),
+    (b"account-fixture-not-for-output", b"<redacted-account>"),
+    (b"chat-fixture-not-for-output", b"<redacted-chat>"),
+):
+    content = content.replace(sensitive, replacement)
+sys.stderr.buffer.write(content)
 PY
 }
 
@@ -279,8 +387,24 @@ run_script_as() {
     CF_AUDIT_LOG="$AUDIT_LOG" \
     CF_AUDIT_REAL_DOCKER="$REAL_DOCKER" \
     CF_AUDIT_REAL_SUDO="$REAL_SUDO" \
+    CF_AUDIT_DOCKER_RUNTIME_MOCK=1 \
+    CF_AUDIT_DOCKER_VIA_SUDO=0 \
+    CF_AUDIT_AGENT_ENV_FILE="$AGENT_ENV_FILE" \
+    CF_AUDIT_GATEWAY_ENV_FILE="$GATEWAY_ENV_FILE" \
+    CONTAINER_NAME="$TEST_CONTAINER" \
+    CF_AGENT_WECHAT_COMPOSE_FILE="$AGENT_COMPOSE_FILE" \
+    CF_AGENT_WECHAT_ENV_FILE="$AGENT_ENV_FILE" \
+    CF_AGENT_GATEWAY_COMPOSE_FILE="$GATEWAY_COMPOSE_FILE" \
+    CF_AGENT_GATEWAY_PROJECT_DIR="$GATEWAY_PROJECT_DIR" \
+    CF_AGENT_GATEWAY_ENV_FILE="$GATEWAY_ENV_FILE" \
     "$@" \
-    /bin/bash -c 'cd "$1" && exec "./scripts/$2"' \
+    /bin/bash -c '
+cd "$1"
+if [ "${CF_TEST_FORCE_QR:-0}" = "1" ]; then
+  exec "./scripts/$2" --force-qr
+fi
+exec "./scripts/$2"
+' \
     cf-agent-wechat-test "$TEST_REPO" "$script_name"
 }
 
@@ -327,6 +451,32 @@ assert_no_sudo_python "Docker permission fallback"
 printf 'PASS ordinary then sudo Docker socket permission fallback\n'
 
 reset_audit
+COMMON_IDENTITY_OUTPUT="${TEST_ROOT}/common-identity.out"
+if ! "$REAL_SUDO" -u "$TEST_USER" -H env \
+  PATH="$AUDIT_PATH" \
+  CF_AUDIT_LOG="$AUDIT_LOG" \
+  CF_AUDIT_REAL_DOCKER="$REAL_DOCKER" \
+  CF_AUDIT_REAL_SUDO="$REAL_SUDO" \
+  CF_AUDIT_DOCKER_RUNTIME_MOCK=1 \
+  CF_AUDIT_DOCKER_VIA_SUDO=0 \
+  CF_AUDIT_AGENT_ENV_FILE="$AGENT_ENV_FILE" \
+  CF_AUDIT_GATEWAY_ENV_FILE="$GATEWAY_ENV_FILE" \
+  CONTAINER_NAME="$TEST_CONTAINER" /bin/bash -c \
+  'cd "$1"; source scripts/common.sh; get_wechat_process_identity' \
+  cf-agent-wechat-test "$TEST_REPO" \
+  > "$COMMON_IDENTITY_OUTPUT" 2>&1; then
+  print_redacted_file "$COMMON_IDENTITY_OUTPUT"
+  fail "common WeChat identity check did not use the sudo Docker fallback"
+fi
+[ "$(cat "$COMMON_IDENTITY_OUTPUT")" = "4242:9001" ] || \
+  fail "common WeChat identity check returned an unexpected identity"
+[ "$(audit_count sudo docker-exec)" -eq 1 ] || \
+  fail "common WeChat identity check did not use exactly one sudo Docker exec"
+assert_no_sudo_python "common WeChat identity Docker fallback"
+assert_file_has_no_token "$COMMON_IDENTITY_OUTPUT"
+printf 'PASS canonical WeChat identity with sudo Docker fallback\n'
+
+reset_audit
 if NONPERMISSION_OUTPUT="$("$REAL_SUDO" -u "$TEST_USER" -H env \
   PATH="$AUDIT_PATH" \
   CF_AUDIT_LOG="$AUDIT_LOG" \
@@ -345,13 +495,69 @@ fi
 assert_no_sudo_python "non-permission Docker error"
 printf 'PASS non-permission Docker error does not use sudo\n'
 
+reset_audit
+assert_runtime_mock_requires_sudo info info
+assert_runtime_mock_requires_sudo compose \
+  compose --env-file "$AGENT_ENV_FILE" \
+  --project-directory "$TEST_REPO" -f "$AGENT_COMPOSE_FILE" \
+  ps --all --quiet agent-wechat
+assert_runtime_mock_requires_sudo exec exec "$TEST_CONTAINER" true
+assert_runtime_mock_requires_sudo inspect inspect "$TEST_CONTAINER"
+printf 'PASS runtime Docker mock requires the sudo fallback\n'
+
+reset_audit
+if ! CLEANUP_OUTPUT="$("$REAL_SUDO" -u "$TEST_USER" -H env \
+  PATH="$AUDIT_PATH" \
+  CF_AUDIT_LOG="$AUDIT_LOG" \
+  CF_AUDIT_REAL_DOCKER="$REAL_DOCKER" \
+  CF_AUDIT_REAL_SUDO="$REAL_SUDO" \
+  CF_AUDIT_DOCKER_RUNTIME_MOCK=1 \
+  CF_AUDIT_DOCKER_VIA_SUDO=0 \
+  CF_AUDIT_AGENT_ENV_FILE="$AGENT_ENV_FILE" \
+  CF_AUDIT_GATEWAY_ENV_FILE="$GATEWAY_ENV_FILE" \
+  CF_AUDIT_AGENT_STATE_FILE="$AGENT_STATE_FILE" \
+  CF_AGENT_WECHAT_COMPOSE_FILE="$AGENT_COMPOSE_FILE" \
+  CF_AGENT_WECHAT_ENV_FILE="$AGENT_ENV_FILE" \
+  CF_AGENT_WECHAT_RUNTIME_ROOT="${TEST_ROOT}/runtime" \
+  /bin/bash -c '
+cd "$1"
+source scripts/common.sh
+source scripts/qr-runtime-common.sh
+runtime_select_docker
+cleanup_failed_agent_container
+printf "%s:%s:%s\n" \
+  "$AGENT_FAILURE_CLEANUP_ATTEMPTED" \
+  "$AGENT_FAILURE_CLEANUP_STOP_RESULT" \
+  "$AGENT_FAILURE_CLEANUP_REMOVE_RESULT"
+' cf-agent-wechat-test "$TEST_REPO" 2>&1)"; then
+  printf '%s\n' "$CLEANUP_OUTPUT" >&2
+  fail "failed-agent cleanup did not use the sudo Docker fallback"
+fi
+[ "$CLEANUP_OUTPUT" = "true:succeeded:succeeded" ] ||
+  fail "failed-agent cleanup returned unexpected results"
+[ "$(cat "$AGENT_STATE_FILE")" = "absent" ] ||
+  fail "failed-agent cleanup left a restartable container"
+[ "$(audit_count sudo docker-info)" -eq 1 ] ||
+  fail "failed-agent cleanup did not select sudo Docker"
+[ "$(audit_count docker compose-agent-stop)" -eq 1 ] ||
+  fail "failed-agent cleanup did not stop the agent container"
+[ "$(audit_count docker compose-agent-remove)" -eq 1 ] ||
+  fail "failed-agent cleanup did not remove the agent container"
+assert_no_sudo_python "failed-agent cleanup"
+CLEANUP_OUTPUT_FILE="${TEST_ROOT}/cleanup.out"
+printf '%s\n' "$CLEANUP_OUTPUT" > "$CLEANUP_OUTPUT_FILE"
+assert_file_has_no_token "$CLEANUP_OUTPUT_FILE"
+assert_file_has_no_token "$AUDIT_LOG"
+printf 'PASS failed-agent cleanup with sudo Docker fallback\n'
+
 python3 "${REPO_ROOT}/tests/helpers/mock_agent_wechat.py" \
   --token-file "$TOKEN_FILE" \
   --state-file "$STATE_FILE" \
   --log-file "$LOG_FILE" \
   --ready-file "$READY_FILE" \
   --pause-file "$PAUSE_FILE" \
-  --continue-file "$CONTINUE_FILE" &
+  --continue-file "$CONTINUE_FILE" \
+  --scenario-file "$SCENARIO_FILE" &
 MOCK_PID=$!
 for _attempt in $(seq 1 100); do
   [ -s "$READY_FILE" ] && break
@@ -364,26 +570,52 @@ WS_PORT="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["ws_p
 
 reset_audit
 STATUS_OUTPUT="${TEST_ROOT}/status.out"
-run_script_as "$TEST_USER" status.sh > "$STATUS_OUTPUT" 2>&1
+if ! run_script_as "$TEST_USER" status.sh > "$STATUS_OUTPUT" 2>&1; then
+  printf '%s\n' 'status.sh failure output (token redacted):' >&2
+  print_redacted_file "$STATUS_OUTPUT"
+  printf '%s\n' 'status.sh audit log:' >&2
+  print_redacted_file "$AUDIT_LOG"
+  fail "ordinary-user status.sh failed"
+fi
 grep -q 'logged_in' "$STATUS_OUTPUT" || fail "status.sh did not report logged_in"
-grep -q 'wxid_permissions_test' "$STATUS_OUTPUT" || fail "status.sh did not report account"
+if grep -q 'account-fixture-not-for-output' "$STATUS_OUTPUT"; then
+  fail "status.sh exposed the account identifier"
+fi
 assert_file_has_no_token "$STATUS_OUTPUT"
 assert_secret_permissions
-assert_token_read_once "status.sh"
-assert_only_token_sudo "successful management script"
-assert_no_sudo_python "status.sh"
+assert_status_sudo_paths
 printf 'PASS root-only token with ordinary-user status.sh\n'
 
 printf '%s\n' '--verbose' > "${TEST_HOME}/.curlrc"
 chown "$TEST_USER:$TEST_USER" "${TEST_HOME}/.curlrc"
 TRACE_OUTPUT="${TEST_ROOT}/trace.out"
-sudo -u "$TEST_USER" -H env \
+if sudo -u "$TEST_USER" -H env \
   API_URL="http://127.0.0.1:${HTTP_PORT}" \
   WS_URL="ws://127.0.0.1:${WS_PORT}/api/ws/login" \
   TOKEN_FILE="$TOKEN_FILE" \
   PYTHON_BIN=python3 \
+  PATH="$AUDIT_PATH" \
+  CF_AUDIT_LOG="$AUDIT_LOG" \
+  CF_AUDIT_REAL_DOCKER="$REAL_DOCKER" \
+  CF_AUDIT_REAL_SUDO="$REAL_SUDO" \
+  CF_AUDIT_DOCKER_RUNTIME_MOCK=1 \
+  CF_AUDIT_DOCKER_VIA_SUDO=0 \
+  CF_AUDIT_AGENT_ENV_FILE="$AGENT_ENV_FILE" \
+  CF_AUDIT_GATEWAY_ENV_FILE="$GATEWAY_ENV_FILE" \
+  CONTAINER_NAME="$TEST_CONTAINER" \
+  CF_AGENT_WECHAT_COMPOSE_FILE="$AGENT_COMPOSE_FILE" \
+  CF_AGENT_WECHAT_ENV_FILE="$AGENT_ENV_FILE" \
+  CF_AGENT_GATEWAY_COMPOSE_FILE="$GATEWAY_COMPOSE_FILE" \
+  CF_AGENT_GATEWAY_PROJECT_DIR="$GATEWAY_PROJECT_DIR" \
+  CF_AGENT_GATEWAY_ENV_FILE="$GATEWAY_ENV_FILE" \
   NO_PROXY=127.0.0.1,localhost \
-  /bin/bash -x "${TEST_REPO}/scripts/status.sh" > "$TRACE_OUTPUT" 2>&1
+  /bin/bash -x "${TEST_REPO}/scripts/status.sh" > "$TRACE_OUTPUT" 2>&1; then
+  :
+else
+  printf '%s\n' 'traced status.sh failure output (token redacted):' >&2
+  print_redacted_file "$TRACE_OUTPUT"
+  fail "traced ordinary-user status.sh failed"
+fi
 assert_file_has_no_token "$TRACE_OUTPUT"
 if grep -q 'Authorization: Bearer' "$TRACE_OUTPUT"; then
   fail "curlrc or shell tracing exposed the Authorization header"
@@ -436,7 +668,7 @@ LOGIN_PID=$!
 for _attempt in $(seq 1 900); do
   [ -e "$PAUSE_FILE" ] && break
   kill -0 "$LOGIN_PID" 2>/dev/null || {
-    cat "$LOGIN_OUTPUT" >&2
+    print_redacted_file "$LOGIN_OUTPUT"
     fail "login.sh exited before WebSocket pause"
   }
   sleep 0.1
@@ -445,7 +677,7 @@ done
 assert_user_processes_have_no_token
 touch "$CONTINUE_FILE"
 if ! wait "$LOGIN_PID"; then
-  cat "$LOGIN_OUTPUT" >&2
+  print_redacted_file "$LOGIN_OUTPUT"
   fail "ordinary-user login.sh failed"
 fi
 LOGIN_PID=""
@@ -470,17 +702,74 @@ assert_tmp_has_no_token
 assert_secret_permissions
 printf 'PASS ordinary-user login.sh phone confirmation flow and user-owned venv\n'
 
+printf '%s\n' 'logged_out' > "$STATE_FILE"
+printf '%s\n' \
+  '{"emit_qr":true,"require_new_account":true,"record_ws_query":true}' \
+  > "$SCENARIO_FILE"
+: > "$LOG_FILE"
+reset_audit
+rm -f "$PAUSE_FILE" "$CONTINUE_FILE"
+FORCE_OUTPUT="${TEST_ROOT}/force-qr.out"
+run_script_as "$TEST_USER" login.sh CF_TEST_FORCE_QR=1 \
+  > "$FORCE_OUTPUT" 2>&1 &
+LOGIN_PID=$!
+for _attempt in $(seq 1 900); do
+  [ -e "$PAUSE_FILE" ] && break
+  kill -0 "$LOGIN_PID" 2>/dev/null || {
+    print_redacted_file "$FORCE_OUTPUT"
+    fail "login.sh --force-qr exited before WebSocket pause"
+  }
+  sleep 0.1
+done
+[ -e "$PAUSE_FILE" ] || fail "force-QR login did not reach WebSocket"
+touch "$CONTINUE_FILE"
+if ! wait "$LOGIN_PID"; then
+  print_redacted_file "$FORCE_OUTPUT"
+  fail "ordinary-user login.sh --force-qr failed"
+fi
+LOGIN_PID=""
+grep -q '请使用手机微信扫描二维码' "$FORCE_OUTPUT" || \
+  fail "force-QR flow did not render a terminal QR code"
+grep -q '登录成功。' "$FORCE_OUTPUT" || \
+  fail "force-QR flow did not report login success"
+grep -q '^WS /api/ws/login newAccount=true$' "$LOG_FILE" || \
+  fail "force-QR WebSocket did not use newAccount=true"
+if grep -qi 'logout' "$LOG_FILE"; then
+  fail "force-QR flow unexpectedly called logout"
+fi
+FORCE_EXPECTED_LOG="${TEST_ROOT}/force-expected.log"
+printf '%s\n' \
+  'GET /api/status/auth' \
+  'POST /api/status/login' \
+  'WS /api/ws/login newAccount=true' \
+  'EVENT qr' \
+  'EVENT phone_confirm' \
+  'EVENT login_success' \
+  'GET /api/status/auth' > "$FORCE_EXPECTED_LOG"
+diff -u "$FORCE_EXPECTED_LOG" "$LOG_FILE" || \
+  fail "force-QR request/event order differs"
+assert_token_read_once "force-QR login.sh"
+assert_only_token_sudo "force-QR login.sh"
+assert_no_sudo_python "force-QR login.sh"
+assert_file_has_no_token "$FORCE_OUTPUT"
+if grep -q 'account-fixture-not-for-output' "$FORCE_OUTPUT"; then
+  fail "force-QR output exposed the account identifier"
+fi
+printf '%s\n' '{}' > "$SCENARIO_FILE"
+printf 'PASS forced new-device QR rendering and newAccount WebSocket flow\n'
+
 reset_audit
 mv "$TOKEN_FILE" "${TOKEN_FILE}.saved"
 MISSING_OUTPUT="${TEST_ROOT}/missing.out"
-if run_script_as "$TEST_USER" status.sh > "$MISSING_OUTPUT" 2>&1; then
-  fail "status.sh unexpectedly accepted a missing token"
+if run_script_as "$TEST_USER" login.sh > "$MISSING_OUTPUT" 2>&1; then
+  fail "login.sh unexpectedly accepted a missing token"
 fi
 grep -q 'token 文件不存在' "$MISSING_OUTPUT" || \
   fail "missing token was not distinguished from a permission failure"
-assert_token_read_once "missing-token status.sh"
-assert_no_sudo_python "missing-token status.sh"
+assert_token_read_once "missing-token login.sh"
+assert_no_sudo_python "missing-token login.sh"
 mv "${TOKEN_FILE}.saved" "$TOKEN_FILE"
+assert_file_has_no_token "$MISSING_OUTPUT"
 assert_secret_permissions
 printf 'PASS missing root-only token distinction\n'
 
@@ -493,10 +782,10 @@ if timeout 15s sudo -u "$NO_SUDO_USER" -H env \
   NO_COLOR=1 \
   NO_PROXY=127.0.0.1,localhost \
   no_proxy=127.0.0.1,localhost \
-  /bin/bash -c 'cd "$1" && exec ./scripts/status.sh' \
+  /bin/bash -c 'cd "$1" && exec ./scripts/login.sh' \
   cf-agent-wechat-test "$TEST_REPO" \
   > "$NO_SUDO_OUTPUT" 2>&1 </dev/null; then
-  fail "status.sh unexpectedly read root-only token without sudo permission"
+  fail "login.sh unexpectedly read root-only token without sudo permission"
 fi
 grep -q '没有可用的 sudo 权限' "$NO_SUDO_OUTPUT" || \
   fail "missing sudo authorization did not produce a clear error"
@@ -504,6 +793,8 @@ if grep -q 'token 文件不存在' "$NO_SUDO_OUTPUT"; then
   fail "permission failure was incorrectly reported as a missing token"
 fi
 assert_file_has_no_token "$NO_SUDO_OUTPUT"
+assert_file_has_no_token "$AUDIT_LOG"
+assert_file_has_no_token "$LOG_FILE"
 assert_secret_permissions
 printf 'PASS explicit no-sudo permission error\n'
 

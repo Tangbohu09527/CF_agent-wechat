@@ -196,23 +196,17 @@ def _read_token_stdin() -> str:
         raise LoginToolError("token 不是有效的 UTF-8 文本。") from exc
 
 
-def _redact_token(value: object, token: str) -> str:
-    return str(value).replace(token, "[REDACTED]")
-
-
-def _login_url(url: str, timeout_ms: int) -> str:
+def _login_url(url: str, timeout_ms: int, new_account: bool = False) -> str:
     parts = urlsplit(url)
     if parts.scheme not in {"ws", "wss"} or not parts.netloc:
         raise LoginToolError("WebSocket URL 必须是有效的 ws:// 或 wss:// 地址。")
     query = dict(parse_qsl(parts.query, keep_blank_values=True))
     query.setdefault("timeoutMs", str(timeout_ms))
-    query.setdefault("newAccount", "false")
+    if new_account:
+        query["newAccount"] = "true"
+    else:
+        query.setdefault("newAccount", "false")
     return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
-
-
-def _event_message(event: dict[str, Any]) -> str:
-    message = event.get("message")
-    return message if isinstance(message, str) else ""
 
 
 def listen_for_login(
@@ -220,6 +214,8 @@ def listen_for_login(
     token: str,
     session_id: str,
     timeout_ms: int,
+    new_account: bool = False,
+    qr_already_rendered: bool = False,
 ) -> None:
     try:
         import websocket
@@ -236,25 +232,22 @@ def listen_for_login(
 
     try:
         connection = websocket.create_connection(
-            _login_url(url, timeout_ms),
+            _login_url(url, timeout_ms, new_account),
             header=headers,
             timeout=socket_timeout,
             http_no_proxy=["*"],
         )
     except Exception as exc:
-        raise LoginToolError(
-            f"无法连接登录 WebSocket：{_redact_token(exc, token)}"
-        ) from exc
+        raise LoginToolError("无法连接登录 WebSocket。") from exc
 
     terminal_event = False
+    qr_rendered = qr_already_rendered
     try:
         while True:
             try:
                 raw_event = connection.recv()
             except Exception as exc:
-                raise LoginToolError(
-                    f"读取登录事件失败：{_redact_token(exc, token)}"
-                ) from exc
+                raise LoginToolError("读取登录事件失败。") from exc
             if raw_event in (None, "", b""):
                 break
             if isinstance(raw_event, bytes):
@@ -272,32 +265,30 @@ def listen_for_login(
 
             event_type = event.get("type")
             if event_type == "status":
-                message = _redact_token(_event_message(event), token)
-                if "navigat" in message.lower() or "login flow" in message.lower():
-                    print("正在启动微信登录流程")
-                elif message:
-                    print(f"登录状态：{message}")
-                else:
-                    print("正在启动微信登录流程")
+                print("正在启动微信登录流程")
             elif event_type == "qr":
                 print("请使用手机微信扫描二维码：")
                 if not render_event_qr(event):
                     raise LoginToolError("登录事件未包含可显示的二维码数据。")
+                qr_rendered = True
             elif event_type == "phone_confirm":
                 print("请在手机微信确认登录")
             elif event_type == "login_success":
                 terminal_event = True
+                if new_account and not qr_rendered:
+                    raise LoginToolError(
+                        "强制新设备登录未收到可显示的二维码，拒绝接受登录成功事件。"
+                    )
                 print("登录成功。")
                 return
             elif event_type == "login_timeout":
                 terminal_event = True
-                raise LoginToolError("登录超时，请重新执行 ./scripts/login.sh。")
+                raise LoginToolError(
+                    "登录超时，请重新执行 ./scripts/start-qr-login.sh。"
+                )
             elif event_type == "error":
                 terminal_event = True
-                message = _redact_token(
-                    _event_message(event) or "agent-wechat 返回未知错误。", token
-                )
-                raise LoginToolError(f"登录失败：{message}")
+                raise LoginToolError("登录失败：agent-wechat 登录流程返回错误。")
     finally:
         connection.close()
 
@@ -321,6 +312,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--url", help="登录 WebSocket URL。")
     parser.add_argument("--session-id", default="default", help="agent-wechat session ID。")
     parser.add_argument("--timeout-ms", type=int, default=300000, help="登录超时毫秒数。")
+    parser.add_argument(
+        "--new-account",
+        action="store_true",
+        help="强制 WebSocket 使用 newAccount=true。",
+    )
+    parser.add_argument(
+        "--qr-already-rendered",
+        action="store_true",
+        help="HTTP 登录响应已经成功显示二维码。",
+    )
     return parser.parse_args()
 
 
@@ -333,7 +334,14 @@ def main() -> int:
         if args.timeout_ms <= 0:
             raise LoginToolError("--timeout-ms 必须大于 0。")
         token = _read_token_stdin()
-        listen_for_login(args.url, token, args.session_id, args.timeout_ms)
+        listen_for_login(
+            args.url,
+            token,
+            args.session_id,
+            args.timeout_ms,
+            new_account=args.new_account,
+            qr_already_rendered=args.qr_already_rendered,
+        )
         return 0
 
     if args.render_json:
