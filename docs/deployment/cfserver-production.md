@@ -251,8 +251,19 @@ cd /opt/cf-agent-wechat
     一个聊天，并对 API 返回的一个聊天读取 messages。
 11. 只有全部通过才启动 `wechat-worker`，随后输出最终状态。
 
-worker 停止已经确认后，后续失败会保持停止、保留归档且不启动 AI 调度。若初始 stop
-无法确认，脚本立即失败并报告“无法确认”；本仓库不能声称 worker 已停止。
+进入 agent 容器轮换阶段后，后续任何失败都会触发统一 cleanup：脚本尝试重新停止并
+确认 worker，再依次 stop/remove `agent-wechat`。remove 使用
+`compose rm --force`，不带 `-v`，也不执行 `down` 或删除 volume；已有 runtime、归档
+及其中已落盘的持久文件不由 cleanup 删除。只有 worker stop 与 agent stop/remove 均
+成功确认时，才能认定 AI 调度已停止且失败容器不会在 Docker daemon 或 Debian 重启后
+恢复。Docker json-file 容器日志不由脚本采集，必须在等待阶段或通过外部日志系统留存。
+
+cleanup 失败会单独报告；归档已建立且 failed manifest 更新成功时，两步结果写入
+manifest。cleanup 或 manifest 更新失败都不覆盖原失败阶段和退出结果，重启 Docker 或
+Debian 前必须人工核验残留状态。只有完整成功流程保留运行中的 agent 容器并启动 worker。
+
+若初始 worker stop 无法确认，脚本立即失败并报告“无法确认”；本仓库不能声称 worker
+已停止。配置、锁和 Token 读取等进入 agent 容器轮换前的失败不会删除既有容器。
 
 ### Dry run
 
@@ -322,7 +333,9 @@ runtime is not clean; use start-qr-login.sh
 - 原 `runtime/wechat-home`；
 - 流程启动与结束 UTC 时间；
 - 原 runtime、data、wechat-home 的 UID、GID 和 mode；
-- 流程结果类别和执行阶段。
+- 流程结果类别和执行阶段；
+- failed manifest 更新成功时，失败 cleanup 是否执行，以及 agent 容器 stop/remove
+  的脱敏结果。
 
 legacy `data` 与 `wechat-home` 必须进入同一个时间戳归档。manifest 的
 `sourceLayout` 和 `sourcePaths` 记录其非敏感来源；mixed 新旧布局不会产生迁移归档，
@@ -346,6 +359,7 @@ SSH -> start-qr-login.sh -> 手机扫码 -> 自动验证 -> worker 启动
 ```
 
 - Debian 重启后不等待容器自动恢复旧会话。
+- cleanup 已确认 remove 成功时，不存在可由 Docker daemon 重启恢复的 agent 容器。
 - 容器重建后不挂载旧会话继续工作。
 - 镜像或代码回滚后仍创建全新 runtime。
 - 旧运行目录只归档，不恢复为活跃登录态。

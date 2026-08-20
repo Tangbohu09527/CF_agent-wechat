@@ -11,6 +11,10 @@ DRY_RUN=0
 FLOW_COMPLETE=0
 WORKER_GUARD=0
 WORKER_STOP_CONFIRMED=0
+AGENT_CLEANUP_GUARD=0
+AGENT_FAILURE_CLEANUP_ATTEMPTED=false
+AGENT_FAILURE_CLEANUP_STOP_RESULT="not_attempted"
+AGENT_FAILURE_CLEANUP_REMOVE_RESULT="not_attempted"
 FLOW_PHASE="initializing"
 FLOW_STARTED_AT=""
 ARCHIVE_PATH=""
@@ -129,7 +133,10 @@ write_manifest() {
     "$LEGACY_WECHAT_HOME_ROOT" "$ARCHIVE_PATH" \
     "$RUNTIME_EXISTS" "$RUNTIME_UID" "$RUNTIME_GID" "$RUNTIME_MODE" \
     "$DATA_EXISTS" "$DATA_UID" "$DATA_GID" "$DATA_MODE" \
-    "$HOME_EXISTS" "$HOME_UID" "$HOME_GID" "$HOME_MODE" <<'PY'
+    "$HOME_EXISTS" "$HOME_UID" "$HOME_GID" "$HOME_MODE" \
+    "$AGENT_FAILURE_CLEANUP_ATTEMPTED" \
+    "$AGENT_FAILURE_CLEANUP_STOP_RESULT" \
+    "$AGENT_FAILURE_CLEANUP_REMOVE_RESULT" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -157,6 +164,9 @@ from pathlib import Path
     home_uid,
     home_gid,
     home_mode,
+    cleanup_attempted,
+    cleanup_stop,
+    cleanup_remove,
 ) = sys.argv[1:]
 
 def metadata(exists, uid, gid, mode):
@@ -200,6 +210,12 @@ payload = {
         "accountIdentifiersIncluded": False,
         "chatIdentifiersIncluded": False,
     },
+    "failureCleanup": {
+        "attempted": cleanup_attempted == "true",
+        "agentContainerStop": cleanup_stop,
+        "agentContainerRemove": cleanup_remove,
+        "volumesRemoved": False,
+    },
 }
 Path(output).write_text(
     json.dumps(payload, ensure_ascii=True, indent=2) + "\n",
@@ -227,10 +243,12 @@ PY
 
 on_exit() {
   local exit_status=$?
-  local ended_at
+  local ended_at original_last_error
+  local agent_cleanup_failed=0 manifest_write_failed=0
 
   trap - EXIT
   set +e
+  original_last_error="${LAST_ERROR:-}"
   if [ "$DRY_RUN" -eq 0 ] && [ "$FLOW_COMPLETE" -eq 0 ] &&
     [ "$WORKER_GUARD" -eq 1 ]; then
     if stop_gateway_worker >/dev/null 2>&1; then
@@ -240,10 +258,19 @@ on_exit() {
     fi
   fi
   if [ "$DRY_RUN" -eq 0 ] && [ "$FLOW_COMPLETE" -eq 0 ] &&
+    [ "$AGENT_CLEANUP_GUARD" -eq 1 ]; then
+    if ! cleanup_failed_agent_container; then
+      agent_cleanup_failed=1
+    fi
+  fi
+  if [ "$DRY_RUN" -eq 0 ] && [ "$FLOW_COMPLETE" -eq 0 ] &&
     [ "$MANIFEST_AVAILABLE" -eq 1 ]; then
     ended_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    write_manifest failed "$ended_at" >/dev/null 2>&1
+    if ! write_manifest failed "$ended_at" >/dev/null 2>&1; then
+      manifest_write_failed=1
+    fi
   fi
+  LAST_ERROR="$original_last_error"
   if [ "$exit_status" -ne 0 ]; then
     error "Fresh QR runtime failed during phase: $FLOW_PHASE"
     if [ -n "$ARCHIVE_PATH" ]; then
@@ -255,6 +282,16 @@ on_exit() {
       error "Gateway wechat-worker remains stopped; AI scheduling was not started."
     elif [ "$WORKER_GUARD" -eq 1 ]; then
       error "Gateway wechat-worker stop could not be confirmed; its state is unknown. Treat AI scheduling as active and stop it manually before retrying."
+    fi
+    if [ "$AGENT_FAILURE_CLEANUP_ATTEMPTED" = true ]; then
+      if [ "$agent_cleanup_failed" -eq 0 ]; then
+        error "Failed-flow cleanup stopped and removed the agent-wechat container; persistent runtime evidence was preserved."
+      else
+        error "Failed-flow agent-wechat cleanup encountered errors (stop: ${AGENT_FAILURE_CLEANUP_STOP_RESULT}; remove: ${AGENT_FAILURE_CLEANUP_REMOVE_RESULT})."
+      fi
+    fi
+    if [ "$manifest_write_failed" -eq 1 ]; then
+      error "The failed-flow manifest could not be updated with cleanup results."
     fi
   fi
   exit "$exit_status"
@@ -562,6 +599,7 @@ main() {
     return 1
   fi
 
+  AGENT_CLEANUP_GUARD=1
   FLOW_PHASE="remove_agent_container"
   if ! stop_agent_container; then
     error "$LAST_ERROR"

@@ -223,6 +223,12 @@ case "$command_name" in
       state_set gateway_running 0
     else
       [ "${*: -1}" = "agent-wechat" ] || exit 65
+      if [ "$(state_get agent_started_once 0)" = "1" ] &&
+        [ "$(state_get agent_cleanup_stop_error 0)" = "1" ]; then
+        state_set agent_running 0
+        record "agent container cleanup stop failed"
+        exit 73
+      fi
       mutate "agent container stop"
       state_set agent_running 0
     fi
@@ -230,6 +236,11 @@ case "$command_name" in
   rm)
     [ "$compose_kind" = "agent" ] || exit 65
     [ "${*: -1}" = "agent-wechat" ] || exit 65
+    if [ "$(state_get agent_started_once 0)" = "1" ] &&
+      [ "$(state_get agent_cleanup_remove_error 0)" = "1" ]; then
+      record "agent container cleanup remove failed"
+      exit 74
+    fi
     mutate "agent container remove"
     state_set agent_exists 0
     state_set agent_running 0
@@ -237,6 +248,10 @@ case "$command_name" in
   up)
     if [ "$compose_kind" = "gateway" ]; then
       [ "${*: -1}" = "wechat-worker" ] || exit 65
+      if [ "$(state_get gateway_start_error 0)" = "1" ]; then
+        record "gateway worker start failed"
+        exit 75
+      fi
       mutate "gateway worker start"
       state_set gateway_running 1
     else
@@ -244,7 +259,10 @@ case "$command_name" in
       mutate "agent container start"
       state_set agent_exists 1
       state_set agent_running 1
+      state_set agent_started_once 1
       state_set wechat_calls 0
+      printf '%s\n' 'agent runtime evidence' > \
+        "${CF_AGENT_WECHAT_RUNTIME_ROOT:?}/data/agent-runtime.log"
     fi
     ;;
   down)

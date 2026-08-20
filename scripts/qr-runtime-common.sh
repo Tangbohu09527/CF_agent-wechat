@@ -693,6 +693,31 @@ remove_agent_container() {
   fi
 }
 
+cleanup_failed_agent_container() {
+  local cleanup_failed=0
+
+  # These result globals are written to the lifecycle manifest by the caller.
+  # shellcheck disable=SC2034
+  AGENT_FAILURE_CLEANUP_ATTEMPTED=true
+  if stop_agent_container; then
+    # shellcheck disable=SC2034
+    AGENT_FAILURE_CLEANUP_STOP_RESULT="succeeded"
+  else
+    # shellcheck disable=SC2034
+    AGENT_FAILURE_CLEANUP_STOP_RESULT="failed"
+    cleanup_failed=1
+  fi
+  if remove_agent_container; then
+    # shellcheck disable=SC2034
+    AGENT_FAILURE_CLEANUP_REMOVE_RESULT="succeeded"
+  else
+    # shellcheck disable=SC2034
+    AGENT_FAILURE_CLEANUP_REMOVE_RESULT="failed"
+    cleanup_failed=1
+  fi
+  return "$cleanup_failed"
+}
+
 start_agent_container() {
   local state
 

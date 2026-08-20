@@ -95,6 +95,7 @@ GATEWAY_PROJECT_DIR="${TEST_ROOT}/gateway"
 GATEWAY_COMPOSE_FILE="${GATEWAY_PROJECT_DIR}/compose.yaml"
 GATEWAY_ENV_FILE="${GATEWAY_PROJECT_DIR}/.env"
 GATEWAY_ENV_SENTINEL="gateway-env-fixture-sensitive-permissions-$$"
+AGENT_STATE_FILE="${TEST_ROOT}/agent-state"
 
 install -d -o root -g root -m 755 "${TEST_REPO}/scripts"
 install -o root -g root -m 755 \
@@ -120,9 +121,12 @@ chmod 644 "$AGENT_COMPOSE_FILE" "$GATEWAY_COMPOSE_FILE"
 printf '%s\n' "$GATEWAY_ENV_SENTINEL" > "$GATEWAY_ENV_FILE"
 chown root:root "$AGENT_ENV_FILE" "$GATEWAY_ENV_FILE"
 chmod 600 "$AGENT_ENV_FILE" "$GATEWAY_ENV_FILE"
+printf '%s\n' 'running' > "$AGENT_STATE_FILE"
 
 useradd --create-home --home-dir "$TEST_HOME" --shell /bin/bash "$TEST_USER"
 useradd --create-home --home-dir "$NO_SUDO_HOME" --shell /bin/bash "$NO_SUDO_USER"
+chown "$TEST_USER:$TEST_USER" "$AGENT_STATE_FILE"
+chmod 600 "$AGENT_STATE_FILE"
 : > "$AUDIT_LOG"
 chown "$TEST_USER:$TEST_USER" "$AUDIT_LOG"
 chmod 600 "$AUDIT_LOG"
@@ -500,6 +504,51 @@ assert_runtime_mock_requires_sudo compose \
 assert_runtime_mock_requires_sudo exec exec "$TEST_CONTAINER" true
 assert_runtime_mock_requires_sudo inspect inspect "$TEST_CONTAINER"
 printf 'PASS runtime Docker mock requires the sudo fallback\n'
+
+reset_audit
+if ! CLEANUP_OUTPUT="$("$REAL_SUDO" -u "$TEST_USER" -H env \
+  PATH="$AUDIT_PATH" \
+  CF_AUDIT_LOG="$AUDIT_LOG" \
+  CF_AUDIT_REAL_DOCKER="$REAL_DOCKER" \
+  CF_AUDIT_REAL_SUDO="$REAL_SUDO" \
+  CF_AUDIT_DOCKER_RUNTIME_MOCK=1 \
+  CF_AUDIT_DOCKER_VIA_SUDO=0 \
+  CF_AUDIT_AGENT_ENV_FILE="$AGENT_ENV_FILE" \
+  CF_AUDIT_GATEWAY_ENV_FILE="$GATEWAY_ENV_FILE" \
+  CF_AUDIT_AGENT_STATE_FILE="$AGENT_STATE_FILE" \
+  CF_AGENT_WECHAT_COMPOSE_FILE="$AGENT_COMPOSE_FILE" \
+  CF_AGENT_WECHAT_ENV_FILE="$AGENT_ENV_FILE" \
+  CF_AGENT_WECHAT_RUNTIME_ROOT="${TEST_ROOT}/runtime" \
+  /bin/bash -c '
+cd "$1"
+source scripts/common.sh
+source scripts/qr-runtime-common.sh
+runtime_select_docker
+cleanup_failed_agent_container
+printf "%s:%s:%s\n" \
+  "$AGENT_FAILURE_CLEANUP_ATTEMPTED" \
+  "$AGENT_FAILURE_CLEANUP_STOP_RESULT" \
+  "$AGENT_FAILURE_CLEANUP_REMOVE_RESULT"
+' cf-agent-wechat-test "$TEST_REPO" 2>&1)"; then
+  printf '%s\n' "$CLEANUP_OUTPUT" >&2
+  fail "failed-agent cleanup did not use the sudo Docker fallback"
+fi
+[ "$CLEANUP_OUTPUT" = "true:succeeded:succeeded" ] ||
+  fail "failed-agent cleanup returned unexpected results"
+[ "$(cat "$AGENT_STATE_FILE")" = "absent" ] ||
+  fail "failed-agent cleanup left a restartable container"
+[ "$(audit_count sudo docker-info)" -eq 1 ] ||
+  fail "failed-agent cleanup did not select sudo Docker"
+[ "$(audit_count docker compose-agent-stop)" -eq 1 ] ||
+  fail "failed-agent cleanup did not stop the agent container"
+[ "$(audit_count docker compose-agent-remove)" -eq 1 ] ||
+  fail "failed-agent cleanup did not remove the agent container"
+assert_no_sudo_python "failed-agent cleanup"
+CLEANUP_OUTPUT_FILE="${TEST_ROOT}/cleanup.out"
+printf '%s\n' "$CLEANUP_OUTPUT" > "$CLEANUP_OUTPUT_FILE"
+assert_file_has_no_token "$CLEANUP_OUTPUT_FILE"
+assert_file_has_no_token "$AUDIT_LOG"
+printf 'PASS failed-agent cleanup with sudo Docker fallback\n'
 
 python3 "${REPO_ROOT}/tests/helpers/mock_agent_wechat.py" \
   --token-file "$TOKEN_FILE" \

@@ -10,6 +10,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 RUNTIME_HELPER = REPO_ROOT / "scripts" / "qr-runtime-common.sh"
 COMMON_HELPER = REPO_ROOT / "scripts" / "common.sh"
+START_SCRIPT = REPO_ROOT / "scripts" / "start-qr-login.sh"
 
 
 def function_body(content: str, name: str) -> str:
@@ -78,6 +79,69 @@ class AgentRuntimeContractTests(unittest.TestCase):
         self.assertEqual(self.content.count(absolute_error), 2)
         self.assertEqual(self.content.count(file_condition), 2)
         self.assertEqual(self.content.count(file_error), 2)
+
+
+class FailedFlowCleanupContractTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        runtime_content = RUNTIME_HELPER.read_text(encoding="utf-8")
+        start_content = START_SCRIPT.read_text(encoding="utf-8")
+        cls.cleanup_body = function_body(
+            runtime_content, "cleanup_failed_agent_container"
+        )
+        cls.remove_body = function_body(
+            runtime_content, "remove_agent_container"
+        )
+        cls.exit_body = function_body(start_content, "on_exit")
+        cls.main_body = function_body(start_content, "main")
+
+    def test_cleanup_attempts_stop_then_remove_without_volume_deletion(
+        self,
+    ) -> None:
+        stop_call = self.cleanup_body.index("if stop_agent_container; then")
+        remove_call = self.cleanup_body.index(
+            "if remove_agent_container; then"
+        )
+        self.assertLess(stop_call, remove_call)
+        self.assertIn(
+            'AGENT_FAILURE_CLEANUP_STOP_RESULT="failed"',
+            self.cleanup_body,
+        )
+        self.assertIn(
+            'AGENT_FAILURE_CLEANUP_REMOVE_RESULT="failed"',
+            self.cleanup_body,
+        )
+        for forbidden in ("rm -v", " down ", "runtime_privileged rm"):
+            self.assertNotIn(forbidden, self.cleanup_body)
+        self.assertIn(
+            "agent_compose rm --force agent-wechat",
+            self.remove_body,
+        )
+        for forbidden in ("rm -v", "--volumes", " down "):
+            self.assertNotIn(forbidden, self.remove_body)
+
+    def test_exit_trap_cleans_agent_before_failed_manifest(self) -> None:
+        self.assertIn(
+            '[ "$AGENT_CLEANUP_GUARD" -eq 1 ]',
+            self.exit_body,
+        )
+        cleanup_call = self.exit_body.index(
+            "cleanup_failed_agent_container"
+        )
+        manifest_call = self.exit_body.index(
+            'write_manifest failed "$ended_at"'
+        )
+        self.assertLess(cleanup_call, manifest_call)
+        self.assertIn('exit "$exit_status"', self.exit_body)
+
+    def test_cleanup_guard_starts_only_at_agent_destructive_phase(
+        self,
+    ) -> None:
+        token_load = self.main_body.index("if ! load_auth_token; then")
+        cleanup_guard = self.main_body.index("AGENT_CLEANUP_GUARD=1")
+        first_agent_stop = self.main_body.index("if ! stop_agent_container; then")
+        self.assertLess(token_load, cleanup_guard)
+        self.assertLess(cleanup_guard, first_agent_stop)
 
 
 class WeChatProcessIdentityContractTests(unittest.TestCase):

@@ -43,7 +43,7 @@ Debian 启动
 | 状态判定 | 已实现并自动化验证 | 进程、auth、chats 缺一不可，不输出账号 ID |
 | 归档 | 已实现并自动化验证 | runtime 或 legacy 双目录进入一个 UTC 归档，mixed layout fail-fast |
 | 有界就绪等待 | 已实现并自动化验证 | 登录后按 `POST_LOGIN_READY_TIMEOUT` 等待 auth/chats/messages |
-| 失败隔离 | 已实现并自动化验证 | 脚本确认 stop 后，后续失败保持 `wechat-worker` 停止 |
+| 失败隔离 | 已实现并自动化验证 | agent 轮换后的失败尝试停止 worker 并 stop/remove agent；结果单独确认 |
 | Gateway boot stop gate | 尚待 CFserver 实机验证 | 本仓未修改 Gateway，不能保证脚本运行前的开机窗口 |
 | 完全新设备 SSH 扫码 | 已实现但尚未实机验证 | 仍需 CFserver 真实手机扫码闭环 |
 
@@ -56,7 +56,8 @@ Debian 启动
 2. 当前 runtime 被原子归档。
 3. 新 `runtime/data` 和 `runtime/wechat-home` 权限正确。
 4. Token 不进入 runtime、归档或 manifest。
-5. 登录失败时 `wechat-worker` 不启动。
+5. agent-server、WeChat、登录、chats/messages 或 worker 启动失败时执行统一
+   cleanup；成功场景确认 worker stopped、agent absent，注入失败场景确认结果被记录。
 6. `/usr/bin/wechat` 为符号链接时解析 canonical executable；目标进程缺失，或同名
    进程、命令行含 `wechat` 但 executable 不匹配时启动失败。
 7. auth 为 `logged_in` 但 chats API 不可读时启动失败。
@@ -73,6 +74,12 @@ Debian 启动
 18. 登录后 auth/chats/messages 在有界窗口内轮询，并跟踪同一 `PID:start_time`；
     超时、`PID:start_time` 身份变化或 canonical executable 不再匹配时失败。
 19. start/stop 共用指定 `flock`；并发只有一个流程获得锁。
+20. 失败 cleanup 不主动删除已有 runtime、归档、其中已落盘的持久文件或 volume；
+    failed manifest 更新成功时记录 stop/remove 结果，cleanup 错误不覆盖原失败阶段。
+21. 模拟 Docker daemon 重启时，remove 成功的失败流程没有残留 agent 容器可恢复；
+    remove 失败场景保留 stopped 容器并明确要求人工处置；成功流程仍保留运行中容器。
+22. 普通 Docker 与 ordinary-user sudo Docker fallback 都执行相同的 stop/remove
+    cleanup，且输出、trace、audit、runtime 和归档不泄露 fixture 敏感值。
 
 ### 静态质量检查
 
@@ -130,7 +137,12 @@ Debian 启动
 - [ ] 容器重建后使用全新 runtime 并重新扫码成功。
 - [ ] 人工停止后再次启动需要全新二维码。
 - [ ] `stop-qr-runtime.sh` 停止 worker 与容器，但不删除任何数据。
-- [ ] 至少验证一个失败场景，确认 worker 保持停止且归档保留。
+- [ ] 至少验证一个失败场景，确认 cleanup 不主动删除已有 runtime、归档或其中已落盘
+  的持久文件；不要把 Docker json-file 容器日志误写为脚本已归档。
+- [ ] 检查 failed manifest 的 `failureCleanup`，确认 stop/remove 结果与现场一致；
+  cleanup 自身失败时仍保留原失败阶段。
+- [ ] 仅在 worker stop 与 agent remove 都已确认成功后，验证 Docker daemon 重启不会
+  恢复失败容器；任一步失败时先人工处置，不得直接重启 Docker 或 Debian。
 
 ### 业务窗口
 

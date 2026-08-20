@@ -51,11 +51,11 @@ if [ "${CF_AUDIT_DOCKER_RUNTIME_MOCK:-}" = "1" ]; then
           expect_env_file=1
           continue
         fi
-        if [ "$argument" = "ps" ]; then
-          compose_command="ps"
-        fi
+        case "$argument" in
+          ps|stop|rm) compose_command="$argument" ;;
+        esac
       done
-      if [ "$compose_command" != "ps" ]; then
+      if [ -z "$compose_command" ]; then
         printf '%s\n' 'unexpected runtime Compose command' >&2
         exit 64
       fi
@@ -66,10 +66,42 @@ if [ "${CF_AUDIT_DOCKER_RUNTIME_MOCK:-}" = "1" ]; then
             printf '%s\n' 'agent-wechat env-file argument mismatch' >&2
             exit 67
           fi
-          printf 'runtime-fixture-%s\n' "$service"
+          agent_state="running"
+          if [ -n "${CF_AUDIT_AGENT_STATE_FILE:-}" ] &&
+            [ -f "$CF_AUDIT_AGENT_STATE_FILE" ]; then
+            agent_state="$(cat -- "$CF_AUDIT_AGENT_STATE_FILE")"
+          fi
+          case "$compose_command" in
+            ps)
+              if printf '%s\n' "$@" | grep -qx -- '--all'; then
+                [ "$agent_state" = "absent" ] ||
+                  printf 'runtime-fixture-%s\n' "$service"
+              elif [ "$agent_state" = "running" ]; then
+                printf 'runtime-fixture-%s\n' "$service"
+              fi
+              ;;
+            stop)
+              printf 'docker\tcompose-agent-stop\n' >> "$CF_AUDIT_LOG"
+              [ -n "${CF_AUDIT_AGENT_STATE_FILE:-}" ] ||
+                exit 68
+              printf '%s\n' 'stopped' > "$CF_AUDIT_AGENT_STATE_FILE"
+              ;;
+            rm)
+              if printf '%s\n' "$@" |
+                grep -Eqx -- '-v|--volumes'; then
+                printf '%s\n' 'volume removal is forbidden' >&2
+                exit 69
+              fi
+              printf 'docker\tcompose-agent-remove\n' >> "$CF_AUDIT_LOG"
+              [ -n "${CF_AUDIT_AGENT_STATE_FILE:-}" ] ||
+                exit 68
+              printf '%s\n' 'absent' > "$CF_AUDIT_AGENT_STATE_FILE"
+              ;;
+          esac
           exit 0
           ;;
         wechat-worker)
+          [ "$compose_command" = "ps" ] || exit 64
           if [ "$compose_env_file" != "${CF_AUDIT_GATEWAY_ENV_FILE:?}" ]; then
             printf '%s\n' 'Gateway env-file argument mismatch' >&2
             exit 67

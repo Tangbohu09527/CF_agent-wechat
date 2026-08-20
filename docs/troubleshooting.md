@@ -156,6 +156,19 @@ sudo docker exec cf-agent-wechat \
 重启；保留现场后重新运行完整入口。`restart: on-failure:3` 已限制容器失败重试，不应
 改回 `always` 或 `unless-stopped`。
 
+进入 agent 容器轮换阶段后，`start-qr-login.sh` 的任何非零退出都会尝试重新停止并
+确认 `wechat-worker`，再依次 stop/remove 本次 `agent-wechat` 容器。remove 只使用
+`compose rm --force`，不使用 `-v`、`down` 或 volume 删除；cleanup 不主动删除已有
+runtime、历史归档或其中已落盘的持久文件。成功流程不执行该 cleanup，容器继续运行。
+
+只有 stop/remove 均报告成功并通过状态确认时，才能认定失败容器已删除且不会在 Docker
+daemon 重启后恢复。任一步失败时，脚本保留原失败阶段和退出结果并追加 cleanup 错误；
+重启 Docker 或 Debian 前必须人工确认并处置残留容器。归档已建立且 failed manifest
+更新成功时，`failureCleanup` 会记录两步结果；manifest 更新失败会另行报告。cleanup
+不会采集 Docker json-file 容器日志，需在等待阶段或由外部日志系统留存；bind-mounted
+runtime 中已经落盘的日志不受容器删除影响。配置、锁或 Token 读取等 agent 容器轮换前
+的失败仍保持 fail-fast，不删除既有容器或运行目录。
+
 ## WeChat 进程不存在、被替换或身份不匹配
 
 即使 agent-server 可访问或 auth 显示 `logged_in`，`/usr/bin/wechat` 真实进程不存在
