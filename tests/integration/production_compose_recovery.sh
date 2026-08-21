@@ -163,6 +163,8 @@ from __future__ import annotations
 
 import http.server
 import json
+import os
+import signal
 import sys
 import urllib.request
 from pathlib import Path
@@ -233,6 +235,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 def main() -> int:
     if Path(sys.argv[0]).name == "curl":
         return curl_main()
+    signal.signal(signal.SIGUSR1, lambda _signum, _frame: os._exit(70))
     server = http.server.ThreadingHTTPServer(("0.0.0.0", 6174), Handler)
     server.serve_forever()
     return 0
@@ -443,17 +446,25 @@ docker exec "$INITIAL_CONTAINER_ID" /bin/sh -c \
   fail "container could not write persistent runtime markers"
 assert_runtime_contract "$INITIAL_CONTAINER_ID" initial
 
-INITIAL_RESTART_COUNT="$(docker inspect --format '{{.RestartCount}}' "$INITIAL_CONTAINER_ID")"
+INITIAL_RESTART_COUNT="$(docker inspect --format '{{.RestartCount}}' "$INITIAL_CONTAINER_ID")" || \
+  fail "could not inspect initial restart count"
 [[ "$INITIAL_RESTART_COUNT" =~ ^[0-9]+$ ]] || fail "initial restart count is invalid"
 # Docker activates a restart policy only after the container has stayed up
 # successfully for at least ten seconds.
 sleep 11
-# Crash container init through the daemon instead of relying on namespace
-# PID 1 signal semantics from an exec process inside the container.
-docker kill --signal KILL "$INITIAL_CONTAINER_ID" >/dev/null || \
-  fail "could not inject a daemon-side SIGKILL into the initial container"
-wait_for_automatic_restart "$INITIAL_CONTAINER_ID" "$INITIAL_RESTART_COUNT" || \
-  fail "unless-stopped did not recover the service after daemon-side SIGKILL"
+assert_runtime_contract "$INITIAL_CONTAINER_ID" pre-crash
+PRE_CRASH_RESTART_COUNT="$(docker inspect --format '{{.RestartCount}}' "$INITIAL_CONTAINER_ID")" || \
+  fail "could not inspect pre-crash restart count"
+[[ "$PRE_CRASH_RESTART_COUNT" =~ ^[0-9]+$ ]] || \
+  fail "pre-crash restart count is invalid"
+[ "$PRE_CRASH_RESTART_COUNT" = "$INITIAL_RESTART_COUNT" ] || \
+  fail "container restarted unexpectedly during the restart-policy activation wait"
+# PID 1 exits nonzero, so Docker does not classify this as a manual stop.
+docker exec --detach "$INITIAL_CONTAINER_ID" /bin/sh -c \
+  'sleep 0.2; kill -USR1 1' || \
+  fail "could not schedule the container self-crash"
+wait_for_automatic_restart "$INITIAL_CONTAINER_ID" "$PRE_CRASH_RESTART_COUNT" || \
+  fail "unless-stopped did not recover the service after PID 1 self-terminated"
 AUTO_RESTARTED_CONTAINER_ID="$(compose ps --all --quiet "$SERVICE_NAME")"
 [ "$AUTO_RESTARTED_CONTAINER_ID" = "$INITIAL_CONTAINER_ID" ] || \
   fail "automatic process recovery unexpectedly replaced the container"
