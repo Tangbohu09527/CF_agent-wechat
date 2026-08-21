@@ -1,5 +1,10 @@
 # agent-server API 边界
 
+> [!NOTE]
+> 2026-08-13/14 的接口结果是旧生产基线证据。forced-QR 用法仅适用于
+> `feat/forced-qr-login@9cb7163` 及其后续合入版本；该用法已自动化验证，尚未完成
+> CFserver 真实扫码闭环。本文审计的 `main` 代码基线 `96264e2` 不含 `--force-qr`。
+
 ## 适用范围
 
 本文描述 `CF_agent-wechat` 对外提供的 agent-server 接口及当前验证边界。Gateway
@@ -20,9 +25,10 @@ http://cf-agent-wechat:6174
 
 生产 Token 由 Compose 只读挂载到 `/data/auth-token`。宿主文件保持
 `root:root 600`，其父目录保持 `root:root 700`。日常状态和登录操作应使用
-`scripts/status.sh` 与 `scripts/login.sh`，不要为了手工调用放宽权限。
+`scripts/status.sh`；forced-QR 目标版本的登录和恢复统一使用
+`start-qr-login.sh`，不要为了手工调用放宽权限。
 
-## 2026-08-13 生产验证
+## 2026-08-13 历史生产验证
 
 以下端点已经由 Gateway 经 `cf-internal` 实机调用：
 
@@ -38,28 +44,27 @@ http://cf-agent-wechat:6174
 
 ## 登录接口
 
-生产登录工具使用：
-
-| 方法或协议 | 路径 | 用途 | 状态 |
+| 方法或协议 | 路径 | 目标用途 | 证据边界 |
 | --- | --- | --- | --- |
-| GET | `/api/status/auth` | 登录前检查和登录后复核 | 已实现并实机验证 |
-| POST | `/api/status/login` | 在 `logged_out` 时启动登录 | 已实现并实机验证 |
-| WebSocket | `/api/ws/login` | 接收手机确认和成功事件 | 已实现并实机验证 |
+| GET | `/api/status/auth` | 登录前、登录后及生产可用复核 | 旧基线已实机验证；forced-QR 组合流程未实机验证 |
+| POST | `/api/status/login` | forced 模式在全新 runtime 请求登录 | `newAccount=true` 已自动化验证；真实扫码未验证 |
+| WebSocket | `/api/ws/login` | 接收 QR、手机确认、成功、超时和错误事件 | forced 模式实际 QR 渲染门槛已自动化验证；真实扫码未验证 |
 
-已验证链路是已信任设备的手机确认登录。二维码事件处理与 SSH 终端渲染已经实现，
-但完全新设备扫码闭环尚未实机验证。详细行为见
-[微信登录管理](login-management.md)。
+2026-08-13 已实机验证的是“已信任设备 -> 手机确认 -> 登录成功”，不是全新二维码流程。
+forced-QR 目标版本由 `start-qr-login.sh` 编排 runtime 轮换并内部调用
+`login.sh --force-qr`；运维人员不得单独调用底层接口或脚本绕过归档和 worker 闸门。
+详细行为见[微信登录管理](login-management.md)。
 
 `GET /api/status/auth` 的当前关键状态为：
 
 - `logged_in`：微信已登录。
-- `logged_out`：微信未登录，可以启动登录流程。
+- `logged_out`：微信未登录；目标版本必须重新执行完整 forced-QR 生命周期。
 - `app_not_running`：微信客户端未运行，应先查容器日志。
 
 响应可能包含实际账号标识；任何对外记录都应替换为
 `<BOT_WECHAT_ACCOUNT_ID>`。
 
-## 2026-08-14 消息与媒体生产验证
+## 2026-08-14 历史消息与媒体生产验证
 
 以下接口已在 CFserver 生产环境中完成真实私聊、群聊或图片样本验证：
 
@@ -141,6 +146,6 @@ agent-wechat 的文本发送行为，不描述调用方身份、权限或 Hermes
 - 容器健康不等于微信已登录；业务调用前应检查认证状态。
 - Gateway 只作为本服务调用方出现，其内部故障应转交 Gateway 项目处理。
 
-当前生产验证证据见
+历史生产验证证据见
 [2026-08-13 CFserver 生产验证](validation/2026-08-13-cfserver-production.md) 和
 [2026-08-14 消息与媒体生产验证](validation/2026-08-14-message-media-production.md)。
