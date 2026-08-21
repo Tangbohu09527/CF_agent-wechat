@@ -143,6 +143,23 @@ printf 'logged_in\n' > "$STATE_FILE"
 reset_audit() {
   : > "$AUDIT_LOG"
 }
+write_management_environment() {
+  local port="$1"
+  local env_file="${TEST_REPO}/docker/.env"
+  local temp_file="${env_file}.tmp"
+
+  {
+    printf '%s\n' \
+      'CF_AGENT_WECHAT_RUNTIME_ROOT=/srv/storage/cf-agent-wechat' \
+      'AGENT_WECHAT_BIND_IP=127.0.0.1' \
+      "AGENT_WECHAT_PORT=$port" \
+      "AGENT_WECHAT_CONTAINER_NAME=$TEST_CONTAINER"
+  } > "$temp_file"
+  chown "$TEST_USER:$TEST_USER" "$temp_file"
+  chmod 600 "$temp_file"
+  mv -f -- "$temp_file" "$env_file"
+}
+
 
 audit_count() {
   awk -F '\t' -v category="$1" -v kind="$2" '
@@ -420,6 +437,8 @@ for _attempt in $(seq 1 30); do
 done
 [ "$(docker inspect --format '{{.State.Health.Status}}' "$TEST_CONTAINER")" = \
   "healthy" ] || fail "test container did not become healthy"
+write_management_environment 6174
+
 
 DOCKER_ERROR="${TEST_ROOT}/docker-error"
 if "$REAL_SUDO" -u "$TEST_USER" -H "$REAL_DOCKER" inspect "$TEST_CONTAINER" \
@@ -483,14 +502,22 @@ else
 fi
 
 reset_audit
-DETECT_OUTPUT="$("$REAL_SUDO" -u "$TEST_USER" -H env \
+DETECT_ERROR="${TEST_ROOT}/detect-container-status.err"
+if DETECT_OUTPUT="$("$REAL_SUDO" -u "$TEST_USER" -H env \
   PATH="$AUDIT_PATH" \
   CF_AUDIT_LOG="$AUDIT_LOG" \
   CF_AUDIT_REAL_DOCKER="$REAL_DOCKER" \
   CF_AUDIT_REAL_SUDO="$REAL_SUDO" \
-  CONTAINER_NAME="$TEST_CONTAINER" /bin/bash -c \
-  'cd "$1"; source scripts/common.sh; detect_container_status' \
-  cf-agent-wechat-test "$TEST_REPO")"
+  /bin/bash -c \
+  'cd "$1"; source scripts/common.sh; [ "$CONTAINER_NAME" = "$2" ] || exit 86; detect_container_status' \
+  cf-agent-wechat-test "$TEST_REPO" "$TEST_CONTAINER" 2> "$DETECT_ERROR")"; then
+  :
+else
+  detect_status=$?
+  cat "$DETECT_ERROR" >&2
+  cat "$AUDIT_LOG" >&2
+  fail "detect_container_status returned $detect_status"
+fi
 [ "$DETECT_OUTPUT" = 'running' ] || \
   fail "detect_container_status did not use the sudo fallback"
 assert_docker_fallback_order
@@ -576,13 +603,7 @@ done
 HTTP_PORT="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["http_port"])' "$READY_FILE")"
 WS_PORT="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["ws_port"])' "$READY_FILE")"
 [ "$WS_PORT" = "$HTTP_PORT" ] || fail "mock HTTP and WebSocket ports must be identical"
-printf '%s\n' \
-  'CF_AGENT_WECHAT_RUNTIME_ROOT=/srv/storage/cf-agent-wechat' \
-  'AGENT_WECHAT_BIND_IP=127.0.0.1' \
-  "AGENT_WECHAT_PORT=$HTTP_PORT" \
-  "AGENT_WECHAT_CONTAINER_NAME=$TEST_CONTAINER" > "${TEST_REPO}/docker/.env"
-chown "$TEST_USER:$TEST_USER" "${TEST_REPO}/docker/.env"
-chmod 600 "${TEST_REPO}/docker/.env"
+write_management_environment "$HTTP_PORT"
 
 
 docker restart "$TEST_CONTAINER" >/dev/null
@@ -737,6 +758,9 @@ assert_secret_permissions
 printf 'PASS missing root-only token distinction\n'
 
 NO_SUDO_OUTPUT="${TEST_ROOT}/no-sudo.out"
+chown "root:$(id -gn "$NO_SUDO_USER")" "${TEST_REPO}/docker/.env"
+chmod 640 "${TEST_REPO}/docker/.env"
+
 if timeout 15s sudo -u "$NO_SUDO_USER" -H env \
   API_URL="http://127.0.0.1:${HTTP_PORT}" \
   AGENT_WECHAT_PORT="$HTTP_PORT" \

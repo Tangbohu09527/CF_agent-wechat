@@ -448,9 +448,12 @@ INITIAL_RESTART_COUNT="$(docker inspect --format '{{.RestartCount}}' "$INITIAL_C
 # Docker activates a restart policy only after the container has stayed up
 # successfully for at least ten seconds.
 sleep 11
-docker exec "$INITIAL_CONTAINER_ID" kill -KILL 1 >/dev/null 2>&1 || true
+# Crash container init through the daemon instead of relying on namespace
+# PID 1 signal semantics from an exec process inside the container.
+docker kill --signal KILL "$INITIAL_CONTAINER_ID" >/dev/null || \
+  fail "could not inject a daemon-side SIGKILL into the initial container"
 wait_for_automatic_restart "$INITIAL_CONTAINER_ID" "$INITIAL_RESTART_COUNT" || \
-  fail "unless-stopped did not recover the service after PID 1 exited"
+  fail "unless-stopped did not recover the service after daemon-side SIGKILL"
 AUTO_RESTARTED_CONTAINER_ID="$(compose ps --all --quiet "$SERVICE_NAME")"
 [ "$AUTO_RESTARTED_CONTAINER_ID" = "$INITIAL_CONTAINER_ID" ] || \
   fail "automatic process recovery unexpectedly replaced the container"
