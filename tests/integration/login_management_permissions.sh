@@ -289,6 +289,7 @@ run_script_as() {
 
   command=(
     "$REAL_SUDO" -u "$user_name" -H env
+    -u XDG_RUNTIME_DIR
     API_URL="http://127.0.0.1:${HTTP_PORT}"
     AGENT_WECHAT_PORT="$HTTP_PORT"
     TOKEN_FILE="$TOKEN_FILE"
