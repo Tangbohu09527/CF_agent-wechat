@@ -11,12 +11,14 @@ import json
 import os
 import shutil
 import sys
+import time
 from typing import Any, Sequence
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 
 NO_QR_DATA = 4
 MAX_TOKEN_BYTES = 8192
+MIN_QR_MATRIX_SIZE = 29
 
 
 class LoginToolError(Exception):
@@ -24,18 +26,19 @@ class LoginToolError(Exception):
 
 
 def _terminal_qr_width() -> int:
+    columns = shutil.get_terminal_size(fallback=(100, 24)).columns
+    available = max(0, columns - 2)
     configured = os.environ.get("QR_MAX_WIDTH")
     if configured:
         try:
             width = int(configured)
         except ValueError as exc:
             raise LoginToolError("QR_MAX_WIDTH 必须是整数。") from exc
-        if width < 21:
-            raise LoginToolError("QR_MAX_WIDTH 不能小于 21。")
-        return width
+        if width < MIN_QR_MATRIX_SIZE:
+            raise LoginToolError("QR_MAX_WIDTH 不能小于 29。")
+        return min(width, available)
 
-    columns = shutil.get_terminal_size(fallback=(100, 24)).columns
-    return max(21, min(columns - 2, 120))
+    return min(available, 120)
 
 
 def _render_matrix(matrix: Sequence[Sequence[bool]]) -> None:
@@ -45,6 +48,22 @@ def _render_matrix(matrix: Sequence[Sequence[bool]]) -> None:
     width = len(matrix[0])
     if any(len(row) != width for row in matrix):
         raise LoginToolError("二维码图像尺寸不一致。")
+    height = len(matrix)
+    if width < MIN_QR_MATRIX_SIZE or height < MIN_QR_MATRIX_SIZE:
+        raise LoginToolError("二维码图像尺寸过小。")
+    if max(width, height) > min(width, height) * 5 / 4:
+        raise LoginToolError("二维码图像长宽比无效。")
+
+    cell_count = width * height
+    dark_count = sum(bool(cell) for row in matrix for cell in row)
+    if dark_count < cell_count // 10 or cell_count - dark_count < cell_count // 10:
+        raise LoginToolError("二维码图像缺少足够的深色或浅色模块。")
+
+    available_width = _terminal_qr_width()
+    if width > available_width:
+        raise LoginToolError(
+            f"终端可用宽度仅 {available_width} 列，无法显示 {width} 列二维码。"
+        )
 
     use_color = (
         sys.stdout.isatty()
@@ -84,6 +103,10 @@ def _matrix_from_image(image_bytes: bytes) -> list[list[bool]]:
         raise LoginToolError("输入数据不是有效的二维码图片。") from exc
 
     max_width = _terminal_qr_width()
+    if max_width < MIN_QR_MATRIX_SIZE:
+        raise LoginToolError(
+            f"终端可用宽度仅 {max_width} 列，至少需要 {MIN_QR_MATRIX_SIZE} 列。"
+        )
     if grayscale.width > max_width:
         ratio = max_width / grayscale.width
         target_height = max(1, round(grayscale.height * ratio))
@@ -150,21 +173,31 @@ def _binary_qr_content(value: Any) -> str:
     raise LoginToolError("不支持的 qrBinaryData 格式。")
 
 
+def _qr_payloads(event: dict[str, Any]) -> list[dict[str, Any]]:
+    payloads = [event]
+    for key in ("state", "data", "payload"):
+        nested = event.get(key)
+        if isinstance(nested, dict):
+            payloads.append(nested)
+    return payloads
+
+
 def render_event_qr(event: dict[str, Any]) -> bool:
-    qr_binary_data = event.get("qrBinaryData")
-    if qr_binary_data not in (None, "", []):
-        render_qr_content(_binary_qr_content(qr_binary_data))
-        return True
+    for payload in _qr_payloads(event):
+        qr_binary_data = payload.get("qrBinaryData")
+        if qr_binary_data not in (None, "", []):
+            render_qr_content(_binary_qr_content(qr_binary_data))
+            return True
 
-    qr_data = event.get("qrData")
-    if isinstance(qr_data, str) and qr_data:
-        render_qr_content(qr_data)
-        return True
+        qr_data = payload.get("qrData")
+        if isinstance(qr_data, str) and qr_data:
+            render_qr_content(qr_data)
+            return True
 
-    qr_data_url = event.get("qrDataUrl")
-    if isinstance(qr_data_url, str) and qr_data_url:
-        render_png_base64(qr_data_url)
-        return True
+        qr_data_url = payload.get("qrDataUrl")
+        if isinstance(qr_data_url, str) and qr_data_url:
+            render_png_base64(qr_data_url)
+            return True
 
     return False
 
@@ -188,8 +221,8 @@ def _read_token_stdin() -> str:
         raise LoginToolError("token 长度超过安全限制。")
     if not raw_token:
         raise LoginToolError("标准输入中没有 token。")
-    if b"\n" in raw_token or b"\r" in raw_token:
-        raise LoginToolError("token 必须只包含一行非空内容。")
+    if any(byte < 0x20 or byte == 0x7F for byte in raw_token):
+        raise LoginToolError("token 不能包含空白行或控制字符。")
     try:
         return raw_token.decode("utf-8")
     except UnicodeDecodeError as exc:
@@ -200,14 +233,24 @@ def _redact_token(value: object, token: str) -> str:
     return str(value).replace(token, "[REDACTED]")
 
 
-def _login_url(url: str, timeout_ms: int) -> str:
+def _login_url(url: str, timeout_ms: int, new_account: bool = False) -> str:
     parts = urlsplit(url)
     if parts.scheme not in {"ws", "wss"} or not parts.netloc:
         raise LoginToolError("WebSocket URL 必须是有效的 ws:// 或 wss:// 地址。")
+    if parts.username is not None or parts.password is not None:
+        raise LoginToolError("WebSocket URL 不能包含用户名或密码。")
     query = dict(parse_qsl(parts.query, keep_blank_values=True))
     query.setdefault("timeoutMs", str(timeout_ms))
-    query.setdefault("newAccount", "false")
+    if new_account:
+        query["newAccount"] = "true"
+    else:
+        query.setdefault("newAccount", "false")
     return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
+
+
+def _validate_session_id(session_id: str) -> None:
+    if session_id != "default":
+        raise LoginToolError("生产登录 session ID 必须是 default。")
 
 
 def _event_message(event: dict[str, Any]) -> str:
@@ -215,12 +258,24 @@ def _event_message(event: dict[str, Any]) -> str:
     return message if isinstance(message, str) else ""
 
 
+def _safe_event_message(event: dict[str, Any], token: str) -> str:
+    message = _redact_token(_event_message(event), token)
+    sanitized = "".join(
+        character if ord(character) >= 0x20 and ord(character) != 0x7F else " "
+        for character in message
+    )
+    return sanitized[:240]
+
+
 def listen_for_login(
     url: str,
     token: str,
     session_id: str,
     timeout_ms: int,
+    new_account: bool = False,
+    require_qr: bool = False,
 ) -> None:
+    _validate_session_id(session_id)
     try:
         import websocket
     except ImportError as exc:
@@ -232,11 +287,12 @@ def listen_for_login(
         f"Authorization: Bearer {token}",
         f"X-Session-Id: {session_id}",
     ]
-    socket_timeout = max(30, timeout_ms / 1000 + 15)
+    deadline = time.monotonic() + timeout_ms / 1000
+    socket_timeout = max(1.0, timeout_ms / 1000)
 
     try:
         connection = websocket.create_connection(
-            _login_url(url, timeout_ms),
+            _login_url(url, timeout_ms, new_account),
             header=headers,
             timeout=socket_timeout,
             http_no_proxy=["*"],
@@ -247,11 +303,23 @@ def listen_for_login(
         ) from exc
 
     terminal_event = False
+    qr_rendered = False
     try:
         while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise LoginToolError("登录超时，请重新执行 ./scripts/login.sh。")
+            try:
+                connection.settimeout(max(0.1, remaining))
+            except AttributeError:
+                pass
             try:
                 raw_event = connection.recv()
             except Exception as exc:
+                if time.monotonic() >= deadline:
+                    raise LoginToolError(
+                        "登录超时，请重新执行 ./scripts/login.sh。"
+                    ) from exc
                 raise LoginToolError(
                     f"读取登录事件失败：{_redact_token(exc, token)}"
                 ) from exc
@@ -272,7 +340,7 @@ def listen_for_login(
 
             event_type = event.get("type")
             if event_type == "status":
-                message = _redact_token(_event_message(event), token)
+                message = _safe_event_message(event, token)
                 if "navigat" in message.lower() or "login flow" in message.lower():
                     print("正在启动微信登录流程")
                 elif message:
@@ -283,10 +351,15 @@ def listen_for_login(
                 print("请使用手机微信扫描二维码：")
                 if not render_event_qr(event):
                     raise LoginToolError("登录事件未包含可显示的二维码数据。")
+                qr_rendered = True
             elif event_type == "phone_confirm":
                 print("请在手机微信确认登录")
             elif event_type == "login_success":
                 terminal_event = True
+                if require_qr and not qr_rendered:
+                    raise LoginToolError(
+                        "fresh 登录未收到可显示的二维码，拒绝接受登录成功事件。"
+                    )
                 print("登录成功。")
                 return
             elif event_type == "login_timeout":
@@ -294,15 +367,16 @@ def listen_for_login(
                 raise LoginToolError("登录超时，请重新执行 ./scripts/login.sh。")
             elif event_type == "error":
                 terminal_event = True
-                message = _redact_token(
-                    _event_message(event) or "agent-wechat 返回未知错误。", token
-                )
+                message = _safe_event_message(event, token)
+                message = message or "agent-wechat 返回未知错误。"
                 raise LoginToolError(f"登录失败：{message}")
     finally:
         connection.close()
 
     if not terminal_event:
-        raise LoginToolError("登录 WebSocket 在成功事件前断开。")
+        if require_qr and not qr_rendered:
+            raise LoginToolError("登录 WebSocket 在显示二维码前断开，请重新执行登录脚本。")
+        raise LoginToolError("登录 WebSocket 在成功事件前断开，请重新执行登录脚本。")
 
 
 def parse_args() -> argparse.Namespace:
@@ -321,6 +395,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--url", help="登录 WebSocket URL。")
     parser.add_argument("--session-id", default="default", help="agent-wechat session ID。")
     parser.add_argument("--timeout-ms", type=int, default=300000, help="登录超时毫秒数。")
+    parser.add_argument(
+        "--new-account",
+        action="store_true",
+        help="使用 newAccount=true 请求 fresh device 登录。",
+    )
+    parser.add_argument(
+        "--require-qr",
+        action="store_true",
+        help="未在当前终端成功渲染二维码时拒绝 login_success。",
+    )
+
     return parser.parse_args()
 
 
@@ -332,8 +417,16 @@ def main() -> int:
             raise LoginToolError("--listen 需要 --url。")
         if args.timeout_ms <= 0:
             raise LoginToolError("--timeout-ms 必须大于 0。")
+        _validate_session_id(args.session_id)
         token = _read_token_stdin()
-        listen_for_login(args.url, token, args.session_id, args.timeout_ms)
+        listen_for_login(
+            args.url,
+            token,
+            args.session_id,
+            args.timeout_ms,
+            new_account=args.new_account,
+            require_qr=args.require_qr,
+        )
         return 0
 
     if args.render_json:

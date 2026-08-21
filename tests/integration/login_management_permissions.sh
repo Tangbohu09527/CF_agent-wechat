@@ -66,11 +66,14 @@ fi
 if [ -e "$SUDOERS_FILE" ]; then
   fail "temporary sudoers file already exists: ${SUDOERS_FILE}"
 fi
-for command_name in docker openssl python3 sudo useradd visudo; do
+for command_name in docker flock openssl python3 script sudo useradd visudo; do
   command -v "$command_name" >/dev/null 2>&1 || fail "missing command: ${command_name}"
 done
 REAL_DOCKER="$(command -v docker)"
 REAL_SUDO="$(command -v sudo)"
+bash "${REPO_ROOT}/tests/integration/session_recovery.sh"
+printf 'PASS dependency-free restart/session recovery suite\n'
+
 
 TEST_ROOT="$(mktemp -d /tmp/cf-agent-wechat-permissions.XXXXXX)"
 chmod 755 "$TEST_ROOT"
@@ -88,7 +91,7 @@ AUDIT_BIN="${TEST_ROOT}/audit-bin"
 AUDIT_LOG="${TEST_ROOT}/audit.log"
 AUDIT_PATH="${AUDIT_BIN}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
-install -d -o root -g root -m 755 "${TEST_REPO}/scripts"
+install -d -o root -g root -m 755 "${TEST_REPO}/docker" "${TEST_REPO}/scripts"
 install -o root -g root -m 755 \
   "${REPO_ROOT}/scripts/common.sh" \
   "${REPO_ROOT}/scripts/status.sh" \
@@ -135,16 +138,34 @@ audit_count() {
   ' "$AUDIT_LOG"
 }
 
+assert_token_read_count() {
+  local label="$1" expected="${2:-1}"
+  [ "$(audit_count sudo token-reader)" -eq "$expected" ] ||
+    fail "$label did not use exactly $expected sudo token read(s)"
+}
+
 assert_token_read_once() {
-  [ "$(audit_count sudo token-reader)" -eq 1 ] || \
-    fail "$1 did not use exactly one sudo token read"
+  assert_token_read_count "$1" 1
 }
 
 assert_only_token_sudo() {
-  local sudo_count
+  local label="$1" expected="${2:-1}" sudo_count
   sudo_count="$(awk -F '\t' '$1 == "sudo" { count++ } END { print count + 0 }' \
     "$AUDIT_LOG")"
-  [ "$sudo_count" -eq 1 ] || fail "$1 used sudo for more than the token read"
+  [ "$sudo_count" -eq "$expected" ] ||
+    fail "$label used sudo beyond the expected token read(s)"
+}
+
+assert_status_sudo_calls() {
+  local sudo_count
+
+  assert_token_read_once "status.sh"
+  [ "$(audit_count sudo docker-inspect)" -eq 2 ] ||
+    fail "status.sh did not use exactly two sudo Docker inspect calls"
+  sudo_count="$(awk -F '\t' '$1 == "sudo" { count++ } END { print count + 0 }' \
+    "$AUDIT_LOG")"
+  [ "$sudo_count" -eq 3 ] ||
+    fail "status.sh used an unexpected sudo command"
 }
 
 assert_no_sudo_calls() {
@@ -262,37 +283,88 @@ PY
 run_script_as() {
   local user_name="$1"
   local script_name="$2"
+  local command_string
+  local -a command
   shift 2
-  "$REAL_SUDO" -u "$user_name" -H env \
-    API_URL="http://127.0.0.1:${HTTP_PORT}" \
-    WS_URL="ws://127.0.0.1:${WS_PORT}/api/ws/login" \
-    TOKEN_FILE="$TOKEN_FILE" \
-    PYTHON_BIN=python3 \
-    LOGIN_CONFIRM_INTERVAL=0 \
-    AUTH_TOKEN=exported-sentinel \
-    NO_COLOR=1 \
-    HTTP_PROXY=http://127.0.0.1:9 \
-    http_proxy=http://127.0.0.1:9 \
-    NO_PROXY= \
-    no_proxy= \
-    PATH="$AUDIT_PATH" \
-    CF_AUDIT_LOG="$AUDIT_LOG" \
-    CF_AUDIT_REAL_DOCKER="$REAL_DOCKER" \
-    CF_AUDIT_REAL_SUDO="$REAL_SUDO" \
-    "$@" \
-    /bin/bash -c 'cd "$1" && exec "./scripts/$2"' \
+
+  command=(
+    "$REAL_SUDO" -u "$user_name" -H env
+    API_URL="http://127.0.0.1:${HTTP_PORT}"
+    AGENT_WECHAT_PORT="$HTTP_PORT"
+    TOKEN_FILE="$TOKEN_FILE"
+    PYTHON_BIN=python3
+    LOGIN_CONFIRM_INTERVAL=0
+    AUTH_TOKEN=exported-sentinel
+    NO_COLOR=1
+    HTTP_PROXY=http://127.0.0.1:9
+    http_proxy=http://127.0.0.1:9
+    NO_PROXY=
+    no_proxy=
+    PATH="$AUDIT_PATH"
+    CF_AUDIT_LOG="$AUDIT_LOG"
+    CF_AUDIT_REAL_DOCKER="$REAL_DOCKER"
+    CF_AUDIT_REAL_SUDO="$REAL_SUDO"
+    CONTAINER_NAME="$TEST_CONTAINER"
+    "$@"
+    /bin/bash -c 'cd "$1" && exec "./scripts/$2"'
     cf-agent-wechat-test "$TEST_REPO" "$script_name"
+  )
+  if [ "${RUN_WITH_TTY:-0}" = 1 ]; then
+    printf -v command_string '%q ' "${command[@]}"
+    script --quiet --return --command "$command_string" /dev/null
+  else
+    "${command[@]}"
+  fi
 }
 
 assert_secret_permissions
+chmod 644 "$TOKEN_FILE"
+if ROOT_TOKEN_OUTPUT="$(TOKEN_FILE="$TOKEN_FILE" /bin/bash -c '
+  source "$1"
+  if load_auth_token; then
+    exit 0
+  fi
+  printf "%s" "$LAST_ERROR"
+  exit 1
+' cf-agent-wechat-test "$TEST_REPO/scripts/common.sh")"; then
+  fail "root direct read accepted an auth-token with mode 644"
+fi
+grep -q 'auth-token 必须保持 root:root 600' <<< "$ROOT_TOKEN_OUTPUT" ||
+  fail "root direct read did not report auth-token permission drift"
+chmod 600 "$TOKEN_FILE"
+chmod 755 "$SECRETS_DIR"
+if ROOT_TOKEN_OUTPUT="$(TOKEN_FILE="$TOKEN_FILE" /bin/bash -c '
+  source "$1"
+  if load_auth_token; then
+    exit 0
+  fi
+  printf "%s" "$LAST_ERROR"
+  exit 1
+' cf-agent-wechat-test "$TEST_REPO/scripts/common.sh")"; then
+  fail "root direct read accepted a secrets directory with mode 755"
+fi
+grep -q 'secrets 目录必须保持 root:root 700' <<< "$ROOT_TOKEN_OUTPUT" ||
+  fail "root direct read did not report secrets directory permission drift"
+chmod 700 "$SECRETS_DIR"
+assert_secret_permissions
+printf 'PASS privileged token metadata is enforced for direct root reads\n'
 [ "$(/bin/bash -c 'source "$1"; printf "%s" "$CONTAINER_NAME"' \
   cf-agent-wechat-test "${TEST_REPO}/scripts/common.sh")" = "cf-agent-wechat" ] || \
   fail "default container name is not cf-agent-wechat"
 if docker inspect "$TEST_CONTAINER" >/dev/null 2>&1; then
   fail "unique test container already exists: ${TEST_CONTAINER}"
 fi
-docker run --detach --name "$TEST_CONTAINER" alpine:3.20 sleep 300 >/dev/null
+docker run --detach --name "$TEST_CONTAINER" \
+  --health-cmd true --health-interval 1s --health-timeout 1s --health-retries 3 \
+  alpine:3.20 sleep 300 >/dev/null
 CONTAINER_CREATED=1
+for _attempt in $(seq 1 30); do
+  [ "$(docker inspect --format '{{.State.Health.Status}}' "$TEST_CONTAINER")" = \
+    "healthy" ] && break
+  sleep 0.2
+done
+[ "$(docker inspect --format '{{.State.Health.Status}}' "$TEST_CONTAINER")" = \
+  "healthy" ] || fail "test container did not become healthy"
 
 DOCKER_ERROR="${TEST_ROOT}/docker-error"
 if "$REAL_SUDO" -u "$TEST_USER" -H "$REAL_DOCKER" inspect "$TEST_CONTAINER" \
@@ -361,16 +433,28 @@ done
 [ -s "$READY_FILE" ] || fail "mock server did not become ready"
 HTTP_PORT="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["http_port"])' "$READY_FILE")"
 WS_PORT="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["ws_port"])' "$READY_FILE")"
+[ "$WS_PORT" = "$HTTP_PORT" ] || fail "mock HTTP and WebSocket ports must be identical"
 
+docker restart "$TEST_CONTAINER" >/dev/null
+for _attempt in $(seq 1 30); do
+  [ "$(docker inspect --format '{{.State.Running}} {{.State.Health.Status}}' \
+    "$TEST_CONTAINER")" = "true healthy" ] && break
+  sleep 0.2
+done
+[ "$(docker inspect --format '{{.State.Running}} {{.State.Health.Status}}' \
+  "$TEST_CONTAINER")" = "true healthy" ] ||
+  fail "test container did not recover to running/healthy after docker restart"
+printf 'PASS actual Docker container restart returns to running/healthy\n'
 reset_audit
 STATUS_OUTPUT="${TEST_ROOT}/status.out"
 run_script_as "$TEST_USER" status.sh > "$STATUS_OUTPUT" 2>&1
 grep -q 'logged_in' "$STATUS_OUTPUT" || fail "status.sh did not report logged_in"
-grep -q 'wxid_permissions_test' "$STATUS_OUTPUT" || fail "status.sh did not report account"
+if grep -q 'wxid_permissions_test' "$STATUS_OUTPUT"; then
+  fail "status.sh exposed the account identifier"
+fi
 assert_file_has_no_token "$STATUS_OUTPUT"
 assert_secret_permissions
-assert_token_read_once "status.sh"
-assert_only_token_sudo "successful management script"
+assert_status_sudo_calls
 assert_no_sudo_python "status.sh"
 printf 'PASS root-only token with ordinary-user status.sh\n'
 
@@ -379,9 +463,10 @@ chown "$TEST_USER:$TEST_USER" "${TEST_HOME}/.curlrc"
 TRACE_OUTPUT="${TEST_ROOT}/trace.out"
 sudo -u "$TEST_USER" -H env \
   API_URL="http://127.0.0.1:${HTTP_PORT}" \
-  WS_URL="ws://127.0.0.1:${WS_PORT}/api/ws/login" \
+  AGENT_WECHAT_PORT="$HTTP_PORT" \
   TOKEN_FILE="$TOKEN_FILE" \
   PYTHON_BIN=python3 \
+  CONTAINER_NAME="$TEST_CONTAINER" \
   NO_PROXY=127.0.0.1,localhost \
   /bin/bash -x "${TEST_REPO}/scripts/status.sh" > "$TRACE_OUTPUT" 2>&1
 assert_file_has_no_token "$TRACE_OUTPUT"
@@ -394,7 +479,8 @@ printf 'PASS shell trace and curlrc token protection\n'
 reset_audit
 LOGIN_SHORT_OUTPUT="${TEST_ROOT}/login-short.out"
 run_script_as "$TEST_USER" login.sh > "$LOGIN_SHORT_OUTPUT" 2>&1
-grep -q '微信已经登录。' "$LOGIN_SHORT_OUTPUT" || fail "logged_in did not short-circuit"
+grep -q '持久化 session 可继续使用' "$LOGIN_SHORT_OUTPUT" ||
+  fail "logged_in did not short-circuit with persisted-session guidance"
 assert_only_token_sudo "successful management script"
 assert_token_read_once "logged-in login.sh"
 assert_no_sudo_python "logged-in login.sh"
@@ -431,7 +517,7 @@ printf 'logged_out\n' > "$STATE_FILE"
 reset_audit
 rm -f "$PAUSE_FILE" "$CONTINUE_FILE"
 LOGIN_OUTPUT="${TEST_ROOT}/login.out"
-run_script_as "$TEST_USER" login.sh > "$LOGIN_OUTPUT" 2>&1 &
+RUN_WITH_TTY=1 run_script_as "$TEST_USER" login.sh > "$LOGIN_OUTPUT" 2>&1 &
 LOGIN_PID=$!
 for _attempt in $(seq 1 900); do
   [ -e "$PAUSE_FILE" ] && break
@@ -443,23 +529,37 @@ for _attempt in $(seq 1 900); do
 done
 [ -e "$PAUSE_FILE" ] || fail "login.sh did not reach WebSocket login"
 assert_user_processes_have_no_token
+
+CONCURRENT_OUTPUT="${TEST_ROOT}/login-concurrent.out"
+if RUN_WITH_TTY=1 run_script_as "$TEST_USER" login.sh \
+  > "$CONCURRENT_OUTPUT" 2>&1; then
+  fail "second concurrent login.sh unexpectedly acquired the login lock"
+fi
+grep -q '已有登录流程正在运行' "$CONCURRENT_OUTPUT" ||
+  fail "concurrent login lock error was not actionable"
+assert_file_has_no_token "$CONCURRENT_OUTPUT"
+printf 'PASS second fresh login fails immediately while the first owns the lock\n'
+
 touch "$CONTINUE_FILE"
 if ! wait "$LOGIN_PID"; then
   cat "$LOGIN_OUTPUT" >&2
   fail "ordinary-user login.sh failed"
 fi
 LOGIN_PID=""
+grep -q '请使用手机微信扫描二维码' "$LOGIN_OUTPUT" || fail "fresh QR was not shown"
 grep -q '请在手机微信确认登录' "$LOGIN_OUTPUT" || fail "phone_confirm was not shown"
 grep -q '登录成功。' "$LOGIN_OUTPUT" || fail "login_success was not shown"
-assert_only_token_sudo "successful management script"
+assert_only_token_sudo "successful and concurrent management scripts" 2
 grep -q '登录状态已确认' "$LOGIN_OUTPUT" || fail "final logged_in state was not confirmed"
-assert_token_read_once "logged-out login.sh"
+assert_token_read_count "logged-out and concurrent login.sh" 2
 assert_no_sudo_python "logged-out login.sh"
 EXPECTED_LOG="${TEST_ROOT}/expected.log"
 printf '%s\n' \
   'GET /api/status/auth' \
-  'POST /api/status/login' \
+  'GET /api/status/auth' \
   'WS /api/ws/login' \
+  'GET /api/status/auth' \
+  'EVENT qr' \
   'EVENT phone_confirm' \
   'EVENT login_success' \
   'GET /api/status/auth' > "$EXPECTED_LOG"
@@ -487,7 +587,7 @@ printf 'PASS missing root-only token distinction\n'
 NO_SUDO_OUTPUT="${TEST_ROOT}/no-sudo.out"
 if timeout 15s sudo -u "$NO_SUDO_USER" -H env \
   API_URL="http://127.0.0.1:${HTTP_PORT}" \
-  WS_URL="ws://127.0.0.1:${WS_PORT}/api/ws/login" \
+  AGENT_WECHAT_PORT="$HTTP_PORT" \
   TOKEN_FILE="$TOKEN_FILE" \
   PYTHON_BIN=python3 \
   NO_COLOR=1 \

@@ -1,0 +1,30 @@
+name: Deployment hardening
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  bootstrap:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate shell syntax
+        run: >-
+          bash -n
+          scripts/bootstrap-cfserver.sh
+          tests/helpers/mock_bootstrap_*.sh
+          tests/deployment/bootstrap_cfserver.sh
+          tests/deployment/validate_compose_config.sh
+      - name: Test CFserver bootstrap and recovery gates
+        run: bash tests/deployment/bootstrap_cfserver.sh
+      - name: Validate production Compose render
+        env:
+          CF_REQUIRE_DOCKER_COMPOSE_CONFIG: "1"
+        run: bash tests/deployment/validate_compose_config.sh

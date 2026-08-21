@@ -1,9 +1,8 @@
 # agent-server API 边界
 
 > [!NOTE]
-> 2026-08-13/14 的接口结果是旧生产基线证据。forced-QR 用法仅适用于
-> `feat/forced-qr-login@9cb7163` 及其后续合入版本；该用法已自动化验证，尚未完成
-> CFserver 真实扫码闭环。本文审计的 `main` 代码基线 `96264e2` 不含 `--force-qr`。
+> 2026-08-13/14 的接口结果是历史生产证据；当前部署、恢复和登录操作以 V1 Beta
+> 指南及当前代码为准。历史证据不能替代新版本的主机重启和真实扫码验收。
 
 ## 适用范围
 
@@ -23,10 +22,10 @@ http://cf-agent-wechat:6174
 除健康检查外，接口使用 Authorization 请求头携带生产 Token。公共示例只能使用
 占位符 `<AGENT_WECHAT_TOKEN>`，不得读取、打印或提交真实 Token。
 
-生产 Token 由 Compose 只读挂载到 `/data/auth-token`。宿主文件保持
-`root:root 600`，其父目录保持 `root:root 700`。日常状态和登录操作应使用
-`scripts/status.sh`；forced-QR 目标版本的登录和恢复统一使用
-`start-qr-login.sh`，不要为了手工调用放宽权限。
+生产 Token 由 Compose 只读挂载到 `/data/auth-token`。默认 runtime 的宿主 `secrets`
+目录保持 `root:root 0700`，`auth-token` 保持 `root:root 0600`；使用自定义 runtime 时，
+`secrets` 和 Token 必须由固定管理用户持有，权限分别保持 `0700` 和 `0600`。日常状态和登录操作应使用
+`scripts/status.sh`；只有 auth 需要登录时才使用 `scripts/login.sh`。不要为了手工调用底层接口放宽权限。
 
 ## 2026-08-13 历史生产验证
 
@@ -46,19 +45,20 @@ http://cf-agent-wechat:6174
 
 | 方法或协议 | 路径 | 目标用途 | 证据边界 |
 | --- | --- | --- | --- |
-| GET | `/api/status/auth` | 登录前、登录后及生产可用复核 | 旧基线已实机验证；forced-QR 组合流程未实机验证 |
-| POST | `/api/status/login` | forced 模式在全新 runtime 请求登录 | `newAccount=true` 已自动化验证；真实扫码未验证 |
-| WebSocket | `/api/ws/login` | 接收 QR、手机确认、成功、超时和错误事件 | forced 模式实际 QR 渲染门槛已自动化验证；真实扫码未验证 |
+| GET | `/api/status/auth` | 登录前、登录后及恢复复核 | 旧基线已实机验证；当前恢复流程已自动化验证 |
+| POST | `/api/status/login` | 读取当前/旧登录 QR 快照 | 不作为 fresh 流程证据，生产 `login.sh` 不调用 |
+| WebSocket | `/api/ws/login` | 接收 QR、手机确认、成功、超时和错误事件 | 实际 QR 渲染门槛已自动化验证；真实扫码未验证 |
 
 2026-08-13 已实机验证的是“已信任设备 -> 手机确认 -> 登录成功”，不是全新二维码流程。
-forced-QR 目标版本由 `start-qr-login.sh` 编排 runtime 轮换并内部调用
-`login.sh --force-qr`；运维人员不得单独调用底层接口或脚本绕过归档和 worker 闸门。
-详细行为见[微信登录管理](login-management.md)。
+当前 `login.sh` 在 `logged_in` 时复用持久 session；只有 auth 需要登录时才建立
+`newAccount=true` WebSocket，并要求当前终端实际渲染该连接的新 QR 后才接受成功。
+HTTP 快照即使可显示也不能满足 fresh 证据门槛。运维人员不应手工调用底层接口。详细行为
+见 [QR Login Guide](qr-login-guide.md)。
 
 `GET /api/status/auth` 的当前关键状态为：
 
 - `logged_in`：微信已登录。
-- `logged_out`：微信未登录；目标版本必须重新执行完整 forced-QR 生命周期。
+- `logged_out`：微信未登录；基础服务正常时运行 `scripts/login.sh` 扫描新的二维码。
 - `app_not_running`：微信客户端未运行，应先查容器日志。
 
 响应可能包含实际账号标识；任何对外记录都应替换为
