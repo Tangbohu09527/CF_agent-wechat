@@ -3,6 +3,12 @@ set -euo pipefail
 
 : "${CF_TEST_DOCKER_STATE_FILE:?}"
 
+if [ "${1:-}" != "--host" ] || [ "${2:-}" != "unix:///var/run/docker.sock" ]; then
+  printf 'mock docker requires the production local socket\n' >&2
+  exit 63
+fi
+shift 2
+
 if [ "${1:-}" != "inspect" ]; then
   printf 'mock docker only supports inspect\n' >&2
   exit 64
@@ -31,6 +37,28 @@ case "$health" in
 esac
 
 arguments="$*"
+hang_forever() {
+  if [ -n "${CF_TEST_DOCKER_HANG_PID_FILE:-}" ]; then
+    printf '%s\n' "$$" > "$CF_TEST_DOCKER_HANG_PID_FILE"
+  fi
+  trap '' TERM
+  while :; do
+    sleep 1
+  done
+}
+
+case "${CF_TEST_DOCKER_HANG_ON:-}" in
+  state)
+    [[ "$arguments" != *State.Running* ]] || hang_forever
+    ;;
+  health)
+    [[ "$arguments" != *State.Health* ]] || hang_forever
+    ;;
+  all)
+    hang_forever
+    ;;
+esac
+
 case "$arguments" in
   *State.Running*) printf '%s\n' "$running" ;;
   *State.Health*) printf '%s\n' "$health" ;;

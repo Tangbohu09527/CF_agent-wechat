@@ -59,10 +59,10 @@ sample_status() {
   SESSION_STATUS="unavailable"
   STATUS_RESULT=1
 
-  if detected="$(detect_container_status)"; then
+  if detected="$(detect_container_status "$deadline")"; then
     CONTAINER_STATUS="$detected"
   fi
-  if detected="$(detect_container_health)"; then
+  if detected="$(detect_container_health "$deadline")"; then
     HEALTH_STATUS="$detected"
   fi
   if request_timeout="$(bounded_http_timeout "$deadline")" &&
@@ -173,6 +173,11 @@ main() {
   if ! command -v "$DOCKER_BIN" >/dev/null 2>&1; then
     print_status
     error "未找到 docker：${DOCKER_BIN}"
+    return 1
+  fi
+  if ! command -v "$TIMEOUT_BIN" >/dev/null 2>&1; then
+    print_status
+    error "未找到 GNU timeout：${TIMEOUT_BIN}"
     return 1
   fi
   if ! load_auth_token; then

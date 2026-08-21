@@ -13,6 +13,18 @@ case "${1:-}" in
       *) exit 1 ;;
     esac
     ;;
+  is-active)
+    [ "${2:-}" = "docker.service" ] || exit 2
+    printf '%s\n' "${CF_BOOTSTRAP_TEST_DOCKER_SERVICE_ACTIVITY:-active}"
+    case "${CF_BOOTSTRAP_TEST_DOCKER_SERVICE_ACTIVITY:-active}" in
+      active)
+        exit 0
+        ;;
+      *)
+        exit 1
+        ;;
+    esac
+    ;;
   is-enabled)
     [ "${2:-}" = "docker.service" ] || exit 2
     printf '%s\n' "${CF_BOOTSTRAP_TEST_DOCKER_SERVICE_ENABLEMENT:-enabled}"

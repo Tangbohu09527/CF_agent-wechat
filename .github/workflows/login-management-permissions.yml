@@ -26,11 +26,18 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y python3-venv
       - name: Validate management scripts
         run: |
-          bash -n scripts/common.sh scripts/status.sh scripts/login.sh
-          bash -n tests/integration/management_environment.sh
-          bash -n tests/integration/session_recovery.sh
-          bash -n tests/helpers/mock_management_curl.sh
-          bash -n tests/helpers/mock_management_docker.sh
+          for file in \
+            scripts/common.sh \
+            scripts/status.sh \
+            scripts/login.sh \
+            tests/helpers/audit_*.sh \
+            tests/helpers/mock_management_*.sh \
+            tests/integration/login_management_permissions.sh \
+            tests/integration/management_environment.sh \
+            tests/integration/session_recovery.sh
+          do
+            bash -n "$file"
+          done
           python3 -m py_compile scripts/qr_login.py tests/helpers/mock_agent_wechat.py
       - name: Run QR login unit tests
         run: python3 -m unittest -v tests/unit/test_qr_login.py

@@ -8,8 +8,9 @@
 4. [Troubleshooting](troubleshooting.md)：按容器、health、API、auth 四层定位故障。
 
 生产基线保留 `data/`、`wechat-home/` 和 `auth-token`，重启后优先恢复原会话。
-`logged_out` 才触发新的二维码登录。任何要求每次启动清空 runtime、归档旧会话或调用
-`start-qr-login.sh` 的旧说明均不适用于当前代码。
+只有 `status.sh` 返回 `2`，即 auth 为 `logged_out` 或登录等待态时，才触发新的二维码
+登录。任何要求每次启动清空 runtime、归档旧会话或调用 `start-qr-login.sh` 的旧说明均
+不适用于当前代码。
 
 ## 参考资料
 

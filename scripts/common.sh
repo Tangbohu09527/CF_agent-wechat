@@ -7,6 +7,7 @@ set +a
 SCRIPTS_DIR="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 REPO_ROOT="$(CDPATH= cd -- "${SCRIPTS_DIR}/.." && pwd -P)"
 MANAGEMENT_ENV_FILE="${REPO_ROOT}/docker/.env"
+PRODUCTION_COMPOSE_FILE="${REPO_ROOT}/docker/compose.cfserver.yaml"
 _MANAGEMENT_ENV_ERROR=""
 _ENV_RUNTIME_ROOT=""
 _ENV_BIND_IP=""
@@ -47,20 +48,32 @@ management_env_path_is_dotenv_safe() {
 }
 
 load_management_environment() {
-  local docker_dir directory_mode line key value seen_keys="|"
-  local mode repo_mode normalized_runtime normalized_legacy
+  local current_uid docker_dir line key value seen_keys="|"
+  local metadata owner mode link_count normalized_runtime normalized_legacy
   local legacy_runtime_root=""
+
+  if ! current_uid="$(/usr/bin/id -u 2>/dev/null)" ||
+    ! [[ "$current_uid" =~ ^[0-9]+$ ]]; then
+    set_management_env_error "无法确定当前管理用户 UID。"
+    return
+  fi
 
   if [ -L "$REPO_ROOT" ] || [ ! -d "$REPO_ROOT" ]; then
     set_management_env_error "仓库根目录必须是非符号链接目录：${REPO_ROOT}"
     return
   fi
-  if ! repo_mode="$(stat -c '%a' -- "$REPO_ROOT" 2>/dev/null)" ||
-    ! [[ "$repo_mode" =~ ^[0-7]{3,4}$ ]]; then
+  if ! metadata="$(stat -c '%u:%a' -- "$REPO_ROOT" 2>/dev/null)" ||
+    ! [[ "$metadata" =~ ^[0-9]+:[0-7]{3,4}$ ]]; then
     set_management_env_error "无法验证仓库根目录权限：${REPO_ROOT}"
     return
   fi
-  if (( (8#$repo_mode & 8#022) != 0 )); then
+  owner="${metadata%%:*}"
+  mode="${metadata#*:}"
+  if [ "$owner" != "0" ] && [ "$owner" != "$current_uid" ]; then
+    set_management_env_error "仓库根目录必须由 root 或当前固定管理用户持有：${REPO_ROOT}"
+    return
+  fi
+  if (( (8#$mode & 8#022) != 0 )); then
     set_management_env_error "仓库根目录不能被 group/other 写入：${REPO_ROOT}"
     return
   fi
@@ -70,16 +83,49 @@ load_management_environment() {
     set_management_env_error "生产配置目录必须是非符号链接目录：${docker_dir}"
     return
   fi
-  if ! directory_mode="$(stat -c '%a' -- "$docker_dir" 2>/dev/null)" ||
-    ! [[ "$directory_mode" =~ ^[0-7]{3,4}$ ]]; then
+  if ! metadata="$(stat -c '%u:%a' -- "$docker_dir" 2>/dev/null)" ||
+    ! [[ "$metadata" =~ ^[0-9]+:[0-7]{3,4}$ ]]; then
     set_management_env_error "无法验证生产配置目录权限：${docker_dir}"
     return
   fi
-  if (( (8#$directory_mode & 8#022) != 0 )); then
+  owner="${metadata%%:*}"
+  mode="${metadata#*:}"
+  if [ "$owner" != "0" ] && [ "$owner" != "$current_uid" ]; then
+    set_management_env_error "生产配置目录必须由 root 或当前固定管理用户持有：${docker_dir}"
+    return
+  fi
+  if (( (8#$mode & 8#022) != 0 )); then
     set_management_env_error "生产配置目录不能被 group/other 写入：${docker_dir}"
     return
   fi
+
+  if [ -L "$PRODUCTION_COMPOSE_FILE" ] || [ ! -f "$PRODUCTION_COMPOSE_FILE" ]; then
+    set_management_env_error "生产 Compose 必须是非符号链接普通文件：${PRODUCTION_COMPOSE_FILE}"
+    return
+  fi
+  if ! metadata="$(stat -c '%u:%a:%h' -- "$PRODUCTION_COMPOSE_FILE" 2>/dev/null)" ||
+    ! [[ "$metadata" =~ ^[0-9]+:[0-7]{3,4}:[0-9]+$ ]]; then
+    set_management_env_error "无法验证生产 Compose 权限：${PRODUCTION_COMPOSE_FILE}"
+    return
+  fi
+  owner="${metadata%%:*}"
+  mode="${metadata#*:}"
+  mode="${mode%%:*}"
+  link_count="${metadata##*:}"
+  if [ "$owner" != "0" ] && [ "$owner" != "$current_uid" ]; then
+    set_management_env_error "生产 Compose 必须由 root 或当前固定管理用户持有：${PRODUCTION_COMPOSE_FILE}"
+    return
+  fi
+  if (( (8#$mode & 8#022) != 0 )); then
+    set_management_env_error "生产 Compose 不能被 group/other 写入：${PRODUCTION_COMPOSE_FILE}"
+    return
+  fi
+  if [ "$link_count" != "1" ]; then
+    set_management_env_error "生产 Compose 不能存在额外硬链接：${PRODUCTION_COMPOSE_FILE}"
+    return
+  fi
   if [ ! -e "$MANAGEMENT_ENV_FILE" ] && [ ! -L "$MANAGEMENT_ENV_FILE" ]; then
+    set_management_env_error "生产环境文件不存在：${MANAGEMENT_ENV_FILE}；请先运行 bootstrap，或从同一恢复单元还原 docker/.env。"
     return
   fi
   if [ -L "$MANAGEMENT_ENV_FILE" ] || [ ! -f "$MANAGEMENT_ENV_FILE" ]; then
@@ -90,9 +136,17 @@ load_management_environment() {
     set_management_env_error "当前管理用户无法读取生产环境文件：${MANAGEMENT_ENV_FILE}"
     return
   fi
-  if ! mode="$(stat -c '%a' -- "$MANAGEMENT_ENV_FILE" 2>/dev/null)" ||
-    ! [[ "$mode" =~ ^[0-7]{3,4}$ ]]; then
+  if ! metadata="$(stat -c '%u:%a:%h' -- "$MANAGEMENT_ENV_FILE" 2>/dev/null)" ||
+    ! [[ "$metadata" =~ ^[0-9]+:[0-7]{3,4}:[0-9]+$ ]]; then
     set_management_env_error "无法验证生产环境文件权限：${MANAGEMENT_ENV_FILE}"
+    return
+  fi
+  owner="${metadata%%:*}"
+  mode="${metadata#*:}"
+  mode="${mode%%:*}"
+  link_count="${metadata##*:}"
+  if [ "$owner" != "0" ] && [ "$owner" != "$current_uid" ]; then
+    set_management_env_error "生产环境文件必须由 root 或当前固定管理用户持有：${MANAGEMENT_ENV_FILE}"
     return
   fi
   case "$mode" in
@@ -102,6 +156,10 @@ load_management_environment() {
       return
       ;;
   esac
+  if [ "$link_count" != "1" ]; then
+    set_management_env_error "生产环境文件不能存在额外硬链接：${MANAGEMENT_ENV_FILE}"
+    return
+  fi
 
   while IFS= read -r line || [ -n "$line" ]; do
     case "$line" in
@@ -136,6 +194,22 @@ load_management_environment() {
     esac
   done < "$MANAGEMENT_ENV_FILE"
 
+  if [ -z "$_ENV_RUNTIME_ROOT" ] && [ -z "$legacy_runtime_root" ]; then
+    set_management_env_error "生产环境文件缺少必需配置键：CF_AGENT_WECHAT_RUNTIME_ROOT"
+    return
+  fi
+  if [ -z "$_ENV_BIND_IP" ]; then
+    set_management_env_error "生产环境文件缺少必需配置键：AGENT_WECHAT_BIND_IP"
+    return
+  fi
+  if [ -z "$_ENV_PORT" ]; then
+    set_management_env_error "生产环境文件缺少必需配置键：AGENT_WECHAT_PORT"
+    return
+  fi
+  if [ -z "$_ENV_CONTAINER_NAME" ]; then
+    set_management_env_error "生产环境文件缺少必需配置键：AGENT_WECHAT_CONTAINER_NAME"
+    return
+  fi
   if [ -n "$_ENV_RUNTIME_ROOT" ]; then
     if ! management_env_path_is_dotenv_safe "$_ENV_RUNTIME_ROOT"; then
       set_management_env_error "生产环境文件中的 CF_AGENT_WECHAT_RUNTIME_ROOT 包含 dotenv 不安全字符"
@@ -191,8 +265,8 @@ _PROCESS_CONTAINER_NAME="${CONTAINER_NAME-}"
 _PROCESS_TOKEN_FILE_SET="${TOKEN_FILE+x}"
 _PROCESS_TOKEN_FILE="${TOKEN_FILE-}"
 
-MANAGEMENT_BIND_IP="${_ENV_BIND_IP:-${AGENT_WECHAT_BIND_IP:-127.0.0.1}}"
-MANAGEMENT_PORT="${_ENV_PORT:-${AGENT_WECHAT_PORT:-6174}}"
+MANAGEMENT_BIND_IP="${_ENV_BIND_IP:-127.0.0.1}"
+MANAGEMENT_PORT="${_ENV_PORT:-6174}"
 API_URL="${API_URL:-http://127.0.0.1:${MANAGEMENT_PORT}}"
 API_URL="${API_URL%/}"
 HEALTH_URL="${API_URL}/health"
@@ -204,7 +278,7 @@ esac
 
 PRIVILEGED_SECRETS_DIR="/srv/storage/cf-agent-wechat/secrets"
 PRIVILEGED_TOKEN_FILE="/srv/storage/cf-agent-wechat/secrets/auth-token"
-RUNTIME_ROOT="${_ENV_RUNTIME_ROOT:-${CF_RUNTIME_ROOT:-${CF_AGENT_WECHAT_RUNTIME_ROOT:-/srv/storage/cf-agent-wechat}}}"
+RUNTIME_ROOT="${_ENV_RUNTIME_ROOT:-/srv/storage/cf-agent-wechat}"
 while [ "$RUNTIME_ROOT" != "/" ] && [[ "$RUNTIME_ROOT" == */ ]]; do
   RUNTIME_ROOT="${RUNTIME_ROOT%/}"
 done
@@ -215,7 +289,7 @@ else
 fi
 TOKEN_FILE="${TOKEN_FILE:-$DEFAULT_TOKEN_FILE}"
 SESSION_ID="${SESSION_ID:-default}"
-CONTAINER_NAME="${_ENV_CONTAINER_NAME:-${CONTAINER_NAME:-${AGENT_WECHAT_CONTAINER_NAME:-cf-agent-wechat}}}"
+CONTAINER_NAME="${_ENV_CONTAINER_NAME:-cf-agent-wechat}"
 
 HTTP_CONNECT_TIMEOUT="${HTTP_CONNECT_TIMEOUT:-5}"
 HTTP_TIMEOUT="${HTTP_TIMEOUT:-45}"
@@ -224,6 +298,9 @@ LOGIN_CONFIRM_RETRIES="${LOGIN_CONFIRM_RETRIES:-5}"
 LOGIN_CONFIRM_INTERVAL="${LOGIN_CONFIRM_INTERVAL:-2}"
 STATUS_WAIT_TIMEOUT="${STATUS_WAIT_TIMEOUT:-180}"
 STATUS_POLL_INTERVAL="${STATUS_POLL_INTERVAL:-2}"
+DOCKER_INSPECT_TIMEOUT="${DOCKER_INSPECT_TIMEOUT:-10}"
+TIMEOUT_BIN="${TIMEOUT_BIN:-timeout}"
+TIMEOUT_TERM_GRACE=2
 
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 CURL_BIN="${CURL_BIN:-curl}"
@@ -244,11 +321,36 @@ export -n AUTH_TOKEN
 AUTH_STATUS=""
 LAST_ERROR=""
 LOGIN_PYTHON=""
+SUDO_AUTHORIZED=0
 
 error() {
   printf '错误：%s\n' "$*" >&2
 }
 
+authorize_management_sudo() {
+  local purpose="${1:-执行生产管理操作}"
+  local current_uid
+
+  if ! current_uid="$(/usr/bin/id -u 2>/dev/null)" ||
+    ! [[ "$current_uid" =~ ^[0-9]+$ ]]; then
+    LAST_ERROR="无法确定当前管理用户 UID。"
+    return 1
+  fi
+  if [ "$current_uid" = "0" ] || [ "$SUDO_AUTHORIZED" -eq 1 ]; then
+    return 0
+  fi
+  if ! command -v sudo >/dev/null 2>&1; then
+    LAST_ERROR="$purpose 需要 sudo，但系统未安装 sudo。"
+    return 1
+  fi
+
+  printf '需要 sudo 权限以%s；请在终端完成授权。\n' "$purpose" >&2
+  if ! sudo -v; then
+    LAST_ERROR="$purpose 失败：当前用户没有可用的 sudo 权限。"
+    return 1
+  fi
+  SUDO_AUTHORIZED=1
+}
 resolve_python() {
   local candidate
 
@@ -266,12 +368,19 @@ resolve_python() {
 }
 
 validate_configuration() {
-  local normalized_runtime_a normalized_runtime_b
+  local normalized_runtime_a normalized_runtime_b docker_override
 
   if [ -n "$_MANAGEMENT_ENV_ERROR" ]; then
     LAST_ERROR="$_MANAGEMENT_ENV_ERROR"
     return 1
   fi
+  for docker_override in DOCKER_HOST DOCKER_CONTEXT DOCKER_TLS_VERIFY DOCKER_CERT_PATH; do
+    if [[ -v $docker_override ]]; then
+      LAST_ERROR="$docker_override 不能覆盖生产本地 Docker daemon。"
+      return 1
+    fi
+  done
+
 
   if [ -n "$_ENV_RUNTIME_ROOT" ]; then
     if [ "${CF_RUNTIME_ROOT+x}" = x ]; then
@@ -428,6 +537,10 @@ validate_configuration() {
     LAST_ERROR="STATUS_POLL_INTERVAL 必须是正整数秒。"
     return 1
   fi
+  if ! [[ "$DOCKER_INSPECT_TIMEOUT" =~ ^[1-9][0-9]*$ ]]; then
+    LAST_ERROR="DOCKER_INSPECT_TIMEOUT 必须是正整数秒。"
+    return 1
+  fi
 
 }
 
@@ -563,9 +676,13 @@ load_auth_token() {
       LAST_ERROR="当前用户无法读取 token，且未安装 sudo：${TOKEN_FILE}"
       return 1
     fi
+    if ! authorize_management_sudo "读取受保护的生产 auth-token"; then
+      return 1
+    fi
+
 
     if token_value="$(
-      sudo -- /bin/sh -c '
+      sudo -n -- /bin/sh -c '
 token_file=/srv/storage/cf-agent-wechat/secrets/auth-token
 secrets_dir=/srv/storage/cf-agent-wechat/secrets
 if [ ! -e "$secrets_dir" ]; then
@@ -759,21 +876,65 @@ check_api_health() {
   fi
 }
 
+run_with_hard_timeout() {
+  local hard_timeout="$1"
+  local soft_timeout
+  shift
+
+  if [ "$hard_timeout" -le "$TIMEOUT_TERM_GRACE" ]; then
+    "$TIMEOUT_BIN" --signal=KILL "${hard_timeout}s" "$@"
+    return
+  fi
+
+  soft_timeout=$((hard_timeout - TIMEOUT_TERM_GRACE))
+  "$TIMEOUT_BIN" --signal=TERM --kill-after="${TIMEOUT_TERM_GRACE}s" \
+    "${soft_timeout}s" "$@"
+}
+
+bounded_docker_inspect_timeout() {
+  local deadline="${1:-0}"
+  local remaining
+
+  if [ "$deadline" -le 0 ]; then
+    printf '%s' "$DOCKER_INSPECT_TIMEOUT"
+    return 0
+  fi
+
+  remaining=$((deadline - SECONDS))
+  [ "$remaining" -gt 0 ] || return 1
+  if [ "$DOCKER_INSPECT_TIMEOUT" -lt "$remaining" ]; then
+    printf '%s' "$DOCKER_INSPECT_TIMEOUT"
+  else
+    printf '%s' "$remaining"
+  fi
+}
+
+run_bounded_docker_inspect() {
+  local deadline="$1"
+  local command_timeout
+  shift
+
+  command_timeout="$(bounded_docker_inspect_timeout "$deadline")" || return 124
+  run_with_hard_timeout "$command_timeout" "$@"
+}
+
 detect_container_status() {
+  local deadline="${1:-0}"
   local inspect_output inspect_status inspect_state error_lower line
 
-  if ! command -v "$DOCKER_BIN" >/dev/null 2>&1; then
+  if ! command -v "$DOCKER_BIN" >/dev/null 2>&1 ||
+    ! command -v "$TIMEOUT_BIN" >/dev/null 2>&1; then
     return 1
   fi
 
-  if inspect_output="$(
-    LC_ALL=C "$DOCKER_BIN" inspect --format '{{.State.Running}}' "$CONTAINER_NAME" 2>&1
-  )"; then
+  if inspect_output="$(LC_ALL=C run_bounded_docker_inspect "$deadline" \
+    "$DOCKER_BIN" --host unix:///var/run/docker.sock inspect --format '{{.State.Running}}' "$CONTAINER_NAME" 2>&1)"; then
     inspect_status=0
   else
     inspect_status=$?
   fi
   if [ "$inspect_status" -ne 0 ]; then
+    case "$inspect_status" in 124|137) return "$inspect_status" ;; esac
     error_lower="${inspect_output,,}"
     case "$error_lower" in
       *permission\ denied*|*access\ denied*|*operation\ not\ permitted*) ;;
@@ -787,10 +948,17 @@ detect_container_status() {
     if ! command -v sudo >/dev/null 2>&1; then
       return 1
     fi
-    if ! inspect_output="$(
-      sudo -- "$DOCKER_BIN" inspect --format '{{.State.Running}}' "$CONTAINER_NAME" 2>/dev/null
-    )"; then
+    if ! authorize_management_sudo "查询生产 Docker 容器状态"; then
       return 1
+    fi
+    if inspect_output="$(run_bounded_docker_inspect "$deadline" sudo -n -- \
+      "$DOCKER_BIN" --host unix:///var/run/docker.sock inspect --format '{{.State.Running}}' \
+      "$CONTAINER_NAME" 2>/dev/null)"; then
+      inspect_status=0
+    else
+      inspect_status=$?
+      case "$inspect_status" in 124|137) return "$inspect_status" ;; esac
+      return "$inspect_status"
     fi
   fi
 
@@ -820,20 +988,24 @@ detect_container_status() {
 }
 
 detect_container_health() {
+  local deadline="${1:-0}"
   local inspect_output inspect_status health_status error_lower line
 
-  if ! command -v "$DOCKER_BIN" >/dev/null 2>&1; then
+  if ! command -v "$DOCKER_BIN" >/dev/null 2>&1 ||
+    ! command -v "$TIMEOUT_BIN" >/dev/null 2>&1; then
     return 1
   fi
 
-  if inspect_output="$(
-    LC_ALL=C "$DOCKER_BIN" inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$CONTAINER_NAME" 2>&1
-  )"; then
+  if inspect_output="$(LC_ALL=C run_bounded_docker_inspect "$deadline" \
+    "$DOCKER_BIN" --host unix:///var/run/docker.sock inspect --format \
+    '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' \
+    "$CONTAINER_NAME" 2>&1)"; then
     inspect_status=0
   else
     inspect_status=$?
   fi
   if [ "$inspect_status" -ne 0 ]; then
+    case "$inspect_status" in 124|137) return "$inspect_status" ;; esac
     error_lower="${inspect_output,,}"
     case "$error_lower" in
       *permission\ denied*|*access\ denied*|*operation\ not\ permitted*) ;;
@@ -847,10 +1019,18 @@ detect_container_health() {
     if ! command -v sudo >/dev/null 2>&1; then
       return 1
     fi
-    if ! inspect_output="$(
-      sudo -- "$DOCKER_BIN" inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$CONTAINER_NAME" 2>/dev/null
-    )"; then
+    if ! authorize_management_sudo "查询生产 Docker health 状态"; then
       return 1
+    fi
+    if inspect_output="$(run_bounded_docker_inspect "$deadline" sudo -n -- \
+      "$DOCKER_BIN" --host unix:///var/run/docker.sock inspect --format \
+      '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' \
+      "$CONTAINER_NAME" 2>/dev/null)"; then
+      inspect_status=0
+    else
+      inspect_status=$?
+      case "$inspect_status" in 124|137) return "$inspect_status" ;; esac
+      return "$inspect_status"
     fi
   fi
 

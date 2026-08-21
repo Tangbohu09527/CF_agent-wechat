@@ -51,8 +51,13 @@ BOOTSTRAP_TIMEOUT="${CF_BOOTSTRAP_TIMEOUT:-180}"
 POLL_INTERVAL="${CF_BOOTSTRAP_POLL_INTERVAL:-2}"
 HTTP_CONNECT_TIMEOUT="${CF_BOOTSTRAP_HTTP_CONNECT_TIMEOUT:-3}"
 HTTP_TIMEOUT="${CF_BOOTSTRAP_HTTP_TIMEOUT:-45}"
+DOCKER_COMMAND_TIMEOUT="${CF_BOOTSTRAP_DOCKER_TIMEOUT:-30}"
+COMPOSE_UP_TIMEOUT="${CF_BOOTSTRAP_COMPOSE_UP_TIMEOUT:-900}"
+TIMEOUT_BIN="${TIMEOUT_BIN:-timeout}"
+TIMEOUT_TERM_GRACE=2
 STAT_BIN="${STAT_BIN:-stat}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
+REALPATH_BIN="${REALPATH_BIN:-realpath}"
 
 CURRENT_UID="$(id -u)"
 CURRENT_GID="$(id -g)"
@@ -158,7 +163,7 @@ normalize_runtime_root() {
       ;;
   esac
 
-  normalized="$(realpath -m -- "$value" 2>/dev/null)" || \
+  normalized="$("$REALPATH_BIN" -m -- "$value" 2>/dev/null)" || \
     die "$label could not be normalized: $value"
   [ "$normalized" != "/" ] || \
     die "$label must not resolve to the filesystem root"
@@ -181,11 +186,52 @@ validate_positive_integer() {
   [[ "$value" =~ ^[1-9][0-9]*$ ]] || die "$label must be a positive integer"
 }
 
+run_with_hard_timeout() {
+  local hard_timeout="$1"
+  local soft_timeout
+  shift
+
+  if [ "$hard_timeout" -le "$TIMEOUT_TERM_GRACE" ]; then
+    "$TIMEOUT_BIN" --signal=KILL "${hard_timeout}s" "$@"
+    return
+  fi
+
+  soft_timeout=$((hard_timeout - TIMEOUT_TERM_GRACE))
+  "$TIMEOUT_BIN" --signal=TERM --kill-after="${TIMEOUT_TERM_GRACE}s" \
+    "${soft_timeout}s" "$@"
+}
+
+bounded_command_timeout() {
+  local maximum="$1"
+  local deadline="${2:-0}"
+  local remaining
+
+  if [ "$deadline" -le 0 ]; then
+    printf '%s' "$maximum"
+    return 0
+  fi
+
+  remaining=$((deadline - SECONDS))
+  [ "$remaining" -gt 0 ] || return 1
+  if [ "$maximum" -lt "$remaining" ]; then
+    printf '%s' "$maximum"
+  else
+    printf '%s' "$remaining"
+  fi
+}
+
 validate_mode() {
   local label="$1"
   local value="$2"
 
   [[ "$value" =~ ^[0-7]{3}$ ]] || die "$label must be a three-digit octal file mode"
+}
+validate_management_owner() {
+  local label="$1" owner="$2" path="$3"
+
+  if [ "$owner" != "0" ] && [ "$owner" != "$CURRENT_UID" ]; then
+    die "$label must be owned by root or the invoking fixed management user: $path"
+  fi
 }
 
 validate_management_permission_contract() {
@@ -287,18 +333,21 @@ read_env_value() {
 }
 
 validate_application_root() {
-  local app_root_mode
+  local metadata owner mode
 
-  app_root_mode="$($STAT_BIN -c '%a' -- "$CF_AGENT_WECHAT_ROOT" 2>/dev/null)" || \
+  metadata="$($STAT_BIN -c '%u:%a' -- "$CF_AGENT_WECHAT_ROOT" 2>/dev/null)" || \
     die "could not inspect CF_AGENT_WECHAT_ROOT: $CF_AGENT_WECHAT_ROOT"
-  validate_mode "CF_AGENT_WECHAT_ROOT mode" "$app_root_mode"
-  if (( (8#$app_root_mode & 8#022) != 0 )); then
+  owner="${metadata%%:*}"
+  mode="${metadata#*:}"
+  validate_mode "CF_AGENT_WECHAT_ROOT mode" "$mode"
+  validate_management_owner "CF_AGENT_WECHAT_ROOT" "$owner" "$CF_AGENT_WECHAT_ROOT"
+  if (( (8#$mode & 8#022) != 0 )); then
     die "CF_AGENT_WECHAT_ROOT must not be group/other writable: $CF_AGENT_WECHAT_ROOT"
   fi
 }
 
 validate_environment_parent() {
-  local env_dir env_dir_mode
+  local env_dir metadata owner mode
 
   env_dir="$(dirname -- "$ENV_FILE")"
   if [ -L "$env_dir" ]; then
@@ -306,23 +355,33 @@ validate_environment_parent() {
   fi
   [ -d "$env_dir" ] || die "environment file parent directory is missing: $env_dir"
 
-  env_dir_mode="$($STAT_BIN -c '%a' -- "$env_dir" 2>/dev/null)" || \
+  metadata="$($STAT_BIN -c '%u:%a' -- "$env_dir" 2>/dev/null)" || \
     die "could not inspect environment file parent directory: $env_dir"
-  validate_mode "environment file parent directory mode" "$env_dir_mode"
-  if (( (8#$env_dir_mode & 8#022) != 0 )); then
+  owner="${metadata%%:*}"
+  mode="${metadata#*:}"
+  validate_mode "environment file parent directory mode" "$mode"
+  validate_management_owner "environment file parent directory" "$owner" "$env_dir"
+  if (( (8#$mode & 8#022) != 0 )); then
     die "environment file parent directory must not be group/other writable: $env_dir"
   fi
 }
 
 validate_production_compose_file() {
-  local compose_mode
+  local metadata owner mode link_count
 
-  compose_mode="$($STAT_BIN -c '%a' -- "$COMPOSE_FILE" 2>/dev/null)" || \
+  metadata="$($STAT_BIN -c '%u:%a:%h' -- "$COMPOSE_FILE" 2>/dev/null)" || \
     die "could not inspect production Compose file: $COMPOSE_FILE"
-  validate_mode "production Compose file mode" "$compose_mode"
-  if (( (8#$compose_mode & 8#022) != 0 )); then
+  owner="${metadata%%:*}"
+  mode="${metadata#*:}"
+  mode="${mode%%:*}"
+  link_count="${metadata##*:}"
+  validate_mode "production Compose file mode" "$mode"
+  validate_management_owner "production Compose file" "$owner" "$COMPOSE_FILE"
+  if (( (8#$mode & 8#022) != 0 )); then
     die "production Compose file must not be group/other writable: $COMPOSE_FILE"
   fi
+  [ "$link_count" = "1" ] || \
+    die "production Compose file must not have additional hard links: $COMPOSE_FILE"
 }
 
 env_key_count() {
@@ -516,7 +575,8 @@ create_environment_file() {
 }
 
 validate_environment_file() {
-  local env_mode file_image file_bind_ip file_port file_container file_rust_log
+  local env_metadata env_owner env_mode env_link_count
+  local file_image file_bind_ip file_port file_container file_rust_log
   local file_runtime_root file_legacy_runtime_root file_bootstrapped file_managed
   local runtime_key_count legacy_runtime_key_count bootstrapped_key_count managed_key_count
   local image_key_count bind_ip_key_count port_key_count container_key_count
@@ -529,12 +589,19 @@ validate_environment_file() {
   fi
   [ -f "$ENV_FILE" ] || die "environment path is not a regular file: $ENV_FILE"
 
-  env_mode="$($STAT_BIN -c '%a' -- "$ENV_FILE" 2>/dev/null)" || \
+  env_metadata="$($STAT_BIN -c '%u:%a:%h' -- "$ENV_FILE" 2>/dev/null)" || \
     die "could not inspect environment file permissions: $ENV_FILE"
+  env_owner="${env_metadata%%:*}"
+  env_mode="${env_metadata#*:}"
+  env_mode="${env_mode%%:*}"
+  env_link_count="${env_metadata##*:}"
   validate_mode "environment file mode" "$env_mode"
+  validate_management_owner "environment file" "$env_owner" "$ENV_FILE"
   case "$env_mode" in
     600|640) ;; *) die "environment file must have mode 600 or 640: $ENV_FILE" ;;
   esac
+  [ "$env_link_count" = "1" ] || \
+    die "environment file must not have additional hard links: $ENV_FILE"
 
   file_image="$(read_env_value AGENT_WECHAT_IMAGE)"
   file_bind_ip="$(read_env_value AGENT_WECHAT_BIND_IP)"
@@ -708,7 +775,9 @@ validate_auth_token() {
   fi
 }
 
-run_docker() {
+run_docker_with_timeout() {
+  local command_timeout="$1"
+  shift
   local -a clean_environment=(
     -u AGENT_WECHAT_IMAGE
     -u AGENT_WECHAT_BIND_IP
@@ -719,6 +788,10 @@ run_docker() {
     -u PROXY
     -u RUST_LOG
     -u COMPOSE_PROJECT_NAME
+    -u DOCKER_HOST
+    -u DOCKER_CONTEXT
+    -u DOCKER_TLS_VERIFY
+    -u DOCKER_CERT_PATH
   )
   local -a deployment_env=(
     "CF_AGENT_WECHAT_RUNTIME_ROOT=$CF_RUNTIME_ROOT"
@@ -729,14 +802,23 @@ run_docker() {
   )
 
   if [ "$DOCKER_USE_SUDO" -eq 1 ]; then
-    sudo -- env "${clean_environment[@]}" "${deployment_env[@]}" docker "$@"
+    run_with_hard_timeout "$command_timeout" \
+      sudo -n -- env "${clean_environment[@]}" "${deployment_env[@]}" docker "$@"
   else
-    env "${clean_environment[@]}" "${deployment_env[@]}" docker "$@"
+    run_with_hard_timeout "$command_timeout" \
+      env "${clean_environment[@]}" "${deployment_env[@]}" docker "$@"
   fi
 }
 
-compose() {
-  run_docker compose \
+run_docker() {
+  run_docker_with_timeout "$DOCKER_COMMAND_TIMEOUT" "$@"
+}
+
+compose_with_timeout() {
+  local command_timeout="$1"
+  shift
+
+  run_docker_with_timeout "$command_timeout" compose \
     --env-file "$ENV_FILE" \
     --project-directory "$CF_AGENT_WECHAT_ROOT" \
     --project-name "$PROJECT_NAME" \
@@ -744,28 +826,68 @@ compose() {
     "$@"
 }
 
-raw_docker() {
+compose() {
+  compose_with_timeout "$DOCKER_COMMAND_TIMEOUT" "$@"
+}
+
+raw_docker_with_timeout() {
+  local command_timeout="$1"
+  shift
+
   if [ "$DOCKER_USE_SUDO" -eq 1 ]; then
-    sudo -- docker "$@"
+    run_with_hard_timeout "$command_timeout" sudo -n -- docker "$@"
   else
-    docker "$@"
+    run_with_hard_timeout "$command_timeout" docker "$@"
   fi
 }
 
-select_docker_access() {
-  local compose_version
+raw_docker() {
+  raw_docker_with_timeout "$DOCKER_COMMAND_TIMEOUT" "$@"
+}
 
-  docker --version >/dev/null 2>&1 || \
+select_docker_access() {
+  local compose_version command_timeout context_name context_endpoint daemon_security
+  local access_deadline
+
+  run_with_hard_timeout "$DOCKER_COMMAND_TIMEOUT" docker --version >/dev/null 2>&1 || \
     die "Docker CLI is unavailable; install Docker Engine before running bootstrap"
 
-  if docker info >/dev/null 2>&1; then
+  access_deadline=$((SECONDS + DOCKER_COMMAND_TIMEOUT))
+  command_timeout="$(bounded_command_timeout "$DOCKER_COMMAND_TIMEOUT" "$access_deadline")" || \
+    die "Docker access check exceeded ${DOCKER_COMMAND_TIMEOUT}s"
+  if run_with_hard_timeout "$command_timeout" docker info >/dev/null 2>&1; then
     DOCKER_USE_SUDO=0
-  elif [ "$CURRENT_UID" != "0" ] && command -v sudo >/dev/null 2>&1 && \
-    sudo -- docker info >/dev/null 2>&1; then
+  elif [ "$CURRENT_UID" != "0" ] && command -v sudo >/dev/null 2>&1; then
+    log "Docker socket requires sudo; authorize the foreground sudo prompt"
+    if ! sudo -v; then
+      die "sudo authorization failed; Docker access could not be established"
+    fi
+    access_deadline=$((SECONDS + DOCKER_COMMAND_TIMEOUT))
+    command_timeout="$(bounded_command_timeout "$DOCKER_COMMAND_TIMEOUT" "$access_deadline")" || \
+      die "Docker access check exceeded ${DOCKER_COMMAND_TIMEOUT}s"
+    if ! run_with_hard_timeout "$command_timeout" sudo -n -- docker info >/dev/null 2>&1; then
+      die "Docker daemon is unavailable through the authorized non-interactive sudo path"
+    fi
     DOCKER_USE_SUDO=1
   else
     die "Docker daemon is unavailable or the current user has no approved access"
   fi
+  context_name="$(raw_docker context show 2>/dev/null)" || \
+    die "could not determine the effective Docker context"
+  [ "$context_name" = "default" ] || \
+    die "production bootstrap requires Docker context default; found: ${context_name:-unknown}"
+  context_endpoint="$(raw_docker context inspect \
+    --format '{{.Endpoints.docker.Host}}' default 2>/dev/null)" || \
+    die "could not inspect the default Docker context endpoint"
+  [ "$context_endpoint" = "unix:///var/run/docker.sock" ] || \
+    die "production bootstrap requires the rootful local Docker socket unix:///var/run/docker.sock; found: ${context_endpoint:-unknown}"
+  daemon_security="$(raw_docker info --format '{{json .SecurityOptions}}' 2>/dev/null)" || \
+    die "could not inspect Docker daemon security options"
+  case "${daemon_security,,}" in
+    *rootless*)
+      die "rootless Docker is not supported because docker.service boot recovery would not cover this deployment"
+      ;;
+  esac
 
   compose_version="$(raw_docker compose version --short 2>/dev/null || true)"
   [[ "$compose_version" =~ ^v?2\. ]] || \
@@ -774,18 +896,26 @@ select_docker_access() {
 }
 
 verify_docker_boot_recovery() {
-  local system_state enablement
+  local system_state activity enablement
 
   if ! command -v systemctl >/dev/null 2>&1; then
-    warn "systemd is unavailable; Docker boot-time recovery could not be verified"
-    return
+    die "systemd/systemctl is required to verify Docker boot-time recovery"
   fi
   system_state="$(systemctl is-system-running 2>/dev/null || true)"
   case "$system_state" in
-    running|degraded|starting) ;;
+    running|degraded) ;;
     *)
-      warn "systemd is not active (${system_state:-unknown}); Docker boot-time recovery could not be verified"
-      return
+      die "systemd is not active; Docker boot-time recovery cannot be guaranteed (state: ${system_state:-unknown})"
+      ;;
+  esac
+
+  activity="$(systemctl is-active docker.service 2>/dev/null || true)"
+  case "$activity" in
+    active)
+      pass "docker.service is active on the verified local Docker socket"
+      ;;
+    *)
+      die "docker.service is not active for the verified local Docker socket (state: ${activity:-unknown})"
       ;;
   esac
 
@@ -846,15 +976,23 @@ sleep_until_deadline() {
 
 wait_for_container() {
   local deadline=$((SECONDS + BOOTSTRAP_TIMEOUT))
+  local command_timeout
   local container_id=""
   local state=""
   local health=""
 
   while [ "$SECONDS" -lt "$deadline" ]; do
-    container_id="$(compose ps --all --quiet "$SERVICE_NAME" 2>/dev/null || true)"
+    command_timeout="$(bounded_command_timeout "$DOCKER_COMMAND_TIMEOUT" "$deadline")" || break
+    container_id="$(compose_with_timeout "$command_timeout" ps --all --quiet \
+      "$SERVICE_NAME" 2>/dev/null || true)"
     if [ -n "$container_id" ]; then
-      state="$(run_docker inspect --format '{{.State.Status}}' "$container_id" 2>/dev/null || true)"
-      health="$(run_docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{end}}' "$container_id" 2>/dev/null || true)"
+      command_timeout="$(bounded_command_timeout "$DOCKER_COMMAND_TIMEOUT" "$deadline")" || break
+      state="$(run_docker_with_timeout "$command_timeout" inspect --format \
+        '{{.State.Status}}' "$container_id" 2>/dev/null || true)"
+      command_timeout="$(bounded_command_timeout "$DOCKER_COMMAND_TIMEOUT" "$deadline")" || break
+      health="$(run_docker_with_timeout "$command_timeout" inspect --format \
+        '{{if .State.Health}}{{.State.Health.Status}}{{end}}' \
+        "$container_id" 2>/dev/null || true)"
       if [ "$state" = "running" ] && [ "$health" = "healthy" ]; then
         printf '%s' "$container_id"
         return 0
@@ -871,6 +1009,22 @@ wait_for_container() {
 
   warn "timed out waiting for container (state=${state:-missing}, health=${health:-missing})"
   return 1
+}
+
+verify_container_identity() {
+  local container_id="$1"
+  local actual_image actual_name expected_name
+
+  actual_image="$(run_docker inspect --format '{{.Config.Image}}' \
+    "$container_id" 2>/dev/null || true)"
+  [ "$actual_image" = "$IMAGE_REF" ] || \
+    die "container image does not match AGENT_WECHAT_IMAGE (expected: $IMAGE_REF, found: ${actual_image:-missing})"
+
+  expected_name="/${CONTAINER_NAME}"
+  actual_name="$(run_docker inspect --format '{{.Name}}' \
+    "$container_id" 2>/dev/null || true)"
+  [ "$actual_name" = "$expected_name" ] || \
+    die "container name does not match AGENT_WECHAT_CONTAINER_NAME (expected: $expected_name, found: ${actual_name:-missing})"
 }
 
 verify_mount() {
@@ -948,11 +1102,12 @@ authenticated_status_request() {
   local token_file="$1"
   local connect_timeout="$2"
   local request_timeout="$3"
+  local request_status
   local token
 
   if [ -r "$token_file" ]; then
     token="$(/bin/cat -- "$token_file")"
-    printf 'Authorization: Bearer %s\nX-Session-Id: default\n' "$token" | curl \
+    if printf 'Authorization: Bearer %s\nX-Session-Id: default\n' "$token" | curl \
       --disable \
       --noproxy '*' \
       --request GET \
@@ -962,8 +1117,13 @@ authenticated_status_request() {
       --connect-timeout "$connect_timeout" \
       --max-time "$request_timeout" \
       --header @- \
-      "${API_URL}/api/status/auth"
+      "${API_URL}/api/status/auth"; then
+      request_status=0
+    else
+      request_status=$?
+    fi
     token=""
+    return "$request_status"
   else
     run_as_root /bin/bash -c '
       set +x
@@ -972,11 +1132,16 @@ authenticated_status_request() {
       connect_timeout=$3
       request_timeout=$4
       token=$(/bin/cat -- "$token_file")
-      printf "Authorization: Bearer %s\nX-Session-Id: default\n" "$token" | curl \
+      if printf "Authorization: Bearer %s\nX-Session-Id: default\n" "$token" | curl \
         --disable --noproxy "*" --request GET --fail --silent --show-error \
         --connect-timeout "$connect_timeout" --max-time "$request_timeout" \
-        --header @- "$api_url/api/status/auth"
+        --header @- "$api_url/api/status/auth"; then
+        request_status=0
+      else
+        request_status=$?
+      fi
       token=
+      exit "$request_status"
     ' bootstrap-auth "$token_file" "$API_URL" "$connect_timeout" "$request_timeout"
   fi
 }
@@ -1029,10 +1194,14 @@ main() {
   local container_id
   local restart_policy
   local auth_status
+  local compose_status
+  local command_name docker_override
 
-  for command_name in awk cp curl env grep id install ln mktemp mv openssl realpath sleep; do
+  for command_name in awk cp curl env grep id install ln mktemp mv openssl sleep; do
     require_command "$command_name"
   done
+  require_command "$REALPATH_BIN"
+  require_command "$TIMEOUT_BIN"
   if ! command -v "$PYTHON_BIN" >/dev/null 2>&1 || \
     ! "$PYTHON_BIN" -c 'import json' >/dev/null 2>&1; then
     if command -v python >/dev/null 2>&1 && python -c 'import json' >/dev/null 2>&1; then
@@ -1052,12 +1221,22 @@ main() {
     die "CF_AGENT_WECHAT_API_URL cannot override the loopback verification endpoint"
   fi
 
+  for docker_override in DOCKER_HOST DOCKER_CONTEXT DOCKER_TLS_VERIFY DOCKER_CERT_PATH; do
+    if [[ -v $docker_override ]]; then
+      die "$docker_override cannot override the production rootful local Docker daemon"
+    fi
+  done
+
   validate_absolute_path "CF_AGENT_WECHAT_ROOT" "$CF_AGENT_WECHAT_ROOT"
   validate_absolute_path "CF_GATEWAY_ROOT" "$CF_GATEWAY_ROOT"
   normalize_runtime_root "default runtime root" "$DEFAULT_RUNTIME_ROOT"
   CANONICAL_DEFAULT_RUNTIME_ROOT="$NORMALIZED_RUNTIME_ROOT"
   normalize_runtime_root "CF_RUNTIME_ROOT" "$CF_RUNTIME_ROOT"
   CF_RUNTIME_ROOT="$NORMALIZED_RUNTIME_ROOT"
+  if [ "$CANONICAL_DEFAULT_RUNTIME_ROOT" != "$DEFAULT_RUNTIME_ROOT" ] &&
+    [ "$CF_RUNTIME_ROOT" = "$CANONICAL_DEFAULT_RUNTIME_ROOT" ]; then
+    die "default runtime root must not resolve through a symbolic link: $DEFAULT_RUNTIME_ROOT -> $CANONICAL_DEFAULT_RUNTIME_ROOT"
+  fi
   if [ "$CF_RUNTIME_ROOT_WAS_SET" -eq 1 ] && [ "$CF_AGENT_WECHAT_RUNTIME_ROOT_WAS_SET" -eq 1 ]; then
     normalize_runtime_root "CF_AGENT_WECHAT_RUNTIME_ROOT" "$CF_AGENT_WECHAT_RUNTIME_ROOT_INPUT"
     alias_runtime_root="$NORMALIZED_RUNTIME_ROOT"
@@ -1078,6 +1257,8 @@ main() {
   validate_positive_integer "CF_BOOTSTRAP_POLL_INTERVAL" "$POLL_INTERVAL"
   validate_positive_integer "CF_BOOTSTRAP_HTTP_CONNECT_TIMEOUT" "$HTTP_CONNECT_TIMEOUT"
   validate_positive_integer "CF_BOOTSTRAP_HTTP_TIMEOUT" "$HTTP_TIMEOUT"
+  validate_positive_integer "CF_BOOTSTRAP_DOCKER_TIMEOUT" "$DOCKER_COMMAND_TIMEOUT"
+  validate_positive_integer "CF_BOOTSTRAP_COMPOSE_UP_TIMEOUT" "$COMPOSE_UP_TIMEOUT"
 
   if [ "${CF_AGENT_WECHAT_NETWORK+x}" = x ] && [ "$CF_AGENT_WECHAT_NETWORK" != "$NETWORK_NAME" ]; then
     die "CF_AGENT_WECHAT_NETWORK cannot override the production Compose network $NETWORK_NAME"
@@ -1184,8 +1365,8 @@ main() {
     fi
   fi
 
-  CF_AGENT_WECHAT_ROOT="$(realpath -e -- "$CF_AGENT_WECHAT_ROOT")"
-  CF_RUNTIME_ROOT="$(realpath -e -- "$CF_RUNTIME_ROOT")"
+  CF_AGENT_WECHAT_ROOT="$("$REALPATH_BIN" -e -- "$CF_AGENT_WECHAT_ROOT")"
+  CF_RUNTIME_ROOT="$("$REALPATH_BIN" -e -- "$CF_RUNTIME_ROOT")"
   CF_AGENT_WECHAT_RUNTIME_ROOT="$CF_RUNTIME_ROOT"
   token_file="${CF_RUNTIME_ROOT}/secrets/auth-token"
 
@@ -1197,11 +1378,26 @@ main() {
 
   ensure_network
   log "starting production service"
-  compose up -d "$SERVICE_NAME" || die "Docker Compose failed to start $SERVICE_NAME"
+  if compose_with_timeout "$COMPOSE_UP_TIMEOUT" up -d "$SERVICE_NAME"; then
+    :
+  else
+    compose_status=$?
+    case "$compose_status" in
+      124|137)
+        die "Docker Compose up exceeded CF_BOOTSTRAP_COMPOSE_UP_TIMEOUT=${COMPOSE_UP_TIMEOUT}s"
+        ;;
+      *)
+        die "Docker Compose failed to start $SERVICE_NAME"
+        ;;
+    esac
+  fi
 
   container_id="$(wait_for_container)" || \
     die "container did not become running and healthy within ${BOOTSTRAP_TIMEOUT}s"
   pass "container is running and Docker health is healthy"
+  verify_container_identity "$container_id"
+  pass "container image and name match the production environment"
+
 
   restart_policy="$(run_docker inspect --format '{{.HostConfig.RestartPolicy.Name}}' \
     "$container_id" 2>/dev/null || true)"

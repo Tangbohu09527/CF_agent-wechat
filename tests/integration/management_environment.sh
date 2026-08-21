@@ -25,6 +25,8 @@ for command_name in bash chmod env grep id install ln mktemp mv realpath rm stat
 done
 HOST_KERNEL="$(uname -s)"
 REAL_STAT="$(command -v stat)"
+CURRENT_UID="$(id -u)"
+FORCE_FIXTURE_METADATA=0
 case "$REAL_STAT" in
   /*) ;;
   *) fail "stat did not resolve to an absolute path: $REAL_STAT" ;;
@@ -34,16 +36,18 @@ TEST_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/cf-wechat-management-env.XXXXXX")"
 FIXTURE_ROOT="${TEST_ROOT}/repo"
 ENV_FILE="${FIXTURE_ROOT}/docker/.env"
 COMMON_FILE="${FIXTURE_ROOT}/scripts/common.sh"
+COMPOSE_FILE="${FIXTURE_ROOT}/docker/compose.cfserver.yaml"
 INJECTION_MARKER="${TEST_ROOT}/injection-ran"
 MOCK_BIN="${TEST_ROOT}/bin"
 
 install -d -m 755 "$MOCK_BIN" "${FIXTURE_ROOT}/docker" "${FIXTURE_ROOT}/scripts"
 install -m 644 "${REPO_ROOT}/scripts/common.sh" "$COMMON_FILE"
-TEST_PATH="$PATH"
+install -m 644 "${REPO_ROOT}/docker/compose.cfserver.yaml" "$COMPOSE_FILE"
+install -m 755 "${REPO_ROOT}/tests/helpers/mock_management_stat.sh" \
+  "${MOCK_BIN}/stat"
+TEST_PATH="${MOCK_BIN}:${PATH}"
 if [ "$HOST_KERNEL" != Linux ]; then
-  install -m 755 "${REPO_ROOT}/tests/helpers/mock_management_stat.sh" \
-    "${MOCK_BIN}/stat"
-  TEST_PATH="${MOCK_BIN}:${PATH}"
+  FORCE_FIXTURE_METADATA=1
   printf '%s\n' 'INFO non-Linux host uses controlled stat metadata for secure fixture modes'
 fi
 
@@ -58,6 +62,9 @@ run_common() {
     CF_TEST_STAT_REPO_ROOT="$FIXTURE_ROOT" \
     CF_TEST_STAT_DOCKER_DIR="${FIXTURE_ROOT}/docker" \
     CF_TEST_STAT_ENV_FILE="$ENV_FILE" \
+    CF_TEST_STAT_COMPOSE_FILE="$COMPOSE_FILE" \
+    CF_TEST_CURRENT_UID="$CURRENT_UID" \
+    CF_TEST_FORCE_STAT_FIXTURE_METADATA="$FORCE_FIXTURE_METADATA" \
     "$@" \
     bash --noprofile --norc -c '
       source "$1"
@@ -89,13 +96,32 @@ expect_failure() {
   esac
 }
 
-output="$(run_common)" || fail "missing .env did not use management defaults"
-assert_contains "$output" 'runtime=/srv/storage/cf-agent-wechat' 'default runtime'
-assert_contains "$output" 'api=http://127.0.0.1:6174' 'default API URL'
-assert_contains "$output" 'container=cf-agent-wechat' 'default container'
-assert_contains "$output" 'health=http://127.0.0.1:6174/health' 'default health URL'
-assert_contains "$output" 'ws=ws://127.0.0.1:6174/api/ws/login' 'default WebSocket URL'
-printf 'PASS missing production env uses documented defaults and derived URLs\n'
+expect_failure 'missing production env' '生产环境文件不存在'
+printf 'PASS missing production env fails closed before management operations\n'
+REQUIRED_ENV_ASSIGNMENTS=(
+  'CF_AGENT_WECHAT_RUNTIME_ROOT=/srv/storage/cf-agent-wechat'
+  'AGENT_WECHAT_BIND_IP=127.0.0.1'
+  'AGENT_WECHAT_PORT=6174'
+  'AGENT_WECHAT_CONTAINER_NAME=cf-agent-wechat'
+)
+for missing_key in CF_AGENT_WECHAT_RUNTIME_ROOT AGENT_WECHAT_BIND_IP AGENT_WECHAT_PORT AGENT_WECHAT_CONTAINER_NAME; do
+  required_env_lines=()
+  for required_assignment in "${REQUIRED_ENV_ASSIGNMENTS[@]}"; do
+    case "$required_assignment" in "$missing_key="*) continue ;; esac
+    required_env_lines+=("$required_assignment")
+  done
+  write_env "${required_env_lines[@]}"
+  case "$missing_key" in
+    CF_AGENT_WECHAT_RUNTIME_ROOT) process_override='CF_RUNTIME_ROOT=/srv/process-only' ;;
+    AGENT_WECHAT_BIND_IP) process_override='AGENT_WECHAT_BIND_IP=127.0.0.1' ;;
+    AGENT_WECHAT_PORT) process_override='AGENT_WECHAT_PORT=9000' ;;
+    AGENT_WECHAT_CONTAINER_NAME) process_override='AGENT_WECHAT_CONTAINER_NAME=process-only' ;;
+  esac
+  expect_failure "missing required $missing_key" "生产环境文件缺少必需配置键：$missing_key" \
+    "$process_override"
+done
+printf 'PASS every production authority key is required and cannot fall back to process values\n'
+
 
 write_env \
   '  CF_AGENT_WECHAT_RUNTIME_ROOT=/srv/custom/cf-agent-wechat' \
@@ -132,6 +158,19 @@ assert_contains "$output" 'runtime=/srv/custom/cf-agent-wechat' 'identical runti
 assert_contains "$output" 'api=http://127.0.0.1:7314' 'identical API URL'
 assert_contains "$output" 'token=/srv/custom/cf-agent-wechat/secrets/auth-token' 'identical token path'
 printf 'PASS process values identical to persisted authority remain accepted\n'
+MANAGEMENT_DOCKER_OVERRIDES=(
+  'DOCKER_HOST=tcp://127.0.0.1:2375'
+  'DOCKER_CONTEXT=remote'
+  'DOCKER_TLS_VERIFY=1'
+  'DOCKER_CERT_PATH=/tmp/unapproved-docker-certs'
+)
+for docker_override in "${MANAGEMENT_DOCKER_OVERRIDES[@]}"; do
+  docker_override_name="${docker_override%%=*}"
+  expect_failure "management $docker_override_name override" \
+    "$docker_override_name 不能覆盖生产本地 Docker daemon" "$docker_override"
+done
+printf 'PASS management commands reject Docker daemon environment overrides\n'
+
 
 expect_failure 'conflicting CF runtime' 'CF_RUNTIME_ROOT 与 docker/.env' \
   CF_RUNTIME_ROOT=/srv/explicit/runtime
@@ -154,19 +193,19 @@ expect_failure 'conflicting token path' 'TOKEN_FILE 必须精确匹配 docker/.e
 printf 'PASS persisted runtime, token, bind, port, container, and API reject conflicts\n'
 
 rm -f -- "$ENV_FILE"
-output="$(run_common \
+expect_failure 'process-only authority without production env' '生产环境文件不存在' \
   CF_RUNTIME_ROOT=/srv/explicit/runtime \
   AGENT_WECHAT_PORT=9000 \
   AGENT_WECHAT_CONTAINER_NAME=cf-agent-wechat-explicit \
   API_URL=http://127.0.0.1:9000 \
-  TOKEN_FILE=/srv/explicit/token)" || fail "process-only management values were rejected"
-assert_contains "$output" 'runtime=/srv/explicit/runtime' 'process-only runtime'
-assert_contains "$output" 'api=http://127.0.0.1:9000' 'process-only API URL'
-assert_contains "$output" 'container=cf-agent-wechat-explicit' 'process-only container'
-assert_contains "$output" 'token=/srv/explicit/token' 'process-only token'
-assert_contains "$output" 'health=http://127.0.0.1:9000/health' 'derived explicit health'
-assert_contains "$output" 'ws=ws://127.0.0.1:9000/api/ws/login' 'derived explicit WebSocket'
-printf 'PASS process-only endpoint is loopback, port-consistent, and fully derived\n'
+  TOKEN_FILE=/srv/explicit/token
+printf 'PASS process-only values cannot replace the production environment authority\n'
+
+write_env \
+  'CF_AGENT_WECHAT_RUNTIME_ROOT=/srv/storage/cf-agent-wechat' \
+  'AGENT_WECHAT_BIND_IP=127.0.0.1' \
+  'AGENT_WECHAT_PORT=6174' \
+  'AGENT_WECHAT_CONTAINER_NAME=cf-agent-wechat'
 
 expect_failure 'external API host' 'API_URL 必须精确匹配' \
   API_URL=http://example.invalid:6174
@@ -220,7 +259,9 @@ expect_failure 'duplicate allowlisted key' '重复配置键：CF_AGENT_WECHAT_RU
 
 write_env \
   'CF_AGENT_WECHAT_RUNTIME_ROOT=/' \
-  'AGENT_WECHAT_BIND_IP=127.0.0.1'
+  'AGENT_WECHAT_BIND_IP=127.0.0.1' \
+  'AGENT_WECHAT_PORT=6174' \
+  'AGENT_WECHAT_CONTAINER_NAME=cf-agent-wechat'
 expect_failure 'filesystem-root runtime' 'CF_AGENT_WECHAT_RUNTIME_ROOT 无效'
 
 unsafe_runtime_values=(
@@ -233,18 +274,48 @@ unsafe_runtime_values=(
   '/srv/has;semicolon'
 )
 for unsafe_runtime in "${unsafe_runtime_values[@]}"; do
-  write_env "CF_AGENT_WECHAT_RUNTIME_ROOT=$unsafe_runtime"
+  write_env \
+    "CF_AGENT_WECHAT_RUNTIME_ROOT=$unsafe_runtime" \
+    'AGENT_WECHAT_BIND_IP=127.0.0.1' \
+    'AGENT_WECHAT_PORT=6174' \
+    'AGENT_WECHAT_CONTAINER_NAME=cf-agent-wechat'
   expect_failure "dotenv-unsafe runtime: $unsafe_runtime" 'dotenv 不安全字符'
 done
 printf 'PASS persisted runtime rejects dotenv-unsafe characters\n'
 
 write_env \
   'CF_AGENT_WECHAT_RUNTIME_ROOT=/srv/custom' \
-  'AGENT_WECHAT_BIND_IP=0.0.0.0'
+  'AGENT_WECHAT_BIND_IP=0.0.0.0' \
+  'AGENT_WECHAT_PORT=6174' \
+  'AGENT_WECHAT_CONTAINER_NAME=cf-agent-wechat'
 expect_failure 'non-loopback bind' 'AGENT_WECHAT_BIND_IP 必须是 127.0.0.1'
 printf 'PASS invalid, duplicate, and conflicting production env values fail closed\n'
 
-write_env 'CF_AGENT_WECHAT_RUNTIME_ROOT=/srv/custom'
+write_env \
+  'CF_AGENT_WECHAT_RUNTIME_ROOT=/srv/custom' \
+  'AGENT_WECHAT_BIND_IP=127.0.0.1' \
+  'AGENT_WECHAT_PORT=6174' \
+  'AGENT_WECHAT_CONTAINER_NAME=cf-agent-wechat'
+OWNER_AUTHORITY_CASES=(
+  "$FIXTURE_ROOT|repository-root|仓库根目录必须由 root 或当前固定管理用户持有"
+  "${FIXTURE_ROOT}/docker|config-directory|生产配置目录必须由 root 或当前固定管理用户持有"
+  "$COMPOSE_FILE|compose-file|生产 Compose 必须由 root 或当前固定管理用户持有"
+  "$ENV_FILE|environment-file|生产环境文件必须由 root 或当前固定管理用户持有"
+)
+for authority_case in "${OWNER_AUTHORITY_CASES[@]}"; do
+  IFS='|' read -r authority_target authority_label authority_error <<< "$authority_case"
+  expect_failure "unapproved $authority_label owner" "$authority_error" \
+    CF_TEST_STAT_UNAPPROVED_OWNER_TARGET="$authority_target"
+done
+for authority_case in \
+  "$COMPOSE_FILE|compose-file|生产 Compose 不能存在额外硬链接" \
+  "$ENV_FILE|environment-file|生产环境文件不能存在额外硬链接"; do
+  IFS='|' read -r authority_target authority_label authority_error <<< "$authority_case"
+  expect_failure "$authority_label hardlink" "$authority_error" \
+    CF_TEST_STAT_HARDLINK_TARGET="$authority_target"
+done
+printf 'PASS production repo, Compose, and environment owner/hardlink authority fail closed\n'
+
 if [ "$HOST_KERNEL" = 'Linux' ]; then
   mv "$ENV_FILE" "${ENV_FILE}.real"
   if ln -s "${ENV_FILE}.real" "$ENV_FILE" 2>/dev/null; then

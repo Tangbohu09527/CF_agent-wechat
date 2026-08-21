@@ -20,23 +20,36 @@ session 稳定性。历史证据也不能外推到新的 bootstrap 和恢复实�
 
 | 范围 | 命令 | 覆盖 |
 | --- | --- | --- |
-| 部署与 runtime | `bash tests/deployment/bootstrap_cfserver.sh` | 三个 ROOT、首次初始化、幂等重跑、Token/runtime 保持、网络、Compose、container/health、mount、restart policy 和 API 失败门禁 |
-| 重启与 session | `bash tests/integration/session_recovery.sh` | container 状态恢复、health/API 恢复、`logged_in` session 复用、`logged_out` 返回码和 QR 分支 |
+| 部署与 runtime | `bash tests/deployment/bootstrap_cfserver.sh` | 三个 ROOT、权威文件、systemd、首次初始化、幂等恢复、Docker/Compose 硬超时、mount/restart/network 和 health/auth 失败门禁 |
+| 生产 Compose 恢复 E2E | `bash tests/integration/production_compose_recovery.sh` | 生产 Compose 加 mock-agent override，在真实 Docker 上验证 health、network、mount、认证 API，以及进程异常退出、容器 restart/recreate 后的 runtime/session 保持 |
+| 重启与 session | `bash tests/integration/session_recovery.sh` | container/health/API 恢复、state/health inspect 总预算、`logged_in` session 复用、登录等待态和 QR 分支 |
 | fresh QR | `python3 -m unittest -v tests/unit/test_qr_login.py` | `newAccount=true`、嵌套 QR、必须实际渲染 QR、token/控制字符清理 |
 | 权限边界 | `tests/integration/login_management_permissions.sh` | root-only Token、普通用户管理脚本、受控 sudo、venv 所有权和 token 防泄漏；仅在隔离 CI 运行 |
 
 CI 入口为 `.github/workflows/deployment-hardening.yml` 和
 `.github/workflows/login-management-permissions.yml`。部署测试使用 fake Docker/curl
-验证编排和失败语义；真实 Compose 渲染门禁在可用的 Docker Compose v2 上运行。
+验证 bootstrap 编排和失败语义；真实 Compose 渲染门禁在 Docker Compose v2 上运行，
+production Compose recovery E2E 使用真实 Docker daemon 和 mock agent API 容器验证重启与
+重建。该 E2E 只能在隔离 Docker daemon 上运行；因为生产 Compose 使用固定外部网络名
+`cf-internal`，测试发现该网络已存在时会明确拒绝运行，绝不复用或删除已有网络。
+mock 容器不包含真实微信客户端，因此不能替代 CFserver 现场验收。
 
 ### 自动化已证明
 
 - bootstrap 缺少 Docker/Compose 时在创建 env、runtime 或 Token 前失败；
 - 首次运行原子创建 env 和 Token，重复运行不替换 Token 或 session marker；
 - 已有数据缺少原 Token 时拒绝生成替代 Token；
+- 固定代码根、`docker/`、Compose 和 env 的 owner/mode/type 不受批准或存在额外硬链接时
+  fail closed；env 缺失时管理脚本不接受进程变量替代；
+- systemd 不活跃或 `docker.service` 未启用时，bootstrap 在部署变更前失败；
+- Docker/Compose metadata、启动和 state/health inspect 均有硬上限，轮询中的查询还受
+  当前阶段剩余总预算约束；
 - 生产容器必须为 running/healthy、`restart: unless-stopped`，且三项 bind mount 指向
   同一持久根；
 - health 或认证 API 无法恢复、返回无效 JSON、挂载错误或 restart policy 错误时失败；
+- 生产 Compose 的真实容器在 PID 1 异常退出自动恢复、显式 restart 和 force-recreate 后仍使用原 bind
+  runtime、只读 Token、`cf-internal` alias 和 `unless-stopped`，且 mock auth API 继续返回
+  `logged_in`；
 - `status.sh --wait` 可观察 stopped/starting 到 running/healthy，以及 API 从不可用到
   可用的恢复过程；
 - auth 为 `logged_in` 时 `login.sh` 不调用 POST 或 WebSocket；

@@ -5,6 +5,7 @@ REPO_ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd -P)"
 BOOTSTRAP="${REPO_ROOT}/scripts/bootstrap-cfserver.sh"
 REAL_STAT="$(command -v stat)"
 REAL_INSTALL="$(command -v install)"
+REAL_REALPATH="$(command -v realpath)"
 TEST_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/cf-agent-wechat-bootstrap.XXXXXX")"
 
 cleanup() {
@@ -39,6 +40,22 @@ assert_contains() {
   }
 }
 
+assert_hung_process_reaped() {
+  local pid_file="$1"
+  local label="$2"
+  local pid attempt
+
+  [ -s "$pid_file" ] || fail "$label did not record its PID"
+  pid="$(cat "$pid_file")"
+  for attempt in {1..20}; do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      return
+    fi
+    sleep 0.1
+  done
+  fail "$label left timed-out process $pid running"
+}
+
 if command -v python3 >/dev/null 2>&1 && python3 -c 'import json' >/dev/null 2>&1; then
   TEST_PYTHON=python3
 elif command -v python >/dev/null 2>&1 && python -c 'import json' >/dev/null 2>&1; then
@@ -46,6 +63,8 @@ elif command -v python >/dev/null 2>&1 && python -c 'import json' >/dev/null 2>&
 else
   fail "Python 3 is required for the deployment test"
 fi
+command -v timeout >/dev/null 2>&1 ||
+  fail "GNU coreutils timeout is required for the deployment test"
 
 APP_ROOT="${TEST_ROOT}/custom-agent-root"
 GATEWAY_ROOT="${TEST_ROOT}/custom-gateway-root"
@@ -71,6 +90,10 @@ install -m 755 -- "${REPO_ROOT}/tests/helpers/mock_bootstrap_chown.sh" \
   "${MOCK_BIN}/chown"
 install -m 755 -- "${REPO_ROOT}/tests/helpers/mock_bootstrap_systemctl.sh" \
   "${MOCK_BIN}/systemctl"
+install -m 755 -- "${REPO_ROOT}/tests/helpers/mock_bootstrap_sudo.sh" \
+  "${MOCK_BIN}/sudo"
+install -m 755 -- "${REPO_ROOT}/tests/helpers/mock_bootstrap_realpath.sh" \
+  "${MOCK_BIN}/realpath"
 : > "$AUDIT_LOG"
 
 ACTIVE_APP_ROOT="$APP_ROOT"
@@ -80,6 +103,14 @@ ACTIVE_ENV_FILE="$ENV_FILE"
 ACTIVE_IMAGE="$IMAGE"
 TEST_DOCKER_UNAVAILABLE=0
 TEST_COMPOSE_INVALID=0
+TEST_DOCKER_DIRECT_DENIED=0
+TEST_DOCKER_CONTEXT_NAME=default
+TEST_DOCKER_CONTEXT_ENDPOINT=unix:///var/run/docker.sock
+TEST_DOCKER_SECURITY_OPTIONS='["name=seccomp"]'
+TEST_DEFAULT_RUNTIME_RESOLVED=""
+TEST_CALLER_DOCKER_OVERRIDE=""
+TEST_CONTAINER_IMAGE=""
+TEST_CONTAINER_INSPECT_NAME=""
 TEST_RESTART_POLICY=unless-stopped
 TEST_BAD_MOUNT=0
 TEST_DATA_MOUNT_RW=true
@@ -100,24 +131,37 @@ AGENT_RUNTIME_ROOT_VALUE=""
 TEST_INSECURE_ENV_PARENT=0
 TEST_INSECURE_COMPOSE_FILE=0
 TEST_INSECURE_APP_ROOT=0
+TEST_UNAPPROVED_APP_OWNER=0
+TEST_UNAPPROVED_ENV_PARENT_OWNER=0
+TEST_UNAPPROVED_COMPOSE_OWNER=0
+TEST_UNAPPROVED_ENV_OWNER=0
+TEST_COMPOSE_HARDLINK=0
+TEST_ENV_HARDLINK=0
 TEST_BAD_RUNTIME_METADATA=0
 TEST_ENV_FILE_MODE=600
 TEST_NETWORK_OVERRIDE=""
 TEST_RUNTIME_MODE=700
 TEST_SECRETS_UID="$CURRENT_UID"
 TEST_SECRETS_GID="$CURRENT_GID"
-TEST_BOOTSTRAP_TIMEOUT=1
+TEST_BOOTSTRAP_TIMEOUT=3
 TEST_HTTP_CONNECT_TIMEOUT=1
 TEST_HTTP_TIMEOUT=1
+TEST_DOCKER_TIMEOUT=""
+TEST_COMPOSE_UP_TIMEOUT=""
+TEST_DOCKER_HANG_ON=""
+TEST_DOCKER_HANG_PID_FILE=""
 TEST_SYSTEMD_STATE=running
 TEST_DOCKER_SERVICE_ENABLEMENT=enabled
+TEST_DOCKER_SERVICE_ACTIVITY=active
 
 run_bootstrap() {
   local -a runtime_root_env=()
   local -a permission_env=()
   local -a contract_env=()
+  local -a timeout_env=()
   local alias_value
   local effective_app_root="$ACTIVE_APP_ROOT"
+  local -a docker_override_env=()
   local effective_env_file="$ACTIVE_ENV_FILE"
   local bootstrap_status
 
@@ -147,6 +191,15 @@ run_bootstrap() {
   if [ -n "$TEST_NETWORK_OVERRIDE" ]; then
     contract_env+=("CF_AGENT_WECHAT_NETWORK=$TEST_NETWORK_OVERRIDE")
   fi
+  if [ -n "$TEST_DOCKER_TIMEOUT" ]; then
+    timeout_env+=("CF_BOOTSTRAP_DOCKER_TIMEOUT=$TEST_DOCKER_TIMEOUT")
+  fi
+  if [ -n "$TEST_COMPOSE_UP_TIMEOUT" ]; then
+    timeout_env+=("CF_BOOTSTRAP_COMPOSE_UP_TIMEOUT=$TEST_COMPOSE_UP_TIMEOUT")
+  fi
+  if [ -n "$TEST_CALLER_DOCKER_OVERRIDE" ]; then
+    docker_override_env+=("$TEST_CALLER_DOCKER_OVERRIDE")
+  fi
   if [ "$PASS_PERMISSION_SETTINGS" -eq 1 ]; then
     permission_env+=(
       "CF_RUNTIME_UID=$CURRENT_UID"
@@ -164,7 +217,10 @@ run_bootstrap() {
     -u CF_RUNTIME_UID -u CF_RUNTIME_GID -u CF_RUNTIME_MODE \
     -u CF_STORAGE_UID -u CF_STORAGE_GID -u CF_SECRETS_UID -u CF_SECRETS_GID \
     -u CF_AGENT_WECHAT_NETWORK -u CF_AGENT_WECHAT_SERVICE_NAME \
+    -u CF_BOOTSTRAP_DOCKER_TIMEOUT -u CF_BOOTSTRAP_COMPOSE_UP_TIMEOUT \
     -u CF_AGENT_WECHAT_STORAGE_ROOT -u PROXY -u RUST_LOG -u COMPOSE_PROJECT_NAME \
+    -u DOCKER_HOST -u DOCKER_CONTEXT -u DOCKER_TLS_VERIFY -u DOCKER_CERT_PATH \
+    "${docker_override_env[@]}" \
     CF_AGENT_WECHAT_STORAGE_ROOT="${TEST_ROOT}/stale-caller-runtime" \
     PROXY="http://stale-proxy.invalid:8080" \
     RUST_LOG=trace \
@@ -177,6 +233,7 @@ run_bootstrap() {
     "${runtime_root_env[@]}" \
     "${permission_env[@]}" \
     "${contract_env[@]}" \
+    "${timeout_env[@]}" \
     CF_BOOTSTRAP_TIMEOUT="$TEST_BOOTSTRAP_TIMEOUT" \
     CF_BOOTSTRAP_POLL_INTERVAL=1 \
     CF_BOOTSTRAP_HTTP_CONNECT_TIMEOUT="$TEST_HTTP_CONNECT_TIMEOUT" \
@@ -188,8 +245,12 @@ run_bootstrap() {
     CF_BOOTSTRAP_TEST_ENV_FILE="$effective_env_file" \
     CF_BOOTSTRAP_REAL_STAT="$REAL_STAT" \
     CF_BOOTSTRAP_TEST_RUNTIME_UID="$CURRENT_UID" \
+    CF_BOOTSTRAP_TEST_CURRENT_UID="$CURRENT_UID" \
     CF_BOOTSTRAP_TEST_RUNTIME_GID="$CURRENT_GID" \
     CF_BOOTSTRAP_TEST_RUNTIME_MODE="$TEST_RUNTIME_MODE" \
+    CF_BOOTSTRAP_REAL_REALPATH="$REAL_REALPATH" \
+    CF_BOOTSTRAP_TEST_DEFAULT_RUNTIME_RESOLVED="$TEST_DEFAULT_RUNTIME_RESOLVED" \
+    CF_BOOTSTRAP_TEST_SUDO_STATE_FILE="${STATE_DIR}/sudo-authorized" \
     CF_BOOTSTRAP_TEST_STORAGE_UID="$CURRENT_UID" \
     CF_BOOTSTRAP_TEST_STORAGE_GID="$CURRENT_GID" \
     CF_BOOTSTRAP_TEST_SECRETS_UID="$TEST_SECRETS_UID" \
@@ -198,13 +259,27 @@ run_bootstrap() {
     CF_BOOTSTRAP_TEST_INSECURE_ENV_PARENT="$TEST_INSECURE_ENV_PARENT" \
     CF_BOOTSTRAP_TEST_INSECURE_COMPOSE_FILE="$TEST_INSECURE_COMPOSE_FILE" \
     CF_BOOTSTRAP_TEST_INSECURE_APP_ROOT="$TEST_INSECURE_APP_ROOT" \
+    CF_BOOTSTRAP_TEST_UNAPPROVED_APP_OWNER="$TEST_UNAPPROVED_APP_OWNER" \
+    CF_BOOTSTRAP_TEST_UNAPPROVED_ENV_PARENT_OWNER="$TEST_UNAPPROVED_ENV_PARENT_OWNER" \
+    CF_BOOTSTRAP_TEST_UNAPPROVED_COMPOSE_OWNER="$TEST_UNAPPROVED_COMPOSE_OWNER" \
+    CF_BOOTSTRAP_TEST_UNAPPROVED_ENV_OWNER="$TEST_UNAPPROVED_ENV_OWNER" \
+    CF_BOOTSTRAP_TEST_COMPOSE_HARDLINK="$TEST_COMPOSE_HARDLINK" \
+    CF_BOOTSTRAP_TEST_ENV_HARDLINK="$TEST_ENV_HARDLINK" \
     CF_BOOTSTRAP_TEST_APP_ROOT="$effective_app_root" \
     CF_BOOTSTRAP_TEST_COMPOSE_FILE="${effective_app_root}/docker/compose.cfserver.yaml" \
     CF_BOOTSTRAP_TEST_BAD_RUNTIME_METADATA="$TEST_BAD_RUNTIME_METADATA" \
     CF_BOOTSTRAP_TEST_ENV_FILE_MODE="$TEST_ENV_FILE_MODE" \
     CF_BOOTSTRAP_TEST_DOCKER_UNAVAILABLE="$TEST_DOCKER_UNAVAILABLE" \
+    CF_BOOTSTRAP_TEST_DOCKER_HANG_ON="$TEST_DOCKER_HANG_ON" \
+    CF_BOOTSTRAP_TEST_DOCKER_HANG_PID_FILE="$TEST_DOCKER_HANG_PID_FILE" \
     CF_BOOTSTRAP_TEST_COMPOSE_INVALID="$TEST_COMPOSE_INVALID" \
+    CF_BOOTSTRAP_TEST_CONTAINER_IMAGE="$TEST_CONTAINER_IMAGE" \
+    CF_BOOTSTRAP_TEST_CONTAINER_NAME="$TEST_CONTAINER_INSPECT_NAME" \
     CF_BOOTSTRAP_TEST_RESTART_POLICY="$TEST_RESTART_POLICY" \
+    CF_BOOTSTRAP_TEST_DOCKER_DIRECT_DENIED="$TEST_DOCKER_DIRECT_DENIED" \
+    CF_BOOTSTRAP_TEST_DOCKER_CONTEXT_NAME="$TEST_DOCKER_CONTEXT_NAME" \
+    CF_BOOTSTRAP_TEST_DOCKER_CONTEXT_ENDPOINT="$TEST_DOCKER_CONTEXT_ENDPOINT" \
+    CF_BOOTSTRAP_TEST_DOCKER_SECURITY_OPTIONS="$TEST_DOCKER_SECURITY_OPTIONS" \
     CF_BOOTSTRAP_TEST_BAD_MOUNT="$TEST_BAD_MOUNT" \
     CF_BOOTSTRAP_TEST_DATA_MOUNT_RW="$TEST_DATA_MOUNT_RW" \
     CF_BOOTSTRAP_TEST_HOME_MOUNT_RW="$TEST_HOME_MOUNT_RW" \
@@ -218,6 +293,7 @@ run_bootstrap() {
     CF_BOOTSTRAP_TEST_AUTH_STATUS="$TEST_AUTH_STATUS" \
     CF_BOOTSTRAP_TEST_AUTH_SEQUENCE="$TEST_AUTH_SEQUENCE" \
     CF_BOOTSTRAP_TEST_SYSTEMD_STATE="$TEST_SYSTEMD_STATE" \
+    CF_BOOTSTRAP_TEST_DOCKER_SERVICE_ACTIVITY="$TEST_DOCKER_SERVICE_ACTIVITY" \
     CF_BOOTSTRAP_TEST_DOCKER_SERVICE_ENABLEMENT="$TEST_DOCKER_SERVICE_ENABLEMENT" \
     /bin/bash "$BOOTSTRAP"; then
     bootstrap_status=0
@@ -373,6 +449,60 @@ assert_contains "$INSECURE_COMPOSE_OUTPUT" 'production Compose file must not be 
   fail "insecure Compose file invoked Docker before rejection"
 TEST_INSECURE_COMPOSE_FILE=0
 pass "group/other-writable Compose file is rejected before state changes"
+AUTHORITY_SCENARIOS=(
+  'TEST_UNAPPROVED_APP_OWNER|application-root-owner|CF_AGENT_WECHAT_ROOT must be owned by root or the invoking fixed management user'
+  'TEST_UNAPPROVED_ENV_PARENT_OWNER|config-directory-owner|environment file parent directory must be owned by root or the invoking fixed management user'
+  'TEST_UNAPPROVED_COMPOSE_OWNER|compose-owner|production Compose file must be owned by root or the invoking fixed management user'
+  'TEST_COMPOSE_HARDLINK|compose-hardlink|production Compose file must not have additional hard links'
+)
+for authority_scenario in "${AUTHORITY_SCENARIOS[@]}"; do
+  IFS='|' read -r authority_flag authority_slug authority_error <<< "$authority_scenario"
+  AUTHORITY_RUNTIME="${TEST_ROOT}/${authority_slug}-runtime"
+  AUTHORITY_ENV="${TEST_ROOT}/${authority_slug}.env"
+  AUTHORITY_OUTPUT="${TEST_ROOT}/${authority_slug}.out"
+  ACTIVE_RUNTIME_ROOT="$AUTHORITY_RUNTIME"
+  ACTIVE_ENV_FILE="$AUTHORITY_ENV"
+  AUTHORITY_AUDIT_BEFORE="$(wc -l < "$AUDIT_LOG")"
+  printf -v "$authority_flag" 1
+  if run_bootstrap > "$AUTHORITY_OUTPUT" 2>&1; then
+    fail "bootstrap accepted unapproved authority metadata: $authority_slug"
+  fi
+  printf -v "$authority_flag" 0
+  assert_contains "$AUTHORITY_OUTPUT" "$authority_error"
+  [ ! -e "$AUTHORITY_ENV" ] && [ ! -e "$AUTHORITY_RUNTIME" ] || \
+    fail "$authority_slug rejection mutated deployment state"
+  [ "$(wc -l < "$AUDIT_LOG")" -eq "$AUTHORITY_AUDIT_BEFORE" ] || \
+    fail "$authority_slug invoked Docker before rejection"
+done
+pass "repo, Docker config directory, and Compose owner/hardlink authority fail closed"
+
+ENV_AUTHORITY_SCENARIOS=(
+  'TEST_UNAPPROVED_ENV_OWNER|environment-owner|environment file must be owned by root or the invoking fixed management user'
+  'TEST_ENV_HARDLINK|environment-hardlink|environment file must not have additional hard links'
+)
+for authority_scenario in "${ENV_AUTHORITY_SCENARIOS[@]}"; do
+  IFS='|' read -r authority_flag authority_slug authority_error <<< "$authority_scenario"
+  AUTHORITY_RUNTIME="${TEST_ROOT}/${authority_slug}-runtime"
+  AUTHORITY_ENV="${TEST_ROOT}/${authority_slug}.env"
+  AUTHORITY_OUTPUT="${TEST_ROOT}/${authority_slug}.out"
+  write_env_fixture "$AUTHORITY_ENV" CF_AGENT_WECHAT_RUNTIME_ROOT "$AUTHORITY_RUNTIME"
+  AUTHORITY_ENV_BEFORE="$(<"$AUTHORITY_ENV")"
+  ACTIVE_RUNTIME_ROOT="$AUTHORITY_RUNTIME"
+  ACTIVE_ENV_FILE="$AUTHORITY_ENV"
+  printf -v "$authority_flag" 1
+  if run_bootstrap > "$AUTHORITY_OUTPUT" 2>&1; then
+    fail "bootstrap accepted unapproved environment metadata: $authority_slug"
+  fi
+  printf -v "$authority_flag" 0
+  assert_contains "$AUTHORITY_OUTPUT" "$authority_error"
+  [ "$(<"$AUTHORITY_ENV")" = "$AUTHORITY_ENV_BEFORE" ] || \
+    fail "$authority_slug rejection changed the authoritative environment"
+  [ ! -e "$AUTHORITY_RUNTIME" ] || fail "$authority_slug created runtime state"
+done
+ACTIVE_RUNTIME_ROOT="$RUNTIME_ROOT"
+ACTIVE_ENV_FILE="$ENV_FILE"
+pass "environment owner and hardlink authority fail closed"
+
 
 INVALID_MODE_RUNTIME="${TEST_ROOT}/invalid-mode-runtime"
 INVALID_MODE_ENV="${TEST_ROOT}/invalid-mode.env"
@@ -420,6 +550,40 @@ PASS_RUNTIME_ROOT=1
 TEST_SECRETS_UID="$CURRENT_UID"
 TEST_SECRETS_GID="$CURRENT_GID"
 pass "default runtime root enforces root-owned management secrets"
+for systemd_state in starting offline; do
+  SYSTEMD_RUNTIME="${TEST_ROOT}/systemd-${systemd_state}-runtime"
+  SYSTEMD_ENV="${TEST_ROOT}/systemd-${systemd_state}.env"
+  SYSTEMD_OUTPUT="${TEST_ROOT}/systemd-${systemd_state}.out"
+  ACTIVE_RUNTIME_ROOT="$SYSTEMD_RUNTIME"
+  ACTIVE_ENV_FILE="$SYSTEMD_ENV"
+  TEST_SYSTEMD_STATE="$systemd_state"
+  if run_bootstrap > "$SYSTEMD_OUTPUT" 2>&1; then
+    fail "bootstrap accepted non-active systemd state: $systemd_state"
+  fi
+  assert_contains "$SYSTEMD_OUTPUT" "systemd is not active; Docker boot-time recovery cannot be guaranteed"
+  [ ! -e "$SYSTEMD_ENV" ] && [ ! -e "$SYSTEMD_RUNTIME" ] || \
+    fail "systemd $systemd_state failure mutated deployment state"
+done
+TEST_SYSTEMD_STATE=running
+pass "starting and offline systemd states fail before deployment mutation"
+for activity in inactive failed; do
+  ACTIVITY_RUNTIME="${TEST_ROOT}/activity-${activity}-runtime"
+  ACTIVITY_ENV="${TEST_ROOT}/activity-${activity}.env"
+  ACTIVE_RUNTIME_ROOT="$ACTIVITY_RUNTIME"
+  ACTIVE_ENV_FILE="$ACTIVITY_ENV"
+  TEST_DOCKER_SERVICE_ACTIVITY="$activity"
+  ACTIVITY_OUTPUT="${TEST_ROOT}/activity-${activity}.out"
+  if run_bootstrap > "$ACTIVITY_OUTPUT" 2>&1; then
+    fail "bootstrap accepted non-active docker.service state: $activity"
+  fi
+  assert_contains "$ACTIVITY_OUTPUT" \
+    "docker.service is not active for the verified local Docker socket (state: $activity)"
+  [ ! -e "$ACTIVITY_ENV" ] && [ ! -e "$ACTIVITY_RUNTIME" ] || \
+    fail "docker.service $activity failure mutated deployment state"
+done
+TEST_DOCKER_SERVICE_ACTIVITY=active
+pass "inactive and failed docker.service states fail before deployment mutation"
+
 
 for enablement in enabled-runtime disabled; do
   RECOVERY_RUNTIME="${TEST_ROOT}/recovery-${enablement}-runtime"
@@ -544,6 +708,40 @@ AGENT_RUNTIME_ROOT_VALUE=""
 ACTIVE_ENV_FILE="$ENV_FILE"
 pass "conflicting runtime root aliases are rejected before state changes"
 
+DOCKER_OVERRIDE_AUDIT_BEFORE="$(wc -l < "$AUDIT_LOG")"
+DOCKER_OVERRIDE_NAMES=(DOCKER_HOST DOCKER_CONTEXT DOCKER_TLS_VERIFY DOCKER_CERT_PATH)
+for docker_override_name in "${DOCKER_OVERRIDE_NAMES[@]}"; do
+  TEST_CALLER_DOCKER_OVERRIDE="${docker_override_name}=forbidden"
+  DOCKER_OVERRIDE_OUTPUT="${TEST_ROOT}/${docker_override_name}.out"
+  if run_bootstrap > "$DOCKER_OVERRIDE_OUTPUT" 2>&1; then
+    fail "bootstrap accepted caller Docker override: $docker_override_name"
+  fi
+  assert_contains "$DOCKER_OVERRIDE_OUTPUT" "$docker_override_name cannot override the production rootful local Docker daemon"
+  [ ! -e "$ENV_FILE" ] && [ ! -e "$RUNTIME_ROOT" ] || \
+    fail "$docker_override_name rejection mutated deployment state"
+  [ "$(wc -l < "$AUDIT_LOG")" -eq "$DOCKER_OVERRIDE_AUDIT_BEFORE" ] || \
+    fail "$docker_override_name reached Docker before rejection"
+done
+TEST_CALLER_DOCKER_OVERRIDE=""
+pass "Docker daemon environment overrides fail before deployment mutation"
+DAEMON_AUTHORITY_SCENARIOS=(
+  'TEST_DOCKER_CONTEXT_NAME|remote|default|docker-context|production bootstrap requires Docker context default'
+  'TEST_DOCKER_CONTEXT_ENDPOINT|unix:///run/user/1000/docker.sock|unix:///var/run/docker.sock|docker-endpoint|production bootstrap requires the rootful local Docker socket'
+  'TEST_DOCKER_SECURITY_OPTIONS|["name=rootless"]|["name=seccomp"]|rootless-daemon|rootless Docker is not supported'
+)
+for daemon_scenario in "${DAEMON_AUTHORITY_SCENARIOS[@]}"; do
+  IFS='|' read -r daemon_flag daemon_bad daemon_good daemon_slug daemon_error <<< "$daemon_scenario"
+  printf -v "$daemon_flag" '%s' "$daemon_bad"
+  DAEMON_OUTPUT="${TEST_ROOT}/${daemon_slug}.out"
+  if run_bootstrap > "$DAEMON_OUTPUT" 2>&1; then
+    fail "bootstrap accepted unapproved Docker daemon scenario: $daemon_slug"
+  fi
+  printf -v "$daemon_flag" '%s' "$daemon_good"
+  assert_contains "$DAEMON_OUTPUT" "$daemon_error"
+  [ ! -e "$ENV_FILE" ] && [ ! -e "$RUNTIME_ROOT" ] || \
+    fail "$daemon_slug rejection mutated deployment state"
+done
+pass "Docker context, socket endpoint, and rootless daemon authority fail closed"
 FIRST_OUTPUT="${TEST_ROOT}/first.out"
 run_bootstrap > "$FIRST_OUTPUT" 2>&1 || {
   sed -n '1,240p' "$FIRST_OUTPUT" >&2
@@ -604,6 +802,9 @@ case "$COMPOSE_ENV_AUDIT" in
     ;;
 esac
 assert_contains "$FIRST_OUTPUT" 'docker.service is persistently enabled for boot recovery'
+assert_contains "$FIRST_OUTPUT" 'docker.service is active on the verified local Docker socket'
+assert_contains "$AUDIT_LOG" $'docker\tcontext\tshow'
+assert_contains "$AUDIT_LOG" $'docker\tcontext\tinspect'
 pass "first-run roots, directories, token, network, startup, mounts, and API checks"
 
 printf '%s\n' 'persisted-session-fixture' > "${RUNTIME_ROOT}/data/session.marker"
@@ -630,6 +831,61 @@ done
 assert_contains "$SECOND_OUTPUT" "persistent runtime root: $RUNTIME_ROOT"
 assert_contains "$SECOND_OUTPUT" 'Docker network exists: cf-internal'
 pass "second run loads persisted root/ownership and preserves token/session without bootstrap variables"
+TEST_DEFAULT_RUNTIME_RESOLVED=/mnt/relocated/cf-agent-wechat
+SYMLINK_CUSTOM_RUNTIME="${TEST_ROOT}/symlink-custom-runtime"
+SYMLINK_CUSTOM_ENV="${TEST_ROOT}/symlink-custom.env"
+ACTIVE_RUNTIME_ROOT="$SYMLINK_CUSTOM_RUNTIME"
+ACTIVE_ENV_FILE="$SYMLINK_CUSTOM_ENV"
+SYMLINK_CUSTOM_OUTPUT="${TEST_ROOT}/symlink-custom.out"
+run_bootstrap > "$SYMLINK_CUSTOM_OUTPUT" 2>&1 || {
+  sed -n '1,240p' "$SYMLINK_CUSTOM_OUTPUT" >&2
+  fail "unused symlinked default runtime blocked a custom runtime"
+}
+grep -Fxq "CF_AGENT_WECHAT_RUNTIME_ROOT=$SYMLINK_CUSTOM_RUNTIME" "$SYMLINK_CUSTOM_ENV" || \
+  fail "custom runtime was not preserved while default runtime resolved through a symlink"
+
+DEFAULT_SYMLINK_ENV="${TEST_ROOT}/default-symlink.env"
+ACTIVE_RUNTIME_ROOT="${TEST_ROOT}/unused-default-symlink-runtime"
+ACTIVE_ENV_FILE="$DEFAULT_SYMLINK_ENV"
+PASS_RUNTIME_ROOT=0
+DEFAULT_SYMLINK_OUTPUT="${TEST_ROOT}/default-symlink.out"
+if run_bootstrap > "$DEFAULT_SYMLINK_OUTPUT" 2>&1; then
+  fail "bootstrap accepted a symlinked default runtime"
+fi
+assert_contains "$DEFAULT_SYMLINK_OUTPUT" 'default runtime root must not resolve through a symbolic link'
+[ ! -e "$DEFAULT_SYMLINK_ENV" ] || fail "symlinked default runtime created an environment file"
+PASS_RUNTIME_ROOT=1
+TEST_DEFAULT_RUNTIME_RESOLVED=""
+ACTIVE_RUNTIME_ROOT="$RUNTIME_ROOT"
+ACTIVE_ENV_FILE="$ENV_FILE"
+pass "used default runtime symlinks fail closed without blocking unrelated custom runtimes"
+if [ "$CURRENT_UID" = "0" ]; then
+  printf 'SKIP foreground sudo authorization test when running as root\n'
+else
+  SUDO_RUNTIME="${TEST_ROOT}/sudo-runtime"
+  SUDO_ENV="${TEST_ROOT}/sudo.env"
+  ACTIVE_RUNTIME_ROOT="$SUDO_RUNTIME"
+  ACTIVE_ENV_FILE="$SUDO_ENV"
+  TEST_DOCKER_DIRECT_DENIED=1
+  rm -f -- "${STATE_DIR}/sudo-authorized"
+  SUDO_AUDIT_BEFORE="$(wc -l < "$AUDIT_LOG")"
+  SUDO_OUTPUT="${TEST_ROOT}/sudo.out"
+  run_bootstrap > "$SUDO_OUTPUT" 2>&1 || {
+    sed -n '1,240p' "$SUDO_OUTPUT" >&2
+    fail "bootstrap did not recover through foreground sudo authorization"
+  }
+  SUDO_AUDIT="${TEST_ROOT}/sudo.audit"
+  sed -n "$((SUDO_AUDIT_BEFORE + 1)),\$p" "$AUDIT_LOG" > "$SUDO_AUDIT"
+  assert_contains "$SUDO_OUTPUT" 'Docker socket requires sudo; authorize the foreground sudo prompt'
+  grep -Fxq $'sudo\t-v' "$SUDO_AUDIT" || fail "bootstrap did not authorize sudo in the foreground"
+  grep -Fq $'sudo\t-n\t--' "$SUDO_AUDIT" || fail "timed Docker commands did not use sudo -n"
+  awk -F '\t' '$1 == "sudo" && $2 != "-v" && $2 != "-n" { exit 1 }' "$SUDO_AUDIT" || \
+    fail "a timed Docker command attempted interactive sudo"
+  TEST_DOCKER_DIRECT_DENIED=0
+  ACTIVE_RUNTIME_ROOT="$RUNTIME_ROOT"
+  ACTIVE_ENV_FILE="$ENV_FILE"
+  pass "foreground sudo authorization precedes non-interactive timed Docker commands"
+fi
 
 MISMATCH_OUTPUT="${TEST_ROOT}/env-mismatch.out"
 ACTIVE_IMAGE="registry.example/other@sha256:$(printf 'b%.0s' {1..64})"
@@ -956,7 +1212,7 @@ SEQUENCE_CALLS_AFTER="$(grep -Fc '/api/status/auth' "$AUDIT_LOG")"
   fail "unknown-to-ready auth sequence was not polled exactly twice"
 assert_contains "$SEQUENCE_OUTPUT" 'authenticated API is ready (auth status: logged_out)'
 TEST_AUTH_SEQUENCE=""
-TEST_BOOTSTRAP_TIMEOUT=1
+TEST_BOOTSTRAP_TIMEOUT=3
 pass "unknown authenticated state is polled until a supported ready state"
 
 TEST_AUTH_STATUS=unknown
@@ -978,13 +1234,44 @@ run_bootstrap > "$CLAMP_OUTPUT" 2>&1 || {
 }
 CLAMP_AUDIT="${TEST_ROOT}/curl-clamp.audit"
 sed -n "$((CLAMP_AUDIT_BEFORE + 1)),\$p" "$AUDIT_LOG" > "$CLAMP_AUDIT"
-assert_contains "$CLAMP_AUDIT" $'connect=1\tmax=1'
+grep -Eq $'connect=[1-3]\tmax=[1-3]' "$CLAMP_AUDIT" || \
+  fail "curl timeouts were not clamped to the 3s stage budget"
 if grep -Eq 'connect=99|max=99' "$CLAMP_AUDIT"; then
   fail "curl exceeded the remaining bootstrap stage deadline"
 fi
 TEST_HTTP_CONNECT_TIMEOUT=1
 TEST_HTTP_TIMEOUT=1
 pass "curl connect and request timeouts are clamped to the stage deadline"
+
+TIMEOUT_ENV_ID_BEFORE="$($REAL_STAT -c '%i:%Y:%s' "$ENV_FILE")"
+TIMEOUT_TOKEN_ID_BEFORE="$($REAL_STAT -c '%i:%Y:%s' "${RUNTIME_ROOT}/secrets/auth-token")"
+TIMEOUT_DOCKER_CALLS_BEFORE="$(wc -l < "$AUDIT_LOG")"
+TEST_DOCKER_TIMEOUT=0
+INVALID_DOCKER_TIMEOUT_OUTPUT="${TEST_ROOT}/invalid-docker-timeout.out"
+if run_bootstrap > "$INVALID_DOCKER_TIMEOUT_OUTPUT" 2>&1; then
+  fail "bootstrap accepted CF_BOOTSTRAP_DOCKER_TIMEOUT=0"
+fi
+assert_contains "$INVALID_DOCKER_TIMEOUT_OUTPUT" \
+  'CF_BOOTSTRAP_DOCKER_TIMEOUT must be a positive integer'
+TEST_DOCKER_TIMEOUT=""
+TEST_COMPOSE_UP_TIMEOUT=invalid
+INVALID_UP_TIMEOUT_OUTPUT="${TEST_ROOT}/invalid-compose-up-timeout.out"
+if run_bootstrap > "$INVALID_UP_TIMEOUT_OUTPUT" 2>&1; then
+  fail "bootstrap accepted an invalid CF_BOOTSTRAP_COMPOSE_UP_TIMEOUT"
+fi
+assert_contains "$INVALID_UP_TIMEOUT_OUTPUT" \
+  'CF_BOOTSTRAP_COMPOSE_UP_TIMEOUT must be a positive integer'
+TEST_COMPOSE_UP_TIMEOUT=""
+[ "$(wc -l < "$AUDIT_LOG")" -eq "$TIMEOUT_DOCKER_CALLS_BEFORE" ] ||
+  fail "invalid timeout values reached Docker before validation"
+[ "$($REAL_STAT -c '%i:%Y:%s' "$ENV_FILE")" = "$TIMEOUT_ENV_ID_BEFORE" ] ||
+  fail "invalid timeout values mutated docker/.env"
+[ "$($REAL_STAT -c '%i:%Y:%s' "${RUNTIME_ROOT}/secrets/auth-token")" = \
+  "$TIMEOUT_TOKEN_ID_BEFORE" ] ||
+  fail "invalid timeout values mutated the runtime token"
+grep -Fxq 'persisted-session-fixture' "${RUNTIME_ROOT}/data/session.marker" ||
+  fail "invalid timeout values mutated persisted runtime data"
+pass "invalid Docker timeouts fail before environment or runtime mutation"
 
 TEST_COMPOSE_INVALID=1
 COMPOSE_OUTPUT="${TEST_ROOT}/compose.out"
@@ -994,6 +1281,66 @@ fi
 assert_contains "$COMPOSE_OUTPUT" 'production Compose validation failed'
 TEST_COMPOSE_INVALID=0
 pass "Compose validation failure"
+
+TEST_DOCKER_TIMEOUT=1
+TEST_DOCKER_HANG_ON=compose-config
+TEST_DOCKER_HANG_PID_FILE="${TEST_ROOT}/compose-config-hang.pid"
+rm -f -- "$TEST_DOCKER_HANG_PID_FILE"
+METADATA_HANG_OUTPUT="${TEST_ROOT}/compose-config-hang.out"
+HANG_STARTED=$SECONDS
+if run_bootstrap > "$METADATA_HANG_OUTPUT" 2>&1; then
+  fail "bootstrap accepted a hung Compose metadata command"
+fi
+HANG_ELAPSED=$((SECONDS - HANG_STARTED))
+[ "$HANG_ELAPSED" -le 3 ] ||
+  fail "Compose metadata hard timeout took ${HANG_ELAPSED}s"
+assert_contains "$METADATA_HANG_OUTPUT" 'production Compose validation failed'
+assert_hung_process_reaped "$TEST_DOCKER_HANG_PID_FILE" "Compose metadata timeout"
+TEST_DOCKER_HANG_ON=""
+TEST_DOCKER_HANG_PID_FILE=""
+TEST_DOCKER_TIMEOUT=""
+pass "Docker and Compose metadata commands have a hard wall-clock timeout"
+
+TEST_COMPOSE_UP_TIMEOUT=1
+TEST_DOCKER_HANG_ON=compose-up
+TEST_DOCKER_HANG_PID_FILE="${TEST_ROOT}/compose-up-hang.pid"
+rm -f -- "$TEST_DOCKER_HANG_PID_FILE"
+UP_HANG_OUTPUT="${TEST_ROOT}/compose-up-hang.out"
+HANG_STARTED=$SECONDS
+if run_bootstrap > "$UP_HANG_OUTPUT" 2>&1; then
+  fail "bootstrap accepted a hung Compose up"
+fi
+HANG_ELAPSED=$((SECONDS - HANG_STARTED))
+[ "$HANG_ELAPSED" -le 3 ] || fail "Compose up hard timeout took ${HANG_ELAPSED}s"
+assert_contains "$UP_HANG_OUTPUT" \
+  'Docker Compose up exceeded CF_BOOTSTRAP_COMPOSE_UP_TIMEOUT=1s'
+assert_hung_process_reaped "$TEST_DOCKER_HANG_PID_FILE" "Compose up timeout"
+TEST_DOCKER_HANG_ON=""
+TEST_DOCKER_HANG_PID_FILE=""
+TEST_COMPOSE_UP_TIMEOUT=""
+pass "Compose up uses its independent hard wall-clock timeout"
+
+TEST_BOOTSTRAP_TIMEOUT=2
+TEST_DOCKER_TIMEOUT=30
+TEST_DOCKER_HANG_ON=compose-ps
+TEST_DOCKER_HANG_PID_FILE="${TEST_ROOT}/compose-ps-hang.pid"
+rm -f -- "$TEST_DOCKER_HANG_PID_FILE"
+WAIT_HANG_OUTPUT="${TEST_ROOT}/compose-ps-hang.out"
+HANG_STARTED=$SECONDS
+if run_bootstrap > "$WAIT_HANG_OUTPUT" 2>&1; then
+  fail "bootstrap accepted a hung container recovery query"
+fi
+HANG_ELAPSED=$((SECONDS - HANG_STARTED))
+[ "$HANG_ELAPSED" -le 4 ] ||
+  fail "container wait exceeded its 2s stage budget: ${HANG_ELAPSED}s"
+assert_contains "$WAIT_HANG_OUTPUT" \
+  'container did not become running and healthy within 2s'
+assert_hung_process_reaped "$TEST_DOCKER_HANG_PID_FILE" "container wait timeout"
+TEST_DOCKER_HANG_ON=""
+TEST_DOCKER_HANG_PID_FILE=""
+TEST_DOCKER_TIMEOUT=""
+TEST_BOOTSTRAP_TIMEOUT=1
+pass "container recovery Docker queries are clamped to the remaining stage budget"
 
 TEST_CONTAINER_STATE=exited
 CONTAINER_OUTPUT="${TEST_ROOT}/container.out"
@@ -1012,6 +1359,31 @@ fi
 assert_contains "$HEALTH_OUTPUT" 'container did not become running and healthy'
 TEST_HEALTH=healthy
 pass "container health verification failure"
+
+# Leave enough budget for the independently bounded container metadata queries.
+TEST_BOOTSTRAP_TIMEOUT=2
+
+WRONG_IMAGE="registry.example/cf-agent-wechat@sha256:$(printf 'b%.0s' {1..64})"
+TEST_CONTAINER_IMAGE="$WRONG_IMAGE"
+IMAGE_IDENTITY_OUTPUT="${TEST_ROOT}/image-identity.out"
+if run_bootstrap > "$IMAGE_IDENTITY_OUTPUT" 2>&1; then
+  fail "bootstrap accepted a container running the wrong image"
+fi
+assert_contains "$IMAGE_IDENTITY_OUTPUT" \
+  "container image does not match AGENT_WECHAT_IMAGE (expected: $IMAGE, found: $WRONG_IMAGE)"
+TEST_CONTAINER_IMAGE=""
+pass "runtime image identity verification failure"
+
+TEST_CONTAINER_INSPECT_NAME=/wrong-agent-wechat
+NAME_IDENTITY_OUTPUT="${TEST_ROOT}/name-identity.out"
+if run_bootstrap > "$NAME_IDENTITY_OUTPUT" 2>&1; then
+  fail "bootstrap accepted an unexpected runtime container name"
+fi
+assert_contains "$NAME_IDENTITY_OUTPUT" \
+  'container name does not match AGENT_WECHAT_CONTAINER_NAME (expected: /cf-agent-wechat, found: /wrong-agent-wechat)'
+TEST_CONTAINER_INSPECT_NAME=""
+pass "runtime container-name identity verification failure"
+
 
 TEST_RESTART_POLICY=always
 RESTART_OUTPUT="${TEST_ROOT}/restart.out"
@@ -1077,6 +1449,26 @@ assert_contains "$PORT_BINDING_OUTPUT" 'container port 6174/tcp must bind to 127
 TEST_PORT_BINDING=""
 pass "runtime loopback port binding verification failure"
 
+TEST_BOOTSTRAP_TIMEOUT=2
+TEST_API_MODE=health-fail
+HEALTH_API_OUTPUT="${TEST_ROOT}/health-api.out"
+if run_bootstrap > "$HEALTH_API_OUTPUT" 2>&1; then
+  fail "bootstrap accepted an unavailable health API"
+fi
+assert_contains "$HEALTH_API_OUTPUT" 'health API did not become ready within 2s'
+TEST_API_MODE=ready
+pass "health API transport failure gate"
+
+TEST_API_MODE=auth-fail
+AUTH_API_OUTPUT="${TEST_ROOT}/auth-api.out"
+if run_bootstrap > "$AUTH_API_OUTPUT" 2>&1; then
+  fail "bootstrap accepted an unavailable authenticated API"
+fi
+assert_contains "$AUTH_API_OUTPUT" \
+  'authenticated status API did not reach a supported ready state within 2s (last status: unavailable)'
+TEST_API_MODE=ready
+pass "authenticated API transport failure gate"
+
 TEST_API_MODE=invalid-json
 API_OUTPUT="${TEST_ROOT}/api.out"
 if run_bootstrap > "$API_OUTPUT" 2>&1; then
@@ -1084,7 +1476,7 @@ if run_bootstrap > "$API_OUTPUT" 2>&1; then
 fi
 assert_contains "$API_OUTPUT" 'last status: invalid_response'
 TEST_API_MODE=ready
-pass "authenticated API verification failure"
+pass "authenticated API response validation failure"
 
 TOKEN_ID_FINAL="$($REAL_STAT -c '%i:%Y:%s' "${RUNTIME_ROOT}/secrets/auth-token")"
 [ "$TOKEN_ID_BEFORE" = "$TOKEN_ID_FINAL" ] || fail "a failure path replaced the auth token"

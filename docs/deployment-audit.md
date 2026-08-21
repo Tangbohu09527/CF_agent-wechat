@@ -16,9 +16,9 @@ fresh QR 登录、自动化测试和部署文档。历史实验 Compose、Gatewa
 | --- | --- | --- | --- |
 | 生产入口 | 历史 Compose 与手工变量可造成不同部署结果 | 固定生产 Compose、env、项目名、服务名和网络；拒绝危险覆盖 | deployment suite、Compose JSON validator |
 | 新机初始化 | 目录、网络、Token、Compose 和启动需要分散人工操作 | bootstrap 一次执行检查 Docker/Compose、创建或校验 runtime、启动并验证服务 | `tests/deployment/bootstrap_cfserver.sh` |
-| 配置权威 | stale shell 变量或 source env 可切换端口、容器或持久根 | 安全解析固定 `docker/.env`；显式值必须一致；不执行文件内容 | `tests/integration/management_environment.sh` |
+| 配置权威 | stale shell 变量、丢失 env 或所有者漂移可切换部署输入 | 安全解析固定 `docker/.env`；缺失、owner/mode/hardlink 漂移时 fail closed；显式值必须一致 | management、permission 和 deployment suites |
 | runtime 恢复 | 空路径、部分恢复或新 Token 可掩盖数据丢失 | `data`、`wechat-home`、原 Token 和权限设置按同一单元校验，部分状态 fail closed | deployment suite |
-| 容器恢复 | 进程退出或主机重启后需要人工发现和启动 | `restart: unless-stopped`，检查 Docker 开机恢复状态并提供有界状态等待 | deployment suite、session recovery |
+| 容器恢复 | 进程退出、daemon 卡死或主机重启后恢复证据不足 | `unless-stopped`；systemd/Docker service fail closed；Docker/Compose 硬超时；生产 Compose mock 恢复 E2E | deployment suite、Compose recovery E2E、session recovery |
 | session 恢复 | 每次重启都扫码会破坏可恢复会话 | `logged_in` 直接复用；只有明确需要登录才进入 QR | session recovery |
 | fresh QR | 旧 QR、无 QR success、窄终端或非 TTY 可误报 | 只接受本次 `newAccount=true` WebSocket 实际渲染的新 QR，并复核最终 auth | QR unit tests |
 | Token 边界 | 不安全文件、控制字符或远端 API 可泄露 Token | 固定 owner/mode/type/长度/单行门禁，管理 API 仅允许权威 loopback | management and permission suites |

@@ -64,16 +64,34 @@ validate_render() {
       -f "$COMPOSE_FILE" \
       config --format json > "$json_file"
 
-  "$PYTHON_BIN" - "$json_file" "$runtime_root" "$label" <<'PY'
+  "$PYTHON_BIN" - "$json_file" "$runtime_root" "$label" "$IMAGE" <<'PY'
 import json
 import sys
 
-config_path, runtime_root, label = sys.argv[1:]
+config_path, runtime_root, label, expected_image = sys.argv[1:]
 with open(config_path, encoding="utf-8") as handle:
     config = json.load(handle)
 
 service = config["services"]["agent-wechat"]
+assert service.get("container_name") == "cf-agent-wechat", (
+    label, service.get("container_name"))
+assert service.get("image") == expected_image, (
+    label, service.get("image"), expected_image)
 assert service.get("restart") == "unless-stopped", (label, service.get("restart"))
+
+healthcheck = service.get("healthcheck", {})
+assert healthcheck.get("test") == [
+    "CMD",
+    "curl",
+    "--fail",
+    "--silent",
+    "--show-error",
+    "http://127.0.0.1:6174/health",
+], (label, healthcheck)
+assert healthcheck.get("interval") == "30s", (label, healthcheck)
+assert healthcheck.get("timeout") == "5s", (label, healthcheck)
+assert healthcheck.get("retries") == 5, (label, healthcheck)
+assert healthcheck.get("start_period") == "1m30s", (label, healthcheck)
 
 volumes = {volume["target"]: volume for volume in service.get("volumes", [])}
 expected = {
@@ -81,7 +99,7 @@ expected = {
     "/home/wechat": f"{runtime_root}/wechat-home",
     "/data/auth-token": f"{runtime_root}/secrets/auth-token",
 }
-assert set(expected).issubset(volumes), (label, volumes)
+assert set(volumes) == set(expected), (label, volumes)
 for target, source in expected.items():
     volume = volumes[target]
     assert volume.get("type") == "bind", (label, target, volume)
@@ -103,7 +121,7 @@ assert port.get("host_ip") == "127.0.0.1", (label, port)
 assert port.get("protocol") == "tcp", (label, port)
 
 service_networks = service.get("networks", {})
-assert "cf-internal" in service_networks
+assert set(service_networks) == {"cf-internal"}, (label, service_networks)
 aliases = service_networks["cf-internal"].get("aliases", [])
 assert "cf-agent-wechat" in aliases, (label, aliases)
 network = config.get("networks", {}).get("cf-internal", {})

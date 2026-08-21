@@ -5,8 +5,13 @@ REPO_ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd -P)"
 TEST_ROOT=""
 STATUS_PID=""
 LOCK_PID=""
+HANG_PID_FILE=""
 TEST_PYTHON=""
 HOST_KERNEL=""
+TEST_STATUS_WAIT_TIMEOUT=8
+TEST_DOCKER_INSPECT_TIMEOUT=10
+TEST_DOCKER_HANG_ON=""
+TEST_DOCKER_HANG_PID_FILE=""
 
 fail() {
   printf 'FAIL: %s\n' "$*" >&2
@@ -26,6 +31,22 @@ assert_status_field() {
   ' "$file" || fail "$label did not report $expected"
 }
 
+assert_hung_process_reaped() {
+  local pid_file="$1"
+  local label="$2"
+  local pid attempt
+
+  [ -s "$pid_file" ] || fail "$label did not record its PID"
+  pid="$(cat "$pid_file")"
+  for attempt in {1..20}; do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      return
+    fi
+    sleep 0.1
+  done
+  fail "$label left timed-out process $pid running"
+}
+
 cleanup() {
   set +e
   if [ -n "$STATUS_PID" ]; then
@@ -36,13 +57,16 @@ cleanup() {
     kill "$LOCK_PID" 2>/dev/null
     wait "$LOCK_PID" 2>/dev/null
   fi
+  if [ -n "$HANG_PID_FILE" ] && [ -s "$HANG_PID_FILE" ]; then
+    kill -KILL "$(cat "$HANG_PID_FILE")" 2>/dev/null
+  fi
   if [ -n "$TEST_ROOT" ]; then
     rm -rf -- "$TEST_ROOT"
   fi
 }
 trap cleanup EXIT
 
-for command_name in awk bash env grep install mktemp sleep uname; do
+for command_name in awk bash env grep install mktemp sleep timeout uname; do
   command -v "$command_name" >/dev/null 2>&1 ||
     fail "missing command: $command_name"
 done
@@ -65,6 +89,7 @@ done
 TEST_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/cf-wechat-recovery.XXXXXX")"
 RUNTIME_ROOT="${TEST_ROOT}/runtime"
 MOCK_BIN="${TEST_ROOT}/bin"
+MANAGEMENT_ROOT="${TEST_ROOT}/repo"
 DOCKER_STATE="${TEST_ROOT}/docker.state"
 API_STATE="${TEST_ROOT}/api.state"
 AUTH_STATE="${TEST_ROOT}/auth.state"
@@ -75,6 +100,35 @@ TOKEN_FILE_PATH="${RUNTIME_ROOT}/secrets/auth-token"
 LOGIN_HOME="${TEST_ROOT}/login-home"
 
 install -d -m 755 "$MOCK_BIN"
+install -d -m 755 "${MANAGEMENT_ROOT}/docker" "${MANAGEMENT_ROOT}/scripts"
+install -m 755 \
+  "${REPO_ROOT}/scripts/common.sh" \
+  "${REPO_ROOT}/scripts/status.sh" \
+  "${REPO_ROOT}/scripts/login.sh" \
+  "${REPO_ROOT}/scripts/qr_login.py" \
+  "${MANAGEMENT_ROOT}/scripts/"
+install -m 644 "${REPO_ROOT}/scripts/requirements.txt" "${MANAGEMENT_ROOT}/scripts/"
+install -m 644 "${REPO_ROOT}/docker/compose.cfserver.yaml" "${MANAGEMENT_ROOT}/docker/"
+printf '%s\n' \
+  "CF_AGENT_WECHAT_RUNTIME_ROOT=$RUNTIME_ROOT" \
+  'AGENT_WECHAT_BIND_IP=127.0.0.1' \
+  'AGENT_WECHAT_PORT=6174' \
+  'AGENT_WECHAT_CONTAINER_NAME=cf-agent-wechat' > "${MANAGEMENT_ROOT}/docker/.env"
+chmod 600 "${MANAGEMENT_ROOT}/docker/.env"
+if [ "$HOST_KERNEL" != Linux ]; then
+  REAL_STAT="$(command -v stat)"
+  install -m 755 "${REPO_ROOT}/tests/helpers/mock_management_stat.sh" "${MOCK_BIN}/stat"
+  export CF_TEST_REAL_STAT="$REAL_STAT"
+  export CF_TEST_STAT_REPO_ROOT="$MANAGEMENT_ROOT"
+  export CF_TEST_STAT_DOCKER_DIR="${MANAGEMENT_ROOT}/docker"
+  export CF_TEST_STAT_COMPOSE_FILE="${MANAGEMENT_ROOT}/docker/compose.cfserver.yaml"
+  export CF_TEST_STAT_ENV_FILE="${MANAGEMENT_ROOT}/docker/.env"
+  export CF_TEST_CURRENT_UID="$(id -u)"
+  export CF_TEST_FORCE_STAT_FIXTURE_METADATA=1
+  PATH="${MOCK_BIN}:${PATH}"
+  export PATH
+fi
+
 if [ "$(/usr/bin/uname -s)" = "Linux" ]; then
   install -d -m 700 "$LOGIN_HOME" "$RUNTIME_ROOT/secrets"
 else
@@ -95,15 +149,18 @@ run_status() {
     CURL_BIN="${MOCK_BIN}/curl" \
     DOCKER_BIN="${MOCK_BIN}/docker" \
     PYTHON_BIN="$TEST_PYTHON" \
-    STATUS_WAIT_TIMEOUT=8 \
+    STATUS_WAIT_TIMEOUT="$TEST_STATUS_WAIT_TIMEOUT" \
     STATUS_POLL_INTERVAL=1 \
+    DOCKER_INSPECT_TIMEOUT="$TEST_DOCKER_INSPECT_TIMEOUT" \
+    CF_TEST_DOCKER_HANG_ON="$TEST_DOCKER_HANG_ON" \
+    CF_TEST_DOCKER_HANG_PID_FILE="$TEST_DOCKER_HANG_PID_FILE" \
     CF_TEST_DOCKER_STATE_FILE="$DOCKER_STATE" \
     CF_TEST_API_STATE_FILE="$API_STATE" \
     CF_TEST_AUTH_STATE_FILE="$AUTH_STATE" \
     CF_TEST_TOKEN_FILE="$TOKEN_FILE_PATH" \
     CF_TEST_REQUEST_LOG="$REQUEST_LOG" \
     AUTH_TOKEN=must-be-cleared \
-    bash "${REPO_ROOT}/scripts/status.sh" "$@"
+    bash "${MANAGEMENT_ROOT}/scripts/status.sh" "$@"
 }
 
 run_login() {
@@ -118,7 +175,7 @@ run_login() {
     CF_TEST_TOKEN_FILE="$TOKEN_FILE_PATH" \
     CF_TEST_REQUEST_LOG="$REQUEST_LOG" \
     AUTH_TOKEN=must-be-cleared \
-    bash "${REPO_ROOT}/scripts/login.sh" "$@"
+    bash "${MANAGEMENT_ROOT}/scripts/login.sh" "$@"
 }
 
 assert_token_rejected() {
@@ -135,7 +192,7 @@ for invalid_session in other $'default\001injected'; do
   session_error="$(
     SESSION_ID="$invalid_session" bash -c \
       'source "$1"; validate_configuration || printf "%s" "$LAST_ERROR"' \
-      cf-wechat-recovery "$REPO_ROOT/scripts/common.sh"
+      cf-wechat-recovery "$MANAGEMENT_ROOT/scripts/common.sh"
   )"
   case "$session_error" in
     *'生产 SESSION_ID 必须是 default'*) ;;
@@ -153,7 +210,7 @@ for escaped_control in '\u0001' '\u001f' '\u007f'; do
       else
         printf REJECTED
       fi
-    ' cf-wechat-recovery "$REPO_ROOT/scripts/common.sh" \
+    ' cf-wechat-recovery "$MANAGEMENT_ROOT/scripts/common.sh" \
       "{\"status\":\"logged${escaped_control}in\"}" 2>&1
   )"
   case "$auth_parse_output" in
@@ -165,10 +222,75 @@ printf 'PASS auth status rejects all C0 and DEL controls\n'
 
 default_wait="$(
   bash -c 'source "$1"; printf "%s" "$STATUS_WAIT_TIMEOUT"' \
-    cf-wechat-recovery "$REPO_ROOT/scripts/common.sh"
+    cf-wechat-recovery "$MANAGEMENT_ROOT/scripts/common.sh"
 )"
 [ "$default_wait" = 180 ] || fail "default STATUS_WAIT_TIMEOUT is not 180 seconds"
-printf 'PASS status wait default is 180 seconds\n'
+default_inspect_timeout="$(
+  bash -c 'source "$1"; printf "%s" "$DOCKER_INSPECT_TIMEOUT"' \
+    cf-wechat-recovery "$MANAGEMENT_ROOT/scripts/common.sh"
+)"
+[ "$default_inspect_timeout" = 10 ] ||
+  fail "default DOCKER_INSPECT_TIMEOUT is not 10 seconds"
+invalid_inspect_timeout="$(
+  DOCKER_INSPECT_TIMEOUT=0 bash -c '
+    source "$1"
+    validate_configuration || printf "%s" "$LAST_ERROR"
+  ' cf-wechat-recovery "$MANAGEMENT_ROOT/scripts/common.sh"
+)"
+case "$invalid_inspect_timeout" in
+  *'DOCKER_INSPECT_TIMEOUT 必须是正整数秒'*) ;;
+  *) fail "invalid DOCKER_INSPECT_TIMEOUT was not rejected" ;;
+esac
+printf 'PASS status wait and Docker inspect timeout defaults are validated\n'
+
+printf '%s\n' 'running healthy' > "$DOCKER_STATE"
+printf '%s\n' 'reachable' > "$API_STATE"
+printf '%s\n' 'logged_in' > "$AUTH_STATE"
+TEST_STATUS_WAIT_TIMEOUT=2
+TEST_DOCKER_INSPECT_TIMEOUT=30
+for hang_target in state health; do
+  TEST_DOCKER_HANG_ON="$hang_target"
+  TEST_DOCKER_HANG_PID_FILE="${TEST_ROOT}/status-${hang_target}-hang.pid"
+  HANG_PID_FILE="$TEST_DOCKER_HANG_PID_FILE"
+  rm -f -- "$TEST_DOCKER_HANG_PID_FILE"
+  HANG_STARTED=$SECONDS
+  if run_status --wait > "$STATUS_OUTPUT" 2>&1; then
+    fail "status --wait accepted a hung Docker $hang_target inspect"
+  else
+    status_code=$?
+  fi
+  HANG_ELAPSED=$((SECONDS - HANG_STARTED))
+  [ "$status_code" -eq 1 ] ||
+    fail "hung Docker $hang_target inspect returned $status_code, expected 1"
+  [ "$HANG_ELAPSED" -le 4 ] ||
+    fail "hung Docker $hang_target inspect exceeded 2s total budget: ${HANG_ELAPSED}s"
+  grep -q '等待恢复的 2 秒轮询预算已耗尽' "$STATUS_OUTPUT" ||
+    fail "hung Docker $hang_target inspect did not report exhausted total budget"
+  assert_hung_process_reaped "$TEST_DOCKER_HANG_PID_FILE" \
+    "status $hang_target inspect timeout"
+  HANG_PID_FILE=""
+done
+TEST_DOCKER_HANG_ON=state
+TEST_DOCKER_HANG_PID_FILE="${TEST_ROOT}/status-nonwait-hang.pid"
+HANG_PID_FILE="$TEST_DOCKER_HANG_PID_FILE"
+TEST_DOCKER_INSPECT_TIMEOUT=1
+rm -f -- "$TEST_DOCKER_HANG_PID_FILE"
+HANG_STARTED=$SECONDS
+if run_status > "$STATUS_OUTPUT" 2>&1; then
+  fail "status accepted a hung Docker inspect without --wait"
+fi
+HANG_ELAPSED=$((SECONDS - HANG_STARTED))
+[ "$HANG_ELAPSED" -le 3 ] ||
+  fail "non-wait Docker inspect exceeded 1s command timeout: ${HANG_ELAPSED}s"
+assert_hung_process_reaped "$TEST_DOCKER_HANG_PID_FILE" \
+  "non-wait status inspect timeout"
+HANG_PID_FILE=""
+TEST_DOCKER_HANG_ON=""
+TEST_DOCKER_HANG_PID_FILE=""
+TEST_DOCKER_INSPECT_TIMEOUT=10
+TEST_STATUS_WAIT_TIMEOUT=8
+printf 'PASS status Docker state/health inspect hard timeouts obey total and per-command budgets\n'
+
 printf '%s\n' 'stopped none' > "$DOCKER_STATE"
 printf '%s\n' 'unreachable' > "$API_STATE"
 printf '%s\n' 'logged_in' > "$AUTH_STATE"
@@ -286,44 +408,44 @@ derived_token="$(
   env -u TOKEN_FILE -u CF_AGENT_WECHAT_RUNTIME_ROOT \
     CF_RUNTIME_ROOT="$RUNTIME_ROOT" bash -c \
     'source "$1"; printf "%s" "$TOKEN_FILE"' \
-    cf-wechat-recovery "${REPO_ROOT}/scripts/common.sh"
+    cf-wechat-recovery "${MANAGEMENT_ROOT}/scripts/common.sh"
 )"
 [ "$derived_token" = "$TOKEN_FILE_PATH" ] ||
   fail "CF_RUNTIME_ROOT did not derive the expected token path"
 custom_error="$(
   env -u TOKEN_FILE -u CF_AGENT_WECHAT_RUNTIME_ROOT \
     CF_RUNTIME_ROOT="${TEST_ROOT}/missing-runtime" bash -c \
-    'source "$1"; load_auth_token || printf "%s" "$LAST_ERROR"' \
-    cf-wechat-recovery "${REPO_ROOT}/scripts/common.sh"
+    'source "$1"; validate_configuration || printf "%s" "$LAST_ERROR"' \
+    cf-wechat-recovery "${MANAGEMENT_ROOT}/scripts/common.sh"
 )"
 case "$custom_error" in
-  *'sudo 自动读取仅允许批准路径 /srv/storage/cf-agent-wechat/secrets/auth-token'*) ;;
-  *) fail "custom unreadable token did not preserve the fixed sudo boundary" ;;
+  *'CF_RUNTIME_ROOT 与 docker/.env'*) ;;
+  *) fail "process runtime override did not fail against persisted authority" ;;
 esac
-printf 'PASS custom runtime token derivation preserves fixed sudo boundary\n'
+printf 'PASS persisted runtime authority rejects a conflicting process override\n'
 
 for path_kind in runtime token; do
   if [ "$path_kind" = runtime ]; then
     path_error="$(
       CF_RUNTIME_ROOT=$'/srv/recovery\001bad' bash -c \
         'source "$1"; validate_configuration || printf "%s" "$LAST_ERROR"' \
-        cf-wechat-recovery "$REPO_ROOT/scripts/common.sh"
+        cf-wechat-recovery "$MANAGEMENT_ROOT/scripts/common.sh"
     )"
-    expected_path_error='CF_RUNTIME_ROOT 包含不允许的路径或控制字符'
+    expected_path_error='CF_RUNTIME_ROOT 与 docker/.env'
   else
     path_error="$(
       TOKEN_FILE=$'/srv/recovery\177bad' bash -c \
         'source "$1"; validate_configuration || printf "%s" "$LAST_ERROR"' \
-        cf-wechat-recovery "$REPO_ROOT/scripts/common.sh"
+        cf-wechat-recovery "$MANAGEMENT_ROOT/scripts/common.sh"
     )"
-    expected_path_error='TOKEN_FILE 包含不允许的路径或控制字符'
+    expected_path_error='TOKEN_FILE 必须精确匹配 docker/.env'
   fi
   case "$path_error" in
     *"$expected_path_error"*) ;;
     *) fail "$path_kind path accepted a non-CR/LF/TAB control" ;;
   esac
 done
-printf 'PASS process runtime and token paths reject all control characters\n'
+printf 'PASS persisted runtime and token authority reject control-character overrides\n'
 
 if [ "$HOST_KERNEL" = Linux ]; then
   LOCK_HOME="${TEST_ROOT}/lock-home"
@@ -342,7 +464,7 @@ if [ "$HOST_KERNEL" = Linux ]; then
       while [ ! -e "$3" ]; do
         sleep 0.05
       done
-    ' cf-wechat-recovery "$REPO_ROOT/scripts/login.sh" "$LOCK_READY" "$LOCK_RELEASE"
+    ' cf-wechat-recovery "$MANAGEMENT_ROOT/scripts/login.sh" "$LOCK_READY" "$LOCK_RELEASE"
   ) &
   LOCK_PID=$!
   for _attempt in {1..100}; do
@@ -360,7 +482,7 @@ if [ "$HOST_KERNEL" = Linux ]; then
       else
         printf "%s" "$LAST_ERROR"
       fi
-    ' cf-wechat-recovery "$REPO_ROOT/scripts/login.sh"
+    ' cf-wechat-recovery "$MANAGEMENT_ROOT/scripts/login.sh"
   )"
   case "$lock_error" in
     *'已有登录流程正在运行'*) ;;

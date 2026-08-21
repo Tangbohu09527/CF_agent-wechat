@@ -8,6 +8,14 @@
 > `login.sh` 会安全读取它。非标准 runtime 必须由同一固定管理用户持有 `secrets`
 > （mode `700`）和 Token（mode `600`）；自定义路径不支持 ACL/`0640`。不要通过
 > stale shell 变量覆盖 `.env`，也不要混用 root 与普通用户运行管理脚本。
+> 若该文件缺失，两个管理脚本都会 fail closed；已有 runtime 时 bootstrap 也不会猜测或
+> 重建配置，必须先从同一恢复单元还原匹配的 `docker/.env`。
+
+所有恢复路径都必须操作 systemd 管理的本机 rootful Docker，使用 `default` context 和
+`unix:///var/run/docker.sock`；rootless 或远程 daemon 不受支持。运行前不得设置
+`DOCKER_HOST`、`DOCKER_CONTEXT`、`DOCKER_TLS_VERIFY` 或 `DOCKER_CERT_PATH`。
+普通用户需要提权时，脚本会先以前台 `sudo -v` 授权，再让受超时保护的调用使用
+非交互 `sudo -n`；下列手工 Docker 命令也遵循同一顺序。
 
 ## 恢复模型
 
@@ -38,6 +46,12 @@ cd /opt/cf-agent-wechat
 3. 宿主 `/health` 是否可访问；
 4. `/api/status/auth` 是否为 `logged_in`。
 
+`DOCKER_INSPECT_TIMEOUT=10` 是每次 `docker inspect` 的独立硬上限。在 `--wait` 模式下，
+单次查询实际使用该值与整体预算剩余时间中的较小值，并在普通用户查询失败转入 sudo
+fallback 前再次计算剩余时间。`STATUS_WAIT_TIMEOUT=180` 才是整个轮询阶段的总预算。
+只有确认本机 daemon 正常但单次 inspect 确实超过 10 秒时才临时调大单次上限；这不会
+延长 `STATUS_WAIT_TIMEOUT`。
+
 结果：
 
 - 返回 `0`：会话已恢复，可以继续服务；
@@ -51,7 +65,8 @@ cd /opt/cf-agent-wechat
 
 ```bash
 cd /opt/cf-agent-wechat
-sudo env \
+sudo -v
+sudo -n -- env \
   -u AGENT_WECHAT_IMAGE \
   -u AGENT_WECHAT_BIND_IP \
   -u AGENT_WECHAT_PORT \
@@ -61,7 +76,11 @@ sudo env \
   -u PROXY \
   -u RUST_LOG \
   -u COMPOSE_PROJECT_NAME \
-  docker compose \
+  -u DOCKER_HOST \
+  -u DOCKER_CONTEXT \
+  -u DOCKER_TLS_VERIFY \
+  -u DOCKER_CERT_PATH \
+  docker --host unix:///var/run/docker.sock compose \
   --env-file docker/.env \
   --project-directory "$PWD" \
   --project-name cf-agent-wechat \
@@ -136,7 +155,8 @@ API 不可用时不要反复扫码；先修复基础服务。
 5. 按 `docker/.env` 中持久化的 UID/GID/mode 恢复目录和 Token 元数据；默认值为数据目录
    `1000:1000 0700`、secrets `root:root 0700`、Token `root:root 0600`；
 6. 运行 bootstrap，随后执行 `status.sh --wait`；
-7. 只有 auth 为 `logged_out` 时才运行 `login.sh`。
+7. auth 为 `logged_out`、处于需要登录的等待态，或 `status.sh` 返回 `2` 时才运行
+   `login.sh`。
 
 不要把备份 `data` 与新生成的 Token 混用，也不要只恢复空的 `wechat-home`。恢复工具和
 存储平台各异，具体复制命令应由备份系统 runbook 给出；本项目不会自动删除被隔离现场。

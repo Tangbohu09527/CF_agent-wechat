@@ -27,10 +27,13 @@
 推荐至少 2 CPU、2 GB RAM、10 GB 可用磁盘。部署前确认：
 
 - Debian 主机时间同步正常；
-- 已安装 Docker Engine，Docker daemon 已启动；
-- `docker compose version` 返回 Compose v2；
-- 已安装 Bash、coreutils、util-linux（含 `flock`）、`curl`、`openssl`、Python 3 和
-  `python3-venv`；
+- 已安装由 systemd 管理的本机 rootful Docker Engine，`docker.service` 已启动并启用；
+- Docker context 为 `default`，其 endpoint 为 `unix:///var/run/docker.sock`；
+- `docker --host unix:///var/run/docker.sock compose version` 返回 Compose v2；
+- 当前 shell 未设置 `DOCKER_HOST`、`DOCKER_CONTEXT`、`DOCKER_TLS_VERIFY` 或
+  `DOCKER_CERT_PATH`；rootless 和远程 Docker daemon 不受支持；
+- 已安装 Bash、coreutils（含 GNU `timeout`）、util-linux（含 `flock`）、`curl`、
+  `openssl`、Python 3 和 `python3-venv`；
 - 主机可访问批准的容器镜像仓库和 Python 包源，或已预置登录 venv；
 - 有 root 或 sudo 权限；
 - 已取得批准的代码版本和 `agent-wechat` 镜像 digest。
@@ -53,6 +56,13 @@ bootstrap 负责检查 Docker 和 Compose，不静默安装或升级它们。检
 | `CF_BOOTSTRAP_POLL_INTERVAL` | `2` | 等待轮询间隔秒数 |
 | `CF_BOOTSTRAP_HTTP_CONNECT_TIMEOUT` | `3` | 单次 HTTP 连接超时秒数 |
 | `CF_BOOTSTRAP_HTTP_TIMEOUT` | `45` | 单次 HTTP 请求超时秒数；会限制在当前阶段剩余时间内 |
+| `CF_BOOTSTRAP_DOCKER_TIMEOUT` | `30` | 单次 Docker/Compose 元数据、配置或 inspect 命令的硬上限（秒）；container 阶段还会限制在剩余阶段预算内 |
+| `CF_BOOTSTRAP_COMPOSE_UP_TIMEOUT` | `900` | `docker compose up -d` 的独立硬上限（秒），包含镜像拉取和容器协调 |
+
+Docker CLI 超时会非零退出。`compose up` 超时不表示 runtime 或微信 session 已损坏；Docker
+daemon 可能仍在完成已经提交的拉取或创建操作。先检查 daemon、镜像仓库和磁盘，再原样重跑
+bootstrap，让固定 Compose 项目幂等收敛。不要因超时删除 `data`、`wechat-home`、Token 或
+`docker/.env`。
 
 Compose 内部兼容变量 `CF_AGENT_WECHAT_RUNTIME_ROOT` 由 bootstrap 映射到
 `CF_RUNTIME_ROOT`；运维时两者必须指向同一绝对路径。不要让 Compose 和管理脚本使用
@@ -66,6 +76,11 @@ Compose 内部兼容变量 `CF_AGENT_WECHAT_RUNTIME_ROOT` 由 bootstrap 映射�
 现有生产 `docker/.env` 的权限只能是 `0600` 或受控组可读的 `0640`；bootstrap 新建时
 固定使用 `0600`。不得使用 `0644` 或更宽权限。
 
+代码根和 `docker/` 目录必须由 root 或当前固定管理用户持有，且不能被 group/other 写入。
+固定生产 Compose 与 `docker/.env` 还必须分别是 root 或该固定用户持有的非符号链接普通文件，
+hardlink 计数必须为 `1`。这些约束阻止未批准账号替换部署输入；`status.sh` 和 `login.sh` 在
+`docker/.env` 缺失时会拒绝执行，不接受进程环境变量替代。
+
 ## 4. 首次部署
 
 把批准的仓库检出放在目标目录，并确保 shell 脚本使用 LF 换行。首次运行时，如果生产
@@ -77,8 +92,14 @@ AGENT_WECHAT_IMAGE='ghcr.io/thisnick/agent-wechat@sha256:<APPROVED_DIGEST>' \
   ./scripts/bootstrap-cfserver.sh
 ```
 
-推荐由具备 sudo 权限的普通运维用户直接执行；脚本只在需要时调用 sudo。不要使用裸
+推荐由具备 sudo 权限的普通运维用户直接执行；脚本只在需要时调用 sudo。Docker socket
+需要提权时，脚本先在前台执行 `sudo -v` 完成授权，随后所有受硬超时保护的 Docker
+调用只使用 `sudo -n`，不会在后台超时命令中等待密码。不要使用裸
 `sudo ./scripts/bootstrap-cfserver.sh` 丢失镜像或路径环境变量。
+
+生产 bootstrap 要求主机使用 systemd，`systemctl is-system-running` 必须为 `running`
+或 `degraded`，且 `docker.service` 必须为 `enabled`。缺少 systemctl 或 systemd
+处于 `starting`、`offline` 等状态时脚本会终止，因为无法保证主机重启后的自动恢复。
 
 非标准布局示例：
 
@@ -137,10 +158,13 @@ UID/GID `1000:1000` 是当前镜像中的 `wechat` 用户假设。升级镜像�
 ```bash
 set -eu
 AGENT_WECHAT_IMAGE='ghcr.io/thisnick/agent-wechat@sha256:<APPROVED_DIGEST>'
-sudo docker pull "$AGENT_WECHAT_IMAGE"
-WECHAT_UID="$(sudo docker run --rm --entrypoint /usr/bin/id \
+sudo -v
+sudo -n -- docker --host unix:///var/run/docker.sock pull "$AGENT_WECHAT_IMAGE"
+WECHAT_UID="$(sudo -n -- docker --host unix:///var/run/docker.sock run \
+  --rm --entrypoint /usr/bin/id \
   "$AGENT_WECHAT_IMAGE" -u wechat)"
-WECHAT_GID="$(sudo docker run --rm --entrypoint /usr/bin/id \
+WECHAT_GID="$(sudo -n -- docker --host unix:///var/run/docker.sock run \
+  --rm --entrypoint /usr/bin/id \
   "$AGENT_WECHAT_IMAGE" -g wechat)"
 [[ "$WECHAT_UID" =~ ^[0-9]+$ && "$WECHAT_GID" =~ ^[0-9]+$ ]]
 printf 'wechat uid=%s gid=%s\n' "$WECHAT_UID" "$WECHAT_GID"
@@ -186,7 +210,8 @@ cd /opt/cf-agent-wechat
 
 ```bash
 cd /opt/cf-agent-wechat
-sudo env \
+sudo -v
+sudo -n -- env \
   -u AGENT_WECHAT_IMAGE \
   -u AGENT_WECHAT_BIND_IP \
   -u AGENT_WECHAT_PORT \
@@ -196,7 +221,11 @@ sudo env \
   -u PROXY \
   -u RUST_LOG \
   -u COMPOSE_PROJECT_NAME \
-  docker compose \
+  -u DOCKER_HOST \
+  -u DOCKER_CONTEXT \
+  -u DOCKER_TLS_VERIFY \
+  -u DOCKER_CERT_PATH \
+  docker --host unix:///var/run/docker.sock compose \
   --env-file docker/.env \
   --project-directory "$PWD" \
   --project-name cf-agent-wechat \
@@ -215,7 +244,8 @@ sudo env \
 ## 8. 验收清单
 
 - [ ] 代码 Commit 和镜像 digest 已记录并批准。
-- [ ] Docker daemon 开机启动，Compose v2 可用。
+- [ ] 本机 rootful Docker daemon 开机启动，`default` context 指向
+  `unix:///var/run/docker.sock`，Compose v2 可用。
 - [ ] 生产 Compose 是 `docker/compose.cfserver.yaml`。
 - [ ] 宿主端口只绑定 `127.0.0.1`。
 - [ ] `data`、`wechat-home`、`secrets/auth-token` 位于批准的持久文件系统。

@@ -5,8 +5,8 @@
 
 V1 Beta 生产基线采用持久会话：宿主机上的 `data/`、`wechat-home/` 和
 `secrets/auth-token` 会跨容器和主机重启保留。服务重启后先尝试恢复原微信会话；只有
-认证状态明确为 `logged_out` 时才重新扫码。部署或排障时不要删除这些目录来“重置”
-服务。
+`status.sh` 返回 `2`，即认证状态为 `logged_out` 或登录等待态时，才重新扫码。部署或
+排障时不要删除这些目录来“重置”服务。
 
 ## 生产基线
 
@@ -23,8 +23,17 @@ V1 Beta 生产基线采用持久会话：宿主机上的 `data/`、`wechat-home/
 
 ## 快速部署
 
-前置条件是 Debian 主机已安装 Docker Engine、Docker Compose v2、`curl`、`openssl`、util-linux（含 `flock`）
-和 Python 3，且批准的代码已位于目标目录。首次启动还需要一个固定到 digest 的镜像引用。
+前置条件是 Debian 主机已安装 Docker Engine、Docker Compose v2、Bash、coreutils
+（含 GNU `timeout`）、`curl`、`openssl`、util-linux（含 `flock`）、Python 3 和
+`python3-venv`，当前用户具备 root 或 sudo 权限，且批准的代码已位于目标目录。首次启动还
+需要一个固定到 digest 的镜像引用。完整主机
+依赖和资源要求见 [Deployment Guide](docs/deployment-guide.md)。
+
+生产只支持 systemd 管理的本机 rootful Docker：context 必须为 `default`，endpoint
+必须为 `unix:///var/run/docker.sock`。rootless 或远程 daemon 不受支持；执行前清除
+`DOCKER_HOST`、`DOCKER_CONTEXT`、`DOCKER_TLS_VERIFY` 和 `DOCKER_CERT_PATH`，
+bootstrap 也会拒绝这些覆盖。普通用户没有 socket 权限时，脚本先在前台执行一次
+`sudo -v`，后续受超时保护的调用只使用非交互 `sudo -n`。
 
 ```bash
 cd /opt/cf-agent-wechat

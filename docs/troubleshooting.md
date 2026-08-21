@@ -23,14 +23,23 @@ printf 'status exit code: %s\n' "$status_rc"
 日常诊断首选 `status.sh`；它会读取权威配置并同时检查容器、health、API 与 auth。
 只有需要查看原始 Docker 数据时才使用下列 helper：
 
+生产管理只支持 systemd 管理的本机 rootful Docker；context 必须为 `default`，endpoint
+必须为 `unix:///var/run/docker.sock`。rootless 或远程 daemon 不受支持。
+脚本会拒绝 `DOCKER_HOST`、`DOCKER_CONTEXT`、`DOCKER_TLS_VERIFY` 和
+`DOCKER_CERT_PATH` 覆盖。普通用户需要提权时，脚本先在前台执行 `sudo -v`，
+受超时保护的 Docker 调用随后只使用非交互 `sudo -n`。下方 helper 和 raw Docker
+命令采用相同顺序；若授权票据在长时间排障中失效，重新以前台 `sudo -v` 授权，
+不要让受超时保护的命令等待密码。
+
 ```bash
 cd /opt/cf-agent-wechat
 ROOT="$(pwd -P)"
 COMPOSE_FILE="$ROOT/docker/compose.cfserver.yaml"
 ENV_FILE="$ROOT/docker/.env"
 
+sudo -v
 compose_prod() {
-  sudo env \
+  sudo -n -- env \
     -u AGENT_WECHAT_IMAGE \
     -u AGENT_WECHAT_BIND_IP \
     -u AGENT_WECHAT_PORT \
@@ -42,15 +51,19 @@ compose_prod() {
     -u RUST_LOG \
     -u COMPOSE_FILE \
     -u COMPOSE_PROJECT_NAME \
-    docker compose --env-file "$ENV_FILE" \
+    -u DOCKER_HOST \
+    -u DOCKER_CONTEXT \
+    -u DOCKER_TLS_VERIFY \
+    -u DOCKER_CERT_PATH \
+    docker --host unix:///var/run/docker.sock compose --env-file "$ENV_FILE" \
       --project-directory "$ROOT" \
       --project-name cf-agent-wechat \
       -f "$COMPOSE_FILE" "$@"
 }
 ```
 
-每次 raw Compose 调用都通过该 helper 清理 stale shell 值，并固定 `--env-file`、
-`--project-name` 与 `-f`。不要 `source` 环境文件。项目名
+每次 raw Compose 调用都通过该 helper 清理 stale shell 值，并固定本机 socket、
+`--env-file`、`--project-name` 与 `-f`。不要 `source` 环境文件。项目名
 `cf-agent-wechat` 是固定 Compose 契约，但容器名可由 `docker/.env` 覆盖；
 需要 `docker inspect` 时必须从 service `agent-wechat` 获取容器 ID。
 
@@ -59,19 +72,58 @@ compose_prod() {
 `bootstrap-cfserver.sh` 任一步失败都会非零退出并保留现场。按错误类型检查：
 
 - `docker` 是否安装且 daemon 为 active；
-- `docker compose version` 是否为 v2；
-- 代码根以及固定 Compose、env 文件是否为安全的普通文件且当前管理用户可读；
+- `docker --host unix:///var/run/docker.sock compose version` 是否为 v2；
+- Docker context 是否为 `default`，endpoint 是否为 `unix:///var/run/docker.sock`，
+  daemon 是否为 rootful，且当前 shell 是否清除了全部 `DOCKER_*` daemon 覆盖；
+- 代码根、`docker/` 目录、固定 Compose 和 env 是否由 root 或当前固定管理用户持有；
+  Compose/env 是否为非符号链接普通文件、hardlink 计数为 `1`，且权限满足生产合同；
 - 镜像是否使用完整 `@sha256:<64 hex>` digest；
 - `CF_RUNTIME_ROOT` 是否位于可写、空间充足的持久文件系统；
 - 现有目录是否为真实目录而非符号链接，属主和权限是否符合生产基线；
 - `docker/.env` 中 `AGENT_WECHAT_PORT` 对应的 loopback 宿主端口
   （默认 `6174`）是否已被其他进程占用；
-- systemd 主机上的 `docker.service` 是否已启用开机启动；
+- systemd 是否为 `running`/`degraded`，且 `docker.service` 是否已启用开机启动；
 - 首次扫码所需 Python 依赖能否从批准包源安装，或登录 venv 是否已预置；
 - 外部网络 `cf-internal` 是否能创建或读取。
 
 缺少 `docker/.env` 时要在首次执行环境中提供 `AGENT_WECHAT_IMAGE`。已有 `.env` 时先
 修复该文件，不要创建第二个环境文件让脚本和人工 Compose 使用不同输入。
+
+## Docker CLI 或 Compose 超时
+
+bootstrap 默认将 Docker/Compose 元数据、配置和 inspect 命令限制为 30 秒
+（`CF_BOOTSTRAP_DOCKER_TIMEOUT`），将 `compose up -d` 单独限制为 900 秒
+（`CF_BOOTSTRAP_COMPOSE_UP_TIMEOUT`）。后者包含首次镜像拉取。状态脚本的单次
+`docker inspect` 默认限制为 10 秒（`DOCKER_INSPECT_TIMEOUT`）；`status.sh --wait`
+还会将每次普通查询和 sudo fallback 收紧到总轮询预算的剩余时间。
+
+发生超时时：
+
+1. 检查 `systemctl status docker`、daemon 日志、磁盘空间、DNS 和镜像仓库；
+2. 确认没有卡住的交互式 sudo 提示；
+3. 不删除或替换 `docker/.env`、`data`、`wechat-home` 和原 Token；
+4. daemon 或网络恢复后原样重跑 bootstrap，再执行 `status.sh --wait`。
+
+超时强制结束的是 CLI 客户端；daemon 可能仍在完成已经提交的 pull/create。Compose 项目
+使用固定名称并可幂等重跑。只有经过现场测量确认主机或仓库正常但确实较慢时，才在变更窗口
+临时调大对应正整数秒数；不要用 `0` 禁用上限。
+
+## 生产配置权威校验失败
+
+`status.sh` 和 `login.sh` 在 `docker/.env` 缺失、属主不受批准、权限过宽或存在额外
+hardlink 时会拒绝执行。若 runtime 已存在，先停止变更并从配套备份还原原 `.env`；
+只有全新且空的 runtime 才能由 bootstrap 使用批准的镜像 digest 初始化新配置。
+
+```bash
+cd /opt/cf-agent-wechat
+stat -c '%F %u:%g %a %h %n' \
+  . docker docker/compose.cfserver.yaml docker/.env
+```
+
+代码根和 `docker/` 目录的 owner 必须是 `0` 或执行管理命令的固定用户 UID；固定
+Compose/env 的 owner 也遵循该规则，且上面输出的 hardlink 计数必须为 `1`。确认文件
+来源后恢复批准的 owner/mode 或从配置备份还原，不要复制到第二个 env、`source` 文件，
+也不要用进程变量绕过校验。
 
 ## 容器不存在或未运行
 
@@ -79,7 +131,7 @@ compose_prod() {
 compose_prod ps --all
 CONTAINER_ID="$(compose_prod ps --all -q agent-wechat)"
 if [ -n "$CONTAINER_ID" ]; then
-  sudo docker inspect "$CONTAINER_ID" --format \
+  sudo -n -- docker --host unix:///var/run/docker.sock inspect "$CONTAINER_ID" --format \
     '{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{end}}'
 fi
 ```
@@ -102,7 +154,7 @@ Compose healthcheck 请求容器内固定端口
 ```bash
 CONTAINER_ID="$(compose_prod ps -q agent-wechat)"
 test -n "$CONTAINER_ID"
-sudo docker inspect "$CONTAINER_ID" --format '{{json .State.Health}}'
+sudo -n -- docker --host unix:///var/run/docker.sock inspect "$CONTAINER_ID" --format '{{json .State.Health}}'
 compose_prod logs --tail=200 agent-wechat
 ```
 
@@ -185,7 +237,7 @@ API 已能响应但微信客户端进程不存在。`login.sh` 无法修复该�
 ```bash
 CONTAINER_ID="$(compose_prod ps -q agent-wechat)"
 test -n "$CONTAINER_ID"
-sudo docker inspect "$CONTAINER_ID" --format \
+sudo -n -- docker --host unix:///var/run/docker.sock inspect "$CONTAINER_ID" --format \
   '{{range .Mounts}}{{println .Source "->" .Destination}}{{end}}'
 ```
 
@@ -203,10 +255,10 @@ runtime。
 ## 外部网络或 Gateway 调用失败
 
 ```bash
-sudo docker network inspect cf-internal
+sudo -n -- docker --host unix:///var/run/docker.sock network inspect cf-internal
 CONTAINER_ID="$(compose_prod ps -q agent-wechat)"
 test -n "$CONTAINER_ID"
-sudo docker inspect "$CONTAINER_ID" --format \
+sudo -n -- docker --host unix:///var/run/docker.sock inspect "$CONTAINER_ID" --format \
   '{{range $name, $_ := .NetworkSettings.Networks}}{{$name}} {{end}}'
 ```
 

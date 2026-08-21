@@ -18,12 +18,68 @@ if [ "${CF_BOOTSTRAP_TEST_DOCKER_UNAVAILABLE:-0}" = "1" ]; then
   exit 127
 fi
 
+hang_forever() {
+  if [ -n "${CF_BOOTSTRAP_TEST_DOCKER_HANG_PID_FILE:-}" ]; then
+    printf '%s\n' "$$" > "$CF_BOOTSTRAP_TEST_DOCKER_HANG_PID_FILE"
+  fi
+  trap '' TERM
+  while :; do
+    sleep 1
+  done
+}
+
+arguments="$*"
+case "${CF_BOOTSTRAP_TEST_DOCKER_HANG_ON:-}" in
+  compose-config)
+    if [ "${1:-}" = compose ] && [[ " $arguments " == *" config "* ]]; then
+      hang_forever
+    fi
+    ;;
+  compose-up)
+    if [ "${1:-}" = compose ] && [[ " $arguments " == *" up "* ]]; then
+      hang_forever
+    fi
+    ;;
+  compose-ps)
+    if [ "${1:-}" = compose ] && [[ " $arguments " == *" ps "* ]]; then
+      hang_forever
+    fi
+    ;;
+  inspect)
+    [ "${1:-}" != inspect ] || hang_forever
+    ;;
+esac
+if [ "${CF_BOOTSTRAP_TEST_DOCKER_DIRECT_DENIED:-0}" = "1" ] &&
+  [ "${CF_BOOTSTRAP_TEST_UNDER_SUDO:-0}" != "1" ] &&
+  [ "${1:-}" = "info" ]; then
+  printf 'permission denied while trying to connect to the Docker daemon socket\n' >&2
+  exit 1
+fi
+
+
 case "${1:-}" in
   --version)
     printf '%s\n' 'Docker version 28.0.0, build bootstrap-test'
     ;;
   info)
-    printf '%s\n' 'mock Docker daemon'
+    if [[ " $* " == *".SecurityOptions"* ]]; then
+      printf '%s\n' "${CF_BOOTSTRAP_TEST_DOCKER_SECURITY_OPTIONS:-[\"name=seccomp\"]}"
+    else
+      printf '%s\n' 'mock Docker daemon'
+    fi
+    ;;
+  context)
+    case "${2:-}" in
+      show)
+        printf '%s\n' "${CF_BOOTSTRAP_TEST_DOCKER_CONTEXT_NAME:-default}"
+        ;;
+      inspect)
+        printf '%s\n' "${CF_BOOTSTRAP_TEST_DOCKER_CONTEXT_ENDPOINT:-unix:///var/run/docker.sock}"
+        ;;
+      *)
+        exit 2
+        ;;
+    esac
     ;;
   network)
     case "${2:-}" in
@@ -76,6 +132,12 @@ case "${1:-}" in
   inspect)
     format="${3:-}"
     case "$format" in
+      '{{.Config.Image}}')
+        printf '%s\n' "${CF_BOOTSTRAP_TEST_CONTAINER_IMAGE:-$AGENT_WECHAT_IMAGE}"
+        ;;
+      '{{.Name}}')
+        printf '%s\n' "${CF_BOOTSTRAP_TEST_CONTAINER_NAME:-/$AGENT_WECHAT_CONTAINER_NAME}"
+        ;;
       '{{.State.Status}}')
         printf '%s\n' "${CF_BOOTSTRAP_TEST_CONTAINER_STATE:-running}"
         ;;
