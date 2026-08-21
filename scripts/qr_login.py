@@ -233,6 +233,15 @@ def _redact_token(value: object, token: str) -> str:
     return str(value).replace(token, "[REDACTED]")
 
 
+def _safe_external_message(value: object, token: str) -> str:
+    message = _redact_token(value, token)
+    sanitized = "".join(
+        character if ord(character) >= 0x20 and ord(character) != 0x7F else " "
+        for character in message
+    )
+    return sanitized[:240]
+
+
 def _login_url(url: str, timeout_ms: int, new_account: bool = False) -> str:
     parts = urlsplit(url)
     if parts.scheme not in {"ws", "wss"} or not parts.netloc:
@@ -259,12 +268,7 @@ def _event_message(event: dict[str, Any]) -> str:
 
 
 def _safe_event_message(event: dict[str, Any], token: str) -> str:
-    message = _redact_token(_event_message(event), token)
-    sanitized = "".join(
-        character if ord(character) >= 0x20 and ord(character) != 0x7F else " "
-        for character in message
-    )
-    return sanitized[:240]
+    return _safe_external_message(_event_message(event), token)
 
 
 def listen_for_login(
@@ -299,7 +303,7 @@ def listen_for_login(
         )
     except Exception as exc:
         raise LoginToolError(
-            f"无法连接登录 WebSocket：{_redact_token(exc, token)}"
+            f"无法连接登录 WebSocket：{_safe_external_message(exc, token)}"
         ) from exc
 
     terminal_event = False
@@ -321,7 +325,7 @@ def listen_for_login(
                         "登录超时，请重新执行 ./scripts/login.sh。"
                     ) from exc
                 raise LoginToolError(
-                    f"读取登录事件失败：{_redact_token(exc, token)}"
+                    f"读取登录事件失败：{_safe_external_message(exc, token)}"
                 ) from exc
             if raw_event in (None, "", b""):
                 break

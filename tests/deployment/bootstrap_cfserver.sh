@@ -40,6 +40,24 @@ assert_contains() {
   }
 }
 
+compose_up_audit_count() {
+  local audit_log="$1"
+
+  awk -F '\t' '
+    $1 == "docker" &&
+    $2 == "compose" &&
+    $3 == "--env-file" &&
+    $5 == "--project-directory" &&
+    $7 == "--project-name" &&
+    $8 == "cf-agent-wechat" &&
+    $9 == "-f" &&
+    $11 == "up" &&
+    $12 == "-d" &&
+    $13 == "agent-wechat" { count++ }
+    END { print count + 0 }
+  ' "$audit_log"
+}
+
 assert_hung_process_reaped() {
   local pid_file="$1"
   local label="$2"
@@ -831,6 +849,63 @@ done
 assert_contains "$SECOND_OUTPUT" "persistent runtime root: $RUNTIME_ROOT"
 assert_contains "$SECOND_OUTPUT" 'Docker network exists: cf-internal'
 pass "second run loads persisted root/ownership and preserves token/session without bootstrap variables"
+
+FRESH_CONFIG_RUNTIME="${TEST_ROOT}/fresh-config-runtime"
+FRESH_CONFIG_ENV="${TEST_ROOT}/fresh-config.env"
+ACTIVE_RUNTIME_ROOT="$FRESH_CONFIG_RUNTIME"
+ACTIVE_ENV_FILE="$FRESH_CONFIG_ENV"
+rm -f -- "${STATE_DIR}/started"
+[ ! -e "${STATE_DIR}/started" ] || fail "fresh Compose fixture started state could not be reset"
+FRESH_CONFIG_UP_CALLS_BEFORE="$(compose_up_audit_count "$AUDIT_LOG")"
+TEST_COMPOSE_INVALID=1
+FRESH_CONFIG_OUTPUT="${TEST_ROOT}/fresh-config.out"
+if run_bootstrap > "$FRESH_CONFIG_OUTPUT" 2>&1; then
+  fail "fresh bootstrap accepted an invalid Compose configuration"
+fi
+assert_contains "$FRESH_CONFIG_OUTPUT" 'production Compose validation failed'
+[ ! -e "${STATE_DIR}/started" ] || fail "fresh Compose validation failure started the service"
+FRESH_CONFIG_UP_CALLS_AFTER_FAILURE="$(compose_up_audit_count "$AUDIT_LOG")"
+[ "$FRESH_CONFIG_UP_CALLS_AFTER_FAILURE" -eq "$FRESH_CONFIG_UP_CALLS_BEFORE" ] ||
+  fail "fresh Compose validation failure invoked Docker Compose up"
+[ -f "$FRESH_CONFIG_ENV" ] || fail "fresh Compose failure did not preserve its staged environment"
+for staged_directory in data wechat-home secrets; do
+  [ -d "${FRESH_CONFIG_RUNTIME}/${staged_directory}" ] ||
+    fail "fresh Compose failure did not preserve staged ${staged_directory}"
+done
+FRESH_CONFIG_TOKEN="${FRESH_CONFIG_RUNTIME}/secrets/auth-token"
+[ -f "$FRESH_CONFIG_TOKEN" ] || fail "fresh Compose failure did not preserve its staged auth token"
+grep -Eq '^[0-9a-f]{64}$' "$FRESH_CONFIG_TOKEN" ||
+  fail "fresh Compose failure left an invalid staged auth token"
+grep -Fxq 'CF_AGENT_WECHAT_BOOTSTRAP_MANAGED=1' "$FRESH_CONFIG_ENV" ||
+  fail "fresh Compose failure did not record controlled staged provenance"
+if grep -Fq 'CF_AGENT_WECHAT_BOOTSTRAPPED=' "$FRESH_CONFIG_ENV"; then
+  fail "fresh Compose failure recorded the initialized success marker"
+fi
+FRESH_CONFIG_TOKEN_ID_BEFORE="$($REAL_STAT -c '%i:%Y:%s' "$FRESH_CONFIG_TOKEN")"
+FRESH_CONFIG_TOKEN_VALUE_BEFORE="$(<"$FRESH_CONFIG_TOKEN")"
+
+TEST_COMPOSE_INVALID=0
+FRESH_CONFIG_RETRY_OUTPUT="${TEST_ROOT}/fresh-config-retry.out"
+run_bootstrap > "$FRESH_CONFIG_RETRY_OUTPUT" 2>&1 || {
+  sed -n '1,240p' "$FRESH_CONFIG_RETRY_OUTPUT" >&2
+  fail "fresh bootstrap did not recover after Compose configuration was repaired"
+}
+[ -f "${STATE_DIR}/started" ] || fail "fresh Compose recovery did not start the service"
+FRESH_CONFIG_UP_CALLS_AFTER_RETRY="$(compose_up_audit_count "$AUDIT_LOG")"
+[ "$FRESH_CONFIG_UP_CALLS_AFTER_RETRY" -eq $((FRESH_CONFIG_UP_CALLS_BEFORE + 1)) ] ||
+  fail "fresh Compose recovery did not invoke Docker Compose up exactly once"
+FRESH_CONFIG_TOKEN_ID_AFTER="$($REAL_STAT -c '%i:%Y:%s' "$FRESH_CONFIG_TOKEN")"
+[ "$FRESH_CONFIG_TOKEN_ID_BEFORE" = "$FRESH_CONFIG_TOKEN_ID_AFTER" ] ||
+  fail "fresh Compose recovery replaced the staged auth token"
+[ "$FRESH_CONFIG_TOKEN_VALUE_BEFORE" = "$(<"$FRESH_CONFIG_TOKEN")" ] ||
+  fail "fresh Compose recovery changed the staged auth token"
+[ "$(grep -Fc 'CF_AGENT_WECHAT_BOOTSTRAPPED=1' "$FRESH_CONFIG_ENV")" -eq 1 ] ||
+  fail "successful fresh Compose recovery did not record initialization exactly once"
+[ "$(grep -Fc 'CF_AGENT_WECHAT_BOOTSTRAP_MANAGED=1' "$FRESH_CONFIG_ENV")" -eq 1 ] ||
+  fail "successful fresh Compose recovery changed staged provenance"
+ACTIVE_RUNTIME_ROOT="$RUNTIME_ROOT"
+ACTIVE_ENV_FILE="$ENV_FILE"
+pass "fresh Compose validation failure preserves a retryable staged deployment"
 TEST_DEFAULT_RUNTIME_RESOLVED=/mnt/relocated/cf-agent-wechat
 SYMLINK_CUSTOM_RUNTIME="${TEST_ROOT}/symlink-custom-runtime"
 SYMLINK_CUSTOM_ENV="${TEST_ROOT}/symlink-custom.env"

@@ -1287,8 +1287,9 @@ main() {
     warn "Gateway root is not present; the shared network will still be prepared: $CF_GATEWAY_ROOT"
   fi
 
-  # Do not leave a partial environment, runtime, or token on a host that
-  # cannot run the production Compose project.
+  # After Docker authority is verified, a fresh deployment persists a controlled,
+  # bootstrap-managed staged environment, runtime, and token that retries can resume.
+  # The initialized marker is written only after container and API verification.
   select_docker_access
   verify_docker_boot_recovery
 

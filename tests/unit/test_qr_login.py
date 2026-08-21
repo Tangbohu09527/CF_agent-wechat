@@ -50,11 +50,22 @@ class FakeImage:
 
 
 class FakeConnection:
-    def __init__(self, events: list[dict[str, object]]) -> None:
-        self.events = [json.dumps(event) for event in events]
+    def __init__(
+        self,
+        events: list[dict[str, object] | str | bytes],
+        *,
+        recv_error: Exception | None = None,
+    ) -> None:
+        self.events = [
+            json.dumps(event) if isinstance(event, dict) else event
+            for event in events
+        ]
+        self.recv_error = recv_error
         self.closed = False
 
-    def recv(self) -> str:
+    def recv(self) -> str | bytes:
+        if self.recv_error is not None:
+            raise self.recv_error
         if self.events:
             return self.events.pop(0)
         return ""
@@ -64,6 +75,43 @@ class FakeConnection:
 
 
 class QrLoginTests(unittest.TestCase):
+    def run_listener_for_error(
+        self,
+        events: list[dict[str, object] | str | bytes],
+        *,
+        token: str = "fixture-token-never-printed",
+        require_qr: bool = False,
+        recv_error: Exception | None = None,
+    ) -> tuple[FakeConnection, Exception]:
+        connection = FakeConnection(events, recv_error=recv_error)
+        websocket_module = types.SimpleNamespace(
+            create_connection=lambda *_args, **_kwargs: connection
+        )
+        with (
+            mock.patch.dict(sys.modules, {"websocket": websocket_module}),
+            mock.patch.object(QR_LOGIN, "render_event_qr", return_value=True),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            with self.assertRaises(QR_LOGIN.LoginToolError) as raised:
+                QR_LOGIN.listen_for_login(
+                    "ws://127.0.0.1/api/ws/login",
+                    token,
+                    "default",
+                    1000,
+                    require_qr=require_qr,
+                )
+        return connection, raised.exception
+
+    def assert_safe_error(self, error: Exception, token: str) -> str:
+        message = str(error)
+        self.assertNotIn(token, message)
+        for character in message:
+            self.assertFalse(
+                ord(character) < 0x20 or ord(character) == 0x7F,
+                repr(message),
+            )
+        return message
+
     def run_listener(
         self,
         events: list[dict[str, object]],
@@ -212,6 +260,128 @@ class QrLoginTests(unittest.TestCase):
                     1000,
                 )
         self.assertTrue(connection.closed)
+
+    def test_websocket_connection_failure_sanitizes_external_error(self) -> None:
+        token = "fixture-connect-secret"
+
+        def fail_connection(*_args: object, **_kwargs: object) -> None:
+            raise OSError(
+                f"connection refused {token}\r\n\x1b\x00\t\x7f"
+            )
+
+        websocket_module = types.SimpleNamespace(
+            create_connection=fail_connection
+        )
+        with mock.patch.dict(sys.modules, {"websocket": websocket_module}):
+            with self.assertRaises(QR_LOGIN.LoginToolError) as raised:
+                QR_LOGIN.listen_for_login(
+                    "ws://127.0.0.1/api/ws/login",
+                    token,
+                    "default",
+                    1000,
+                )
+
+        message = self.assert_safe_error(raised.exception, token)
+        self.assertIn("无法连接登录 WebSocket", message)
+        self.assertIn("[REDACTED]", message)
+
+    def test_websocket_recv_failure_sanitizes_external_error(self) -> None:
+        token = "fixture-recv-secret"
+        recv_error = OSError(
+            f"read failed {token}\r\n\x1b\x00\t\x7f"
+        )
+        connection, error = self.run_listener_for_error(
+            [],
+            token=token,
+            recv_error=recv_error,
+        )
+
+        message = self.assert_safe_error(error, token)
+        self.assertIn("读取登录事件失败", message)
+        self.assertIn("[REDACTED]", message)
+        self.assertTrue(connection.closed)
+
+    def test_external_message_sanitizer_truncates_to_240(self) -> None:
+        token = "fixture-sanitizer-secret"
+        sanitized = QR_LOGIN._safe_external_message(
+            f"{token}\r\n\x1b\x00\t\x7f" + "x" * 300,
+            token,
+        )
+
+        self.assertEqual(len(sanitized), 240)
+        self.assertTrue(sanitized.startswith("[REDACTED]"))
+        self.assert_safe_error(QR_LOGIN.LoginToolError(sanitized), token)
+
+    def test_invalid_json_and_non_utf8_events_fail_closed(self) -> None:
+        token = "fixture-malformed-secret"
+        cases: list[tuple[str | bytes, str]] = [
+            (f"not-json {token}\r\n", "无法解析"),
+            (token.encode("ascii") + b"\xff\r\n", "不是 UTF-8"),
+        ]
+
+        for raw_event, expected_message in cases:
+            with self.subTest(expected_message=expected_message):
+                connection, error = self.run_listener_for_error(
+                    [raw_event], token=token
+                )
+                message = self.assert_safe_error(error, token)
+                self.assertIn(expected_message, message)
+                self.assertTrue(connection.closed)
+
+    def test_login_timeout_event_fails_closed(self) -> None:
+        token = "fixture-timeout-secret"
+        connection, error = self.run_listener_for_error(
+            [
+                {
+                    "type": "login_timeout",
+                    "message": f"expired\r\n{token}\x7f",
+                }
+            ],
+            token=token,
+        )
+
+        message = self.assert_safe_error(error, token)
+        self.assertIn("登录超时", message)
+        self.assertTrue(connection.closed)
+
+    def test_server_error_event_redacts_token_and_controls(self) -> None:
+        token = "fixture-server-secret"
+        connection, error = self.run_listener_for_error(
+            [
+                {
+                    "type": "error",
+                    "message": f"denied\r\nAuthorization: {token}\x7f",
+                }
+            ],
+            token=token,
+        )
+
+        message = self.assert_safe_error(error, token)
+        self.assertIn("登录失败", message)
+        self.assertIn("[REDACTED]", message)
+        self.assertTrue(connection.closed)
+
+    def test_connection_close_before_qr_or_success_fails_closed(self) -> None:
+        token = "fixture-close-secret"
+        cases = [
+            ([], "显示二维码前断开"),
+            (
+                [{"type": "qr", "qrData": "fixture://fresh-device"}],
+                "成功事件前断开",
+            ),
+        ]
+
+        for events, expected_message in cases:
+            with self.subTest(expected_message=expected_message):
+                connection, error = self.run_listener_for_error(
+                    events,
+                    token=token,
+                    require_qr=True,
+                )
+                message = self.assert_safe_error(error, token)
+                self.assertIn(expected_message, message)
+                self.assertTrue(connection.closed)
+
     def test_nondefault_session_id_is_rejected(self) -> None:
         for session_id in ("other", "", "default\nInjected: value"):
             with self.subTest(session_id=session_id):
