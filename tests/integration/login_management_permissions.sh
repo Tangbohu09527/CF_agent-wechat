@@ -502,11 +502,14 @@ reset_audit
   CF_AUDIT_REAL_SUDO="$REAL_SUDO" \
   PYTHON_BIN=python3 \
   /bin/bash -c \
-  'set -e; cd "$1"; source scripts/common.sh; ensure_login_environment' \
+  'set -e; umask 077; cd "$1"; source scripts/common.sh; ensure_login_environment' \
   cf-agent-wechat-test "$TEST_REPO" > "${TEST_ROOT}/venv-setup.out" 2>&1
 assert_no_sudo_calls "venv setup"
 assert_no_sudo_python "venv setup"
-VENV_DIR="${TEST_HOME}/.local/share/cf-agent-wechat/venv"
+LOGIN_DATA_DIR="${TEST_HOME}/.local/share/cf-agent-wechat"
+VENV_DIR="${LOGIN_DATA_DIR}/venv"
+[ "$(stat -c '%U:%a' "$LOGIN_DATA_DIR")" = "$TEST_USER:700" ] ||
+  fail "login data directory is not owned by the ordinary user with mode 700"
 [ -x "${VENV_DIR}/bin/python" ] || fail "default ordinary-user venv was not created"
 if find "$VENV_DIR" ! -user "$TEST_USER" -print -quit | grep -q .; then
   fail "venv contains files not owned by the ordinary user"
