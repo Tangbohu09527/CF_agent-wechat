@@ -5,21 +5,306 @@ set +x
 set +a
 
 SCRIPTS_DIR="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+REPO_ROOT="$(CDPATH= cd -- "${SCRIPTS_DIR}/.." && pwd -P)"
+MANAGEMENT_ENV_FILE="${REPO_ROOT}/docker/.env"
+PRODUCTION_COMPOSE_FILE="${REPO_ROOT}/docker/compose.cfserver.yaml"
+_MANAGEMENT_ENV_ERROR=""
+_ENV_RUNTIME_ROOT=""
+_ENV_BIND_IP=""
+_ENV_PORT=""
+_ENV_CONTAINER_NAME=""
 
-API_URL="${API_URL:-http://127.0.0.1:6174}"
+set_management_env_error() {
+  if [ -z "$_MANAGEMENT_ENV_ERROR" ]; then
+    _MANAGEMENT_ENV_ERROR="$1"
+  fi
+}
+
+normalize_management_path() {
+  local value="$1"
+  local normalized
+
+  case "$value" in
+    /)
+      return 1
+      ;;
+    /*) ;;
+    *) return 1 ;;
+  esac
+  case "$value" in
+    *[[:cntrl:]]*|*/../*|*/..) return 1 ;;
+  esac
+  command -v realpath >/dev/null 2>&1 || return 1
+  normalized="$(realpath -m -- "$value" 2>/dev/null)" || return 1
+  [ "$normalized" != "/" ] || return 1
+  printf '%s' "$normalized"
+}
+
+management_env_path_is_dotenv_safe() {
+  local LC_ALL=C
+  local dotenv_path_pattern='^/[-A-Za-z0-9._/@%+,=:~]*$'
+
+  [[ "$1" =~ $dotenv_path_pattern ]]
+}
+
+load_management_environment() {
+  local current_uid docker_dir line key value seen_keys="|"
+  local metadata owner mode link_count normalized_runtime normalized_legacy
+  local legacy_runtime_root=""
+
+  if ! current_uid="$(/usr/bin/id -u 2>/dev/null)" ||
+    ! [[ "$current_uid" =~ ^[0-9]+$ ]]; then
+    set_management_env_error "无法确定当前管理用户 UID。"
+    return
+  fi
+
+  if [ -L "$REPO_ROOT" ] || [ ! -d "$REPO_ROOT" ]; then
+    set_management_env_error "仓库根目录必须是非符号链接目录：${REPO_ROOT}"
+    return
+  fi
+  if ! metadata="$(stat -c '%u:%a' -- "$REPO_ROOT" 2>/dev/null)" ||
+    ! [[ "$metadata" =~ ^[0-9]+:[0-7]{3,4}$ ]]; then
+    set_management_env_error "无法验证仓库根目录权限：${REPO_ROOT}"
+    return
+  fi
+  owner="${metadata%%:*}"
+  mode="${metadata#*:}"
+  if [ "$owner" != "0" ] && [ "$owner" != "$current_uid" ]; then
+    set_management_env_error "仓库根目录必须由 root 或当前固定管理用户持有：${REPO_ROOT}"
+    return
+  fi
+  if (( (8#$mode & 8#022) != 0 )); then
+    set_management_env_error "仓库根目录不能被 group/other 写入：${REPO_ROOT}"
+    return
+  fi
+
+  docker_dir="${REPO_ROOT}/docker"
+  if [ -L "$docker_dir" ] || [ ! -d "$docker_dir" ]; then
+    set_management_env_error "生产配置目录必须是非符号链接目录：${docker_dir}"
+    return
+  fi
+  if ! metadata="$(stat -c '%u:%a' -- "$docker_dir" 2>/dev/null)" ||
+    ! [[ "$metadata" =~ ^[0-9]+:[0-7]{3,4}$ ]]; then
+    set_management_env_error "无法验证生产配置目录权限：${docker_dir}"
+    return
+  fi
+  owner="${metadata%%:*}"
+  mode="${metadata#*:}"
+  if [ "$owner" != "0" ] && [ "$owner" != "$current_uid" ]; then
+    set_management_env_error "生产配置目录必须由 root 或当前固定管理用户持有：${docker_dir}"
+    return
+  fi
+  if (( (8#$mode & 8#022) != 0 )); then
+    set_management_env_error "生产配置目录不能被 group/other 写入：${docker_dir}"
+    return
+  fi
+
+  if [ -L "$PRODUCTION_COMPOSE_FILE" ] || [ ! -f "$PRODUCTION_COMPOSE_FILE" ]; then
+    set_management_env_error "生产 Compose 必须是非符号链接普通文件：${PRODUCTION_COMPOSE_FILE}"
+    return
+  fi
+  if ! metadata="$(stat -c '%u:%a:%h' -- "$PRODUCTION_COMPOSE_FILE" 2>/dev/null)" ||
+    ! [[ "$metadata" =~ ^[0-9]+:[0-7]{3,4}:[0-9]+$ ]]; then
+    set_management_env_error "无法验证生产 Compose 权限：${PRODUCTION_COMPOSE_FILE}"
+    return
+  fi
+  owner="${metadata%%:*}"
+  mode="${metadata#*:}"
+  mode="${mode%%:*}"
+  link_count="${metadata##*:}"
+  if [ "$owner" != "0" ] && [ "$owner" != "$current_uid" ]; then
+    set_management_env_error "生产 Compose 必须由 root 或当前固定管理用户持有：${PRODUCTION_COMPOSE_FILE}"
+    return
+  fi
+  if (( (8#$mode & 8#022) != 0 )); then
+    set_management_env_error "生产 Compose 不能被 group/other 写入：${PRODUCTION_COMPOSE_FILE}"
+    return
+  fi
+  if [ "$link_count" != "1" ]; then
+    set_management_env_error "生产 Compose 不能存在额外硬链接：${PRODUCTION_COMPOSE_FILE}"
+    return
+  fi
+  if [ ! -e "$MANAGEMENT_ENV_FILE" ] && [ ! -L "$MANAGEMENT_ENV_FILE" ]; then
+    set_management_env_error "生产环境文件不存在：${MANAGEMENT_ENV_FILE}；请先运行 bootstrap，或从同一恢复单元还原 docker/.env。"
+    return
+  fi
+  if [ -L "$MANAGEMENT_ENV_FILE" ] || [ ! -f "$MANAGEMENT_ENV_FILE" ]; then
+    set_management_env_error "生产环境文件必须是非符号链接普通文件：${MANAGEMENT_ENV_FILE}"
+    return
+  fi
+  if [ ! -r "$MANAGEMENT_ENV_FILE" ]; then
+    set_management_env_error "当前管理用户无法读取生产环境文件：${MANAGEMENT_ENV_FILE}"
+    return
+  fi
+  if ! metadata="$(stat -c '%u:%a:%h' -- "$MANAGEMENT_ENV_FILE" 2>/dev/null)" ||
+    ! [[ "$metadata" =~ ^[0-9]+:[0-7]{3,4}:[0-9]+$ ]]; then
+    set_management_env_error "无法验证生产环境文件权限：${MANAGEMENT_ENV_FILE}"
+    return
+  fi
+  owner="${metadata%%:*}"
+  mode="${metadata#*:}"
+  mode="${mode%%:*}"
+  link_count="${metadata##*:}"
+  if [ "$owner" != "0" ] && [ "$owner" != "$current_uid" ]; then
+    set_management_env_error "生产环境文件必须由 root 或当前固定管理用户持有：${MANAGEMENT_ENV_FILE}"
+    return
+  fi
+  case "$mode" in
+    600|0600|640|0640) ;;
+    *)
+      set_management_env_error "生产环境文件权限必须是 0600 或 0640：${MANAGEMENT_ENV_FILE}"
+      return
+      ;;
+  esac
+  if [ "$link_count" != "1" ]; then
+    set_management_env_error "生产环境文件不能存在额外硬链接：${MANAGEMENT_ENV_FILE}"
+    return
+  fi
+
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      ""|\#*) continue ;;
+    esac
+    if ! [[ "$line" =~ ^[[:space:]]*([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then
+      continue
+    fi
+    key="${BASH_REMATCH[1]}"
+    value="${BASH_REMATCH[2]}"
+    case "$key" in
+      CF_AGENT_WECHAT_RUNTIME_ROOT|CF_AGENT_WECHAT_STORAGE_ROOT|AGENT_WECHAT_BIND_IP|AGENT_WECHAT_PORT|AGENT_WECHAT_CONTAINER_NAME) ;;
+      *) continue ;;
+    esac
+    case "$seen_keys" in
+      *"|${key}|"*)
+        set_management_env_error "生产环境文件包含重复配置键：${key}"
+        return
+        ;;
+    esac
+    seen_keys="${seen_keys}${key}|"
+    if [ -z "$value" ] || [[ "$value" =~ [[:cntrl:]] ]]; then
+      set_management_env_error "生产环境文件中的 ${key} 为空或包含控制字符"
+      return
+    fi
+    case "$key" in
+      CF_AGENT_WECHAT_RUNTIME_ROOT) _ENV_RUNTIME_ROOT="$value" ;;
+      CF_AGENT_WECHAT_STORAGE_ROOT) legacy_runtime_root="$value" ;;
+      AGENT_WECHAT_BIND_IP) _ENV_BIND_IP="$value" ;;
+      AGENT_WECHAT_PORT) _ENV_PORT="$value" ;;
+      AGENT_WECHAT_CONTAINER_NAME) _ENV_CONTAINER_NAME="$value" ;;
+    esac
+  done < "$MANAGEMENT_ENV_FILE"
+
+  if [ -z "$_ENV_RUNTIME_ROOT" ] && [ -z "$legacy_runtime_root" ]; then
+    set_management_env_error "生产环境文件缺少必需配置键：CF_AGENT_WECHAT_RUNTIME_ROOT"
+    return
+  fi
+  if [ -z "$_ENV_BIND_IP" ]; then
+    set_management_env_error "生产环境文件缺少必需配置键：AGENT_WECHAT_BIND_IP"
+    return
+  fi
+  if [ -z "$_ENV_PORT" ]; then
+    set_management_env_error "生产环境文件缺少必需配置键：AGENT_WECHAT_PORT"
+    return
+  fi
+  if [ -z "$_ENV_CONTAINER_NAME" ]; then
+    set_management_env_error "生产环境文件缺少必需配置键：AGENT_WECHAT_CONTAINER_NAME"
+    return
+  fi
+  if [ -n "$_ENV_RUNTIME_ROOT" ]; then
+    if ! management_env_path_is_dotenv_safe "$_ENV_RUNTIME_ROOT"; then
+      set_management_env_error "生产环境文件中的 CF_AGENT_WECHAT_RUNTIME_ROOT 包含 dotenv 不安全字符"
+      return
+    fi
+    if ! normalized_runtime="$(normalize_management_path "$_ENV_RUNTIME_ROOT")"; then
+      set_management_env_error "生产环境文件中的 CF_AGENT_WECHAT_RUNTIME_ROOT 无效"
+      return
+    fi
+    _ENV_RUNTIME_ROOT="$normalized_runtime"
+  fi
+  if [ -n "$legacy_runtime_root" ]; then
+    if ! management_env_path_is_dotenv_safe "$legacy_runtime_root"; then
+      set_management_env_error "生产环境文件中的 legacy runtime root 包含 dotenv 不安全字符"
+      return
+    fi
+    if ! normalized_legacy="$(normalize_management_path "$legacy_runtime_root")"; then
+      set_management_env_error "生产环境文件中的 legacy runtime root 无效"
+      return
+    fi
+    if [ -n "$_ENV_RUNTIME_ROOT" ] &&
+      [ "$_ENV_RUNTIME_ROOT" != "$normalized_legacy" ]; then
+      set_management_env_error "生产环境文件中的新旧 runtime root 配置冲突"
+      return
+    fi
+    _ENV_RUNTIME_ROOT="${_ENV_RUNTIME_ROOT:-$normalized_legacy}"
+  fi
+  if [ -n "$_ENV_BIND_IP" ] && [ "$_ENV_BIND_IP" != "127.0.0.1" ]; then
+    set_management_env_error "生产环境文件中的 AGENT_WECHAT_BIND_IP 必须是 127.0.0.1"
+    return
+  fi
+  if [ -n "$_ENV_PORT" ] &&
+    { ! [[ "$_ENV_PORT" =~ ^[1-9][0-9]*$ ]] || [ "$_ENV_PORT" -gt 65535 ]; }; then
+    set_management_env_error "生产环境文件中的 AGENT_WECHAT_PORT 无效"
+    return
+  fi
+  if [ -n "$_ENV_CONTAINER_NAME" ] &&
+    ! [[ "$_ENV_CONTAINER_NAME" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]]; then
+    set_management_env_error "生产环境文件中的 AGENT_WECHAT_CONTAINER_NAME 无效"
+    return
+  fi
+}
+
+load_management_environment
+
+_PROCESS_API_URL_SET="${API_URL+x}"
+_PROCESS_HEALTH_URL_SET="${HEALTH_URL+x}"
+_PROCESS_HEALTH_URL="${HEALTH_URL-}"
+_PROCESS_WS_URL_SET="${WS_URL+x}"
+_PROCESS_WS_URL="${WS_URL-}"
+_PROCESS_CONTAINER_NAME_SET="${CONTAINER_NAME+x}"
+_PROCESS_CONTAINER_NAME="${CONTAINER_NAME-}"
+_PROCESS_TOKEN_FILE_SET="${TOKEN_FILE+x}"
+_PROCESS_TOKEN_FILE="${TOKEN_FILE-}"
+
+MANAGEMENT_BIND_IP="${_ENV_BIND_IP:-127.0.0.1}"
+MANAGEMENT_PORT="${_ENV_PORT:-6174}"
+API_URL="${API_URL:-http://127.0.0.1:${MANAGEMENT_PORT}}"
 API_URL="${API_URL%/}"
-DEFAULT_TOKEN_FILE="/srv/storage/cf-agent-wechat/secrets/auth-token"
+HEALTH_URL="${API_URL}/health"
+case "$API_URL" in
+  http://*) WS_URL="ws://${API_URL#http://}/api/ws/login" ;;
+  https://*) WS_URL="wss://${API_URL#https://}/api/ws/login" ;;
+  *) WS_URL="" ;;
+esac
+
+PRIVILEGED_SECRETS_DIR="/srv/storage/cf-agent-wechat/secrets"
+PRIVILEGED_TOKEN_FILE="/srv/storage/cf-agent-wechat/secrets/auth-token"
+RUNTIME_ROOT="${_ENV_RUNTIME_ROOT:-/srv/storage/cf-agent-wechat}"
+while [ "$RUNTIME_ROOT" != "/" ] && [[ "$RUNTIME_ROOT" == */ ]]; do
+  RUNTIME_ROOT="${RUNTIME_ROOT%/}"
+done
+if [ "$RUNTIME_ROOT" = "/" ]; then
+  DEFAULT_TOKEN_FILE="/secrets/auth-token"
+else
+  DEFAULT_TOKEN_FILE="${RUNTIME_ROOT}/secrets/auth-token"
+fi
 TOKEN_FILE="${TOKEN_FILE:-$DEFAULT_TOKEN_FILE}"
 SESSION_ID="${SESSION_ID:-default}"
-CONTAINER_NAME="${CONTAINER_NAME:-${AGENT_WECHAT_CONTAINER_NAME:-cf-agent-wechat}}"
+CONTAINER_NAME="${_ENV_CONTAINER_NAME:-cf-agent-wechat}"
 
 HTTP_CONNECT_TIMEOUT="${HTTP_CONNECT_TIMEOUT:-5}"
 HTTP_TIMEOUT="${HTTP_TIMEOUT:-45}"
 LOGIN_TIMEOUT_MS="${LOGIN_TIMEOUT_MS:-300000}"
 LOGIN_CONFIRM_RETRIES="${LOGIN_CONFIRM_RETRIES:-5}"
 LOGIN_CONFIRM_INTERVAL="${LOGIN_CONFIRM_INTERVAL:-2}"
+STATUS_WAIT_TIMEOUT="${STATUS_WAIT_TIMEOUT:-180}"
+STATUS_POLL_INTERVAL="${STATUS_POLL_INTERVAL:-2}"
+DOCKER_INSPECT_TIMEOUT="${DOCKER_INSPECT_TIMEOUT:-10}"
+TIMEOUT_BIN="${TIMEOUT_BIN:-timeout}"
+TIMEOUT_TERM_GRACE=2
 
 PYTHON_BIN="${PYTHON_BIN:-python3}"
+CURL_BIN="${CURL_BIN:-curl}"
+DOCKER_BIN="${DOCKER_BIN:-docker}"
 REQUIREMENTS_FILE="${REQUIREMENTS_FILE:-${SCRIPTS_DIR}/requirements.txt}"
 if [ -n "${XDG_DATA_HOME:-}" ]; then
   _DEFAULT_DATA_HOME="$XDG_DATA_HOME"
@@ -30,25 +315,42 @@ else
 fi
 VENV_DIR="${CF_AGENT_WECHAT_VENV:-${_DEFAULT_DATA_HOME:+${_DEFAULT_DATA_HOME}/cf-agent-wechat/venv}}"
 
-case "$API_URL" in
-  http://*) _DEFAULT_WS_URL="ws://${API_URL#http://}/api/ws/login" ;;
-  https://*) _DEFAULT_WS_URL="wss://${API_URL#https://}/api/ws/login" ;;
-  *) _DEFAULT_WS_URL="" ;;
-esac
-WS_URL="${WS_URL:-${_DEFAULT_WS_URL}}"
-
 unset AUTH_TOKEN
 AUTH_TOKEN=""
 export -n AUTH_TOKEN
 AUTH_STATUS=""
-AUTH_ACCOUNT=""
 LAST_ERROR=""
 LOGIN_PYTHON=""
+SUDO_AUTHORIZED=0
 
 error() {
   printf '错误：%s\n' "$*" >&2
 }
 
+authorize_management_sudo() {
+  local purpose="${1:-执行生产管理操作}"
+  local current_uid
+
+  if ! current_uid="$(/usr/bin/id -u 2>/dev/null)" ||
+    ! [[ "$current_uid" =~ ^[0-9]+$ ]]; then
+    LAST_ERROR="无法确定当前管理用户 UID。"
+    return 1
+  fi
+  if [ "$current_uid" = "0" ] || [ "$SUDO_AUTHORIZED" -eq 1 ]; then
+    return 0
+  fi
+  if ! command -v sudo >/dev/null 2>&1; then
+    LAST_ERROR="$purpose 需要 sudo，但系统未安装 sudo。"
+    return 1
+  fi
+
+  printf '需要 sudo 权限以%s；请在终端完成授权。\n' "$purpose" >&2
+  if ! sudo -v; then
+    LAST_ERROR="$purpose 失败：当前用户没有可用的 sudo 权限。"
+    return 1
+  fi
+  SUDO_AUTHORIZED=1
+}
 resolve_python() {
   local candidate
 
@@ -66,41 +368,240 @@ resolve_python() {
 }
 
 validate_configuration() {
-  case "$API_URL" in
-    http://*|https://*) ;;
+  local normalized_runtime_a normalized_runtime_b docker_override
+
+  if [ -n "$_MANAGEMENT_ENV_ERROR" ]; then
+    LAST_ERROR="$_MANAGEMENT_ENV_ERROR"
+    return 1
+  fi
+  for docker_override in DOCKER_HOST DOCKER_CONTEXT DOCKER_TLS_VERIFY DOCKER_CERT_PATH; do
+    if [[ -v $docker_override ]]; then
+      LAST_ERROR="$docker_override 不能覆盖生产本地 Docker daemon。"
+      return 1
+    fi
+  done
+
+
+  if [ -n "$_ENV_RUNTIME_ROOT" ]; then
+    if [ "${CF_RUNTIME_ROOT+x}" = x ]; then
+      if ! normalized_runtime_a="$(normalize_management_path "$CF_RUNTIME_ROOT")" ||
+        [ "$normalized_runtime_a" != "$_ENV_RUNTIME_ROOT" ]; then
+        LAST_ERROR="CF_RUNTIME_ROOT 与 docker/.env 中持久化的 runtime root 冲突。"
+        return 1
+      fi
+    fi
+    if [ "${CF_AGENT_WECHAT_RUNTIME_ROOT+x}" = x ]; then
+      if ! normalized_runtime_a="$(normalize_management_path "$CF_AGENT_WECHAT_RUNTIME_ROOT")" ||
+        [ "$normalized_runtime_a" != "$_ENV_RUNTIME_ROOT" ]; then
+        LAST_ERROR="CF_AGENT_WECHAT_RUNTIME_ROOT 与 docker/.env 中持久化的 runtime root 冲突。"
+        return 1
+      fi
+    fi
+    if [ "${CF_AGENT_WECHAT_STORAGE_ROOT+x}" = x ]; then
+      if ! normalized_runtime_a="$(normalize_management_path "$CF_AGENT_WECHAT_STORAGE_ROOT")" ||
+        [ "$normalized_runtime_a" != "$_ENV_RUNTIME_ROOT" ]; then
+        LAST_ERROR="CF_AGENT_WECHAT_STORAGE_ROOT 与 docker/.env 中持久化的 runtime root 冲突。"
+        return 1
+      fi
+    fi
+    if [ "$_PROCESS_TOKEN_FILE_SET" = x ] &&
+      [ "$_PROCESS_TOKEN_FILE" != "$DEFAULT_TOKEN_FILE" ]; then
+      LAST_ERROR="TOKEN_FILE 必须精确匹配 docker/.env runtime 派生路径 ${DEFAULT_TOKEN_FILE}。"
+      return 1
+    fi
+  fi
+
+  if [ "${CF_RUNTIME_ROOT+x}" = x ] &&
+    [ "${CF_AGENT_WECHAT_RUNTIME_ROOT+x}" = x ]; then
+    if ! normalized_runtime_a="$(normalize_management_path "$CF_RUNTIME_ROOT")" ||
+      ! normalized_runtime_b="$(normalize_management_path "$CF_AGENT_WECHAT_RUNTIME_ROOT")" ||
+      [ "$normalized_runtime_a" != "$normalized_runtime_b" ]; then
+      LAST_ERROR="CF_RUNTIME_ROOT 与 CF_AGENT_WECHAT_RUNTIME_ROOT 必须指向同一目录。"
+      return 1
+    fi
+  fi
+
+  if [ -n "$_ENV_BIND_IP" ] &&
+    [ "${AGENT_WECHAT_BIND_IP+x}" = x ] &&
+    [ "$AGENT_WECHAT_BIND_IP" != "$_ENV_BIND_IP" ]; then
+    LAST_ERROR="AGENT_WECHAT_BIND_IP 与 docker/.env 中持久化的 bind IP 冲突。"
+    return 1
+  fi
+  if [ -n "$_ENV_PORT" ] &&
+    [ "${AGENT_WECHAT_PORT+x}" = x ] &&
+    [ "$AGENT_WECHAT_PORT" != "$_ENV_PORT" ]; then
+    LAST_ERROR="AGENT_WECHAT_PORT 与 docker/.env 中持久化的端口冲突。"
+    return 1
+  fi
+  if [ -n "$_ENV_CONTAINER_NAME" ]; then
+    if [ "${AGENT_WECHAT_CONTAINER_NAME+x}" = x ] &&
+      [ "$AGENT_WECHAT_CONTAINER_NAME" != "$_ENV_CONTAINER_NAME" ]; then
+      LAST_ERROR="AGENT_WECHAT_CONTAINER_NAME 与 docker/.env 中持久化的容器名冲突。"
+      return 1
+    fi
+    if [ "$_PROCESS_CONTAINER_NAME_SET" = x ] &&
+      [ "$_PROCESS_CONTAINER_NAME" != "$_ENV_CONTAINER_NAME" ]; then
+      LAST_ERROR="CONTAINER_NAME 与 docker/.env 中持久化的容器名冲突。"
+      return 1
+    fi
+  fi
+  case "$RUNTIME_ROOT" in
+    /)
+      LAST_ERROR="CF_RUNTIME_ROOT 不能是文件系统根目录 /。"
+      return 1
+      ;;
+    /*) ;;
     *)
-      LAST_ERROR="API_URL 必须以 http:// 或 https:// 开头：${API_URL}"
+      LAST_ERROR="CF_RUNTIME_ROOT 必须是绝对路径：${RUNTIME_ROOT}"
+      return 1
+      ;;
+  esac
+  case "$RUNTIME_ROOT" in
+    *[[:cntrl:]]*|*/../*|*/..)
+      LAST_ERROR="CF_RUNTIME_ROOT 包含不允许的路径或控制字符：${RUNTIME_ROOT}"
+      return 1
+      ;;
+  esac
+  if [ "$MANAGEMENT_BIND_IP" != "127.0.0.1" ]; then
+    LAST_ERROR="AGENT_WECHAT_BIND_IP 必须是 127.0.0.1。"
+    return 1
+  fi
+  if ! [[ "$MANAGEMENT_PORT" =~ ^[1-9][0-9]*$ ]] ||
+    [ "$MANAGEMENT_PORT" -gt 65535 ]; then
+    LAST_ERROR="AGENT_WECHAT_PORT 必须是 1 到 65535 的整数。"
+    return 1
+  fi
+  if ! [[ "$HTTP_CONNECT_TIMEOUT" =~ ^[1-9][0-9]*$ ]]; then
+    LAST_ERROR="HTTP_CONNECT_TIMEOUT 必须是正整数秒。"
+    return 1
+  fi
+  if ! [[ "$HTTP_TIMEOUT" =~ ^[1-9][0-9]*$ ]]; then
+    LAST_ERROR="HTTP_TIMEOUT 必须是正整数秒。"
+    return 1
+  fi
+  if ! [[ "$CONTAINER_NAME" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]]; then
+    LAST_ERROR="agent-wechat 容器名无效。"
+    return 1
+  fi
+
+  case "$TOKEN_FILE" in
+    /*) ;;
+    *)
+      LAST_ERROR="TOKEN_FILE 必须是绝对路径：${TOKEN_FILE}"
+      return 1
+      ;;
+  esac
+  case "$TOKEN_FILE" in
+    *[[:cntrl:]]*|*/../*|*/..)
+      LAST_ERROR="TOKEN_FILE 包含不允许的路径或控制字符：${TOKEN_FILE}"
       return 1
       ;;
   esac
 
-  case "$WS_URL" in
-    ws://*|wss://*) ;;
-    *)
-      LAST_ERROR="WS_URL 必须以 ws:// 或 wss:// 开头：${WS_URL}"
-      return 1
-      ;;
-  esac
+  if [ "$API_URL" != "http://127.0.0.1:${MANAGEMENT_PORT}" ]; then
+    LAST_ERROR="API_URL 必须精确匹配本机生产端点 http://127.0.0.1:${MANAGEMENT_PORT}。"
+    return 1
+  fi
+  if [ "$_PROCESS_HEALTH_URL_SET" = x ] &&
+    [ "$_PROCESS_HEALTH_URL" != "$HEALTH_URL" ]; then
+    LAST_ERROR="HEALTH_URL 不能独立覆盖；它必须由 API_URL 推导。"
+    return 1
+  fi
+  if [ "$_PROCESS_WS_URL_SET" = x ] &&
+    [ "$_PROCESS_WS_URL" != "$WS_URL" ]; then
+    LAST_ERROR="WS_URL 不能独立覆盖；它必须由 API_URL 推导。"
+    return 1
+  fi
 
-  case "$SESSION_ID" in
-    *$'\r'*|*$'\n'*)
-      LAST_ERROR="SESSION_ID 不能包含换行符。"
-      return 1
-      ;;
-  esac
+  if [ "$SESSION_ID" != default ]; then
+    LAST_ERROR="生产 SESSION_ID 必须是 default。"
+    return 1
+  fi
   if ! [[ "$LOGIN_TIMEOUT_MS" =~ ^[1-9][0-9]*$ ]]; then
-    LAST_ERROR="LOGIN_TIMEOUT_MS must be positive."
+    LAST_ERROR="LOGIN_TIMEOUT_MS 必须是正整数。"
     return 1
   fi
   if ! [[ "$LOGIN_CONFIRM_RETRIES" =~ ^[1-9][0-9]*$ ]]; then
-    LAST_ERROR="LOGIN_CONFIRM_RETRIES must be positive."
+    LAST_ERROR="LOGIN_CONFIRM_RETRIES 必须是正整数。"
+    return 1
+  fi
+  if ! [[ "$LOGIN_CONFIRM_INTERVAL" =~ ^[0-9]+$ ]]; then
+    LAST_ERROR="LOGIN_CONFIRM_INTERVAL 必须是非负整数秒。"
+    return 1
+  fi
+  if ! [[ "$STATUS_WAIT_TIMEOUT" =~ ^[1-9][0-9]*$ ]]; then
+    LAST_ERROR="STATUS_WAIT_TIMEOUT 必须是正整数秒。"
+    return 1
+  fi
+  if ! [[ "$STATUS_POLL_INTERVAL" =~ ^[1-9][0-9]*$ ]]; then
+    LAST_ERROR="STATUS_POLL_INTERVAL 必须是正整数秒。"
+    return 1
+  fi
+  if ! [[ "$DOCKER_INSPECT_TIMEOUT" =~ ^[1-9][0-9]*$ ]]; then
+    LAST_ERROR="DOCKER_INSPECT_TIMEOUT 必须是正整数秒。"
     return 1
   fi
 
 }
 
+validate_token_file_content() {
+  local token_path="$1"
+
+  /usr/bin/od -An -v -t u1 -- "$token_path" | /usr/bin/awk '
+    BEGIN {
+      content_bytes = 0
+      line_ended = 0
+      bad_format = 0
+      too_long = 0
+      bad_control = 0
+    }
+    {
+      for (field = 1; field <= NF; field++) {
+        byte = $field + 0
+        if (byte == 10) {
+          if (content_bytes == 0 || line_ended) {
+            bad_format = 1
+          }
+          line_ended = 1
+        } else {
+          if (line_ended) {
+            bad_format = 1
+          }
+          content_bytes++
+          if (content_bytes > 8192) {
+            too_long = 1
+          }
+          if (byte < 32 || byte == 127) {
+            bad_control = 1
+          }
+        }
+      }
+    }
+    END {
+      if (content_bytes == 0 || bad_format) {
+        exit 48
+      }
+      if (too_long) {
+        exit 49
+      }
+      if (bad_control) {
+        exit 50
+      }
+    }
+  '
+}
+
+set_token_content_error() {
+  case "$1" in
+    48) LAST_ERROR="token 文件必须只包含一行非空 token：${TOKEN_FILE}" ;;
+    49) LAST_ERROR="token 内容不能超过 8192 字节：${TOKEN_FILE}" ;;
+    50) LAST_ERROR="token 不能包含 C0 或 DEL 控制字符：${TOKEN_FILE}" ;;
+    *) LAST_ERROR="无法验证 token 文件内容：${TOKEN_FILE}" ;;
+  esac
+}
+
 load_auth_token() {
-  local token_value token_status
+  local token_value token_status metadata token_dir current_uid
 
   AUTH_TOKEN=""
   export -n AUTH_TOKEN
@@ -113,22 +614,75 @@ load_auth_token() {
       LAST_ERROR="token 路径不是普通文件：${TOKEN_FILE}"
       return 1
     fi
+    if [ "$TOKEN_FILE" = "$PRIVILEGED_TOKEN_FILE" ]; then
+      if [ -L "$PRIVILEGED_SECRETS_DIR" ] || [ ! -d "$PRIVILEGED_SECRETS_DIR" ]; then
+        LAST_ERROR="secrets 路径必须是非符号链接目录：$PRIVILEGED_SECRETS_DIR"
+        return 1
+      fi
+      if ! metadata="$(/usr/bin/stat -c '%u:%g:%a' -- "$PRIVILEGED_SECRETS_DIR")" ||
+        [ "$metadata" != "0:0:700" ]; then
+        LAST_ERROR="secrets 目录必须保持 root:root 700：$PRIVILEGED_SECRETS_DIR"
+        return 1
+      fi
+      if ! metadata="$(/usr/bin/stat -c '%u:%g:%a' -- "$TOKEN_FILE")" ||
+        [ "$metadata" != "0:0:600" ]; then
+        LAST_ERROR="auth-token 必须保持 root:root 600：$TOKEN_FILE"
+        return 1
+      fi
+    elif [ "$(/usr/bin/uname -s)" = "Linux" ]; then
+      token_dir="$(/usr/bin/dirname -- "$TOKEN_FILE")"
+      if [ -L "$token_dir" ] || [ ! -d "$token_dir" ]; then
+        LAST_ERROR="自定义 secrets 路径必须是非符号链接目录：$token_dir"
+        return 1
+      fi
+      if ! current_uid="$(/usr/bin/id -u)"; then
+        LAST_ERROR="无法确定当前管理用户 UID。"
+        return 1
+      fi
+      if ! metadata="$(/usr/bin/stat -c '%u:%a' -- "$token_dir")" ||
+        [ "$metadata" != "$current_uid:700" ]; then
+        LAST_ERROR="自定义 secrets 目录必须由当前管理用户持有且 mode 700：$token_dir"
+        return 1
+      fi
+      if ! metadata="$(/usr/bin/stat -c '%u:%a' -- "$TOKEN_FILE")" ||
+        [ "$metadata" != "$current_uid:600" ]; then
+        LAST_ERROR="自定义 auth-token 必须由当前管理用户持有且 mode 600：$TOKEN_FILE"
+        return 1
+      fi
+    fi
+    if validate_token_file_content "$TOKEN_FILE"; then
+      token_status=0
+    else
+      token_status=$?
+    fi
+    if [ "$token_status" -ne 0 ]; then
+      set_token_content_error "$token_status"
+      return 1
+    fi
     if ! token_value="$(/bin/cat -- "$TOKEN_FILE")"; then
       LAST_ERROR="无法读取 token 文件：${TOKEN_FILE}"
       return 1
     fi
   else
-    if [ "$TOKEN_FILE" != "$DEFAULT_TOKEN_FILE" ]; then
-      LAST_ERROR="当前用户无法读取自定义 token 路径；sudo 读取仅允许默认路径：${DEFAULT_TOKEN_FILE}"
+    if [ "$TOKEN_FILE" != "$PRIVILEGED_TOKEN_FILE" ]; then
+      if [ "$TOKEN_FILE" = "$DEFAULT_TOKEN_FILE" ]; then
+        LAST_ERROR="当前用户无法读取自定义 runtime 的 token：${TOKEN_FILE}；sudo 自动读取仅允许批准路径 ${PRIVILEGED_TOKEN_FILE}"
+      else
+        LAST_ERROR="当前用户无法读取自定义 token 路径：${TOKEN_FILE}；sudo 自动读取仅允许批准路径 ${PRIVILEGED_TOKEN_FILE}"
+      fi
       return 1
     fi
     if ! command -v sudo >/dev/null 2>&1; then
       LAST_ERROR="当前用户无法读取 token，且未安装 sudo：${TOKEN_FILE}"
       return 1
     fi
+    if ! authorize_management_sudo "读取受保护的生产 auth-token"; then
+      return 1
+    fi
+
 
     if token_value="$(
-      sudo -- /bin/sh -c '
+      sudo -n -- /bin/sh -c '
 token_file=/srv/storage/cf-agent-wechat/secrets/auth-token
 secrets_dir=/srv/storage/cf-agent-wechat/secrets
 if [ ! -e "$secrets_dir" ]; then
@@ -155,6 +709,52 @@ fi
 if [ "$(/usr/bin/stat -c "%u:%g:%a" "$token_file")" != "0:0:600" ]; then
   exit 46
 fi
+/usr/bin/od -An -v -t u1 -- "$token_file" | /usr/bin/awk "
+  BEGIN {
+    content_bytes = 0
+    line_ended = 0
+    bad_format = 0
+    too_long = 0
+    bad_control = 0
+  }
+  {
+    for (field = 1; field <= NF; field++) {
+      byte = \$field + 0
+      if (byte == 10) {
+        if (content_bytes == 0 || line_ended) {
+          bad_format = 1
+        }
+        line_ended = 1
+      } else {
+        if (line_ended) {
+          bad_format = 1
+        }
+        content_bytes++
+        if (content_bytes > 8192) {
+          too_long = 1
+        }
+        if (byte < 32 || byte == 127) {
+          bad_control = 1
+        }
+      }
+    }
+  }
+  END {
+    if (content_bytes == 0 || bad_format) {
+      exit 48
+    }
+    if (too_long) {
+      exit 49
+    }
+    if (bad_control) {
+      exit 50
+    }
+  }
+"
+token_status=$?
+if [ "$token_status" -ne 0 ]; then
+  exit "$token_status"
+fi
 exec /bin/cat -- "$token_file"
 ' cf-agent-wechat-token-reader
     )"; then
@@ -171,6 +771,9 @@ exec /bin/cat -- "$token_file"
       45) LAST_ERROR="secrets 目录必须保持 root:root 700：/srv/storage/cf-agent-wechat/secrets" ;;
       46) LAST_ERROR="auth-token 必须保持 root:root 600：${TOKEN_FILE}" ;;
       47) LAST_ERROR="secrets 路径必须是非符号链接目录：/srv/storage/cf-agent-wechat/secrets" ;;
+      48) LAST_ERROR="token 文件必须只包含一行非空 token：${TOKEN_FILE}" ;;
+      49) LAST_ERROR="token 内容不能超过 8192 字节：${TOKEN_FILE}" ;;
+      50) LAST_ERROR="token 不能包含 C0 或 DEL 控制字符：${TOKEN_FILE}" ;;
       *) LAST_ERROR="当前用户无法读取 token，且没有可用的 sudo 权限：${TOKEN_FILE}" ;;
     esac
     if [ "$token_status" -ne 0 ]; then
@@ -180,25 +783,15 @@ exec /bin/cat -- "$token_file"
 
   AUTH_TOKEN="$token_value"
   export -n AUTH_TOKEN
-  if [ -z "$AUTH_TOKEN" ]; then
-    LAST_ERROR="token 文件为空：${TOKEN_FILE}"
-    return 1
-  fi
-  case "$AUTH_TOKEN" in
-    *$'\r'*|*$'\n'*)
-      LAST_ERROR="token 文件必须只包含一行 token：${TOKEN_FILE}"
-      AUTH_TOKEN=""
-      return 1
-      ;;
-  esac
 }
 
 api_request() {
   local method="$1"
   local path="$2"
+  local request_timeout="${3:-$HTTP_TIMEOUT}"
 
   printf 'Authorization: Bearer %s\nX-Session-Id: %s\n' \
-    "$AUTH_TOKEN" "$SESSION_ID" | curl \
+    "$AUTH_TOKEN" "$SESSION_ID" | "$CURL_BIN" \
     --disable \
     --noproxy '*' \
     --request "$method" \
@@ -206,7 +799,7 @@ api_request() {
     --silent \
     --show-error \
     --connect-timeout "$HTTP_CONNECT_TIMEOUT" \
-    --max-time "$HTTP_TIMEOUT" \
+    --max-time "$request_timeout" \
     --header @- \
     "${API_URL}${path}"
 }
@@ -234,56 +827,114 @@ if not isinstance(status, str) or not status:
     print("认证状态响应缺少 status 字段。", file=sys.stderr)
     raise SystemExit(2)
 
-account = payload.get("loggedInUser") or ""
-if not isinstance(account, str):
-    account = str(account)
-if any(character in account for character in ("\n", "\r", "\t")):
-    print("loggedInUser 字段包含非法换行符。", file=sys.stderr)
-    raise SystemExit(2)
-
-if any(character in status for character in ("\n", "\r", "\t")):
+if any(ord(character) < 0x20 or ord(character) == 0x7F for character in status):
     print("status contains an invalid control character.", file=sys.stderr)
     raise SystemExit(2)
 
-sys.stdout.write(status + "\t" + account)
+sys.stdout.write(status)
 ')"; then
     LAST_ERROR="无法解析 agent-wechat 认证状态。"
     return 1
   fi
 
-  AUTH_STATUS="${parsed%%$'\t'*}"
-  if [[ "$parsed" == *$'\t'* ]]; then
-    AUTH_ACCOUNT="${parsed#*$'\t'}"
-  else
-    AUTH_ACCOUNT=""
-  fi
+  AUTH_STATUS="$parsed"
 }
 
 fetch_auth_status() {
   local response
+  local request_timeout="${1:-$HTTP_TIMEOUT}"
 
-  if ! response="$(api_request GET /api/status/auth 2>&1)"; then
+  if ! response="$(api_request GET /api/status/auth "$request_timeout" 2>&1)"; then
     LAST_ERROR="认证状态接口调用失败：${response}"
     return 1
   fi
   parse_auth_response "$response"
 }
 
+auth_status_is_login_pending() {
+  case "$1" in
+    logged_out|qr_pending|waiting_for_qr|waiting_for_scan) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+check_api_health() {
+  local request_timeout="${1:-$HTTP_TIMEOUT}"
+
+  if ! "$CURL_BIN" \
+    --disable \
+    --noproxy '*' \
+    --request GET \
+    --fail \
+    --silent \
+    --show-error \
+    --connect-timeout "$HTTP_CONNECT_TIMEOUT" \
+    --max-time "$request_timeout" \
+    "$HEALTH_URL" >/dev/null 2>&1; then
+    LAST_ERROR="agent-wechat health API 不可用：${HEALTH_URL}"
+    return 1
+  fi
+}
+
+run_with_hard_timeout() {
+  local hard_timeout="$1"
+  local soft_timeout
+  shift
+
+  if [ "$hard_timeout" -le "$TIMEOUT_TERM_GRACE" ]; then
+    "$TIMEOUT_BIN" --signal=KILL "${hard_timeout}s" "$@"
+    return
+  fi
+
+  soft_timeout=$((hard_timeout - TIMEOUT_TERM_GRACE))
+  "$TIMEOUT_BIN" --signal=TERM --kill-after="${TIMEOUT_TERM_GRACE}s" \
+    "${soft_timeout}s" "$@"
+}
+
+bounded_docker_inspect_timeout() {
+  local deadline="${1:-0}"
+  local remaining
+
+  if [ "$deadline" -le 0 ]; then
+    printf '%s' "$DOCKER_INSPECT_TIMEOUT"
+    return 0
+  fi
+
+  remaining=$((deadline - SECONDS))
+  [ "$remaining" -gt 0 ] || return 1
+  if [ "$DOCKER_INSPECT_TIMEOUT" -lt "$remaining" ]; then
+    printf '%s' "$DOCKER_INSPECT_TIMEOUT"
+  else
+    printf '%s' "$remaining"
+  fi
+}
+
+run_bounded_docker_inspect() {
+  local deadline="$1"
+  local command_timeout
+  shift
+
+  command_timeout="$(bounded_docker_inspect_timeout "$deadline")" || return 124
+  run_with_hard_timeout "$command_timeout" "$@"
+}
+
 detect_container_status() {
+  local deadline="${1:-0}"
   local inspect_output inspect_status inspect_state error_lower line
 
-  if ! command -v docker >/dev/null 2>&1; then
+  if ! command -v "$DOCKER_BIN" >/dev/null 2>&1 ||
+    ! command -v "$TIMEOUT_BIN" >/dev/null 2>&1; then
     return 1
   fi
 
-  if inspect_output="$(
-    LC_ALL=C docker inspect --format '{{.State.Running}}' "$CONTAINER_NAME" 2>&1
-  )"; then
+  if inspect_output="$(LC_ALL=C run_bounded_docker_inspect "$deadline" \
+    "$DOCKER_BIN" --host unix:///var/run/docker.sock inspect --format '{{.State.Running}}' "$CONTAINER_NAME" 2>&1)"; then
     inspect_status=0
   else
     inspect_status=$?
   fi
   if [ "$inspect_status" -ne 0 ]; then
+    case "$inspect_status" in 124|137) return "$inspect_status" ;; esac
     error_lower="${inspect_output,,}"
     case "$error_lower" in
       *permission\ denied*|*access\ denied*|*operation\ not\ permitted*) ;;
@@ -297,10 +948,17 @@ detect_container_status() {
     if ! command -v sudo >/dev/null 2>&1; then
       return 1
     fi
-    if ! inspect_output="$(
-      sudo -- docker inspect --format '{{.State.Running}}' "$CONTAINER_NAME" 2>/dev/null
-    )"; then
+    if ! authorize_management_sudo "查询生产 Docker 容器状态"; then
       return 1
+    fi
+    if inspect_output="$(run_bounded_docker_inspect "$deadline" sudo -n -- \
+      "$DOCKER_BIN" --host unix:///var/run/docker.sock inspect --format '{{.State.Running}}' \
+      "$CONTAINER_NAME" 2>/dev/null)"; then
+      inspect_status=0
+    else
+      inspect_status=$?
+      case "$inspect_status" in 124|137) return "$inspect_status" ;; esac
+      return "$inspect_status"
     fi
   fi
 
@@ -327,6 +985,69 @@ detect_container_status() {
       ;;
     *) return 1 ;;
   esac
+}
+
+detect_container_health() {
+  local deadline="${1:-0}"
+  local inspect_output inspect_status health_status error_lower line
+
+  if ! command -v "$DOCKER_BIN" >/dev/null 2>&1 ||
+    ! command -v "$TIMEOUT_BIN" >/dev/null 2>&1; then
+    return 1
+  fi
+
+  if inspect_output="$(LC_ALL=C run_bounded_docker_inspect "$deadline" \
+    "$DOCKER_BIN" --host unix:///var/run/docker.sock inspect --format \
+    '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' \
+    "$CONTAINER_NAME" 2>&1)"; then
+    inspect_status=0
+  else
+    inspect_status=$?
+  fi
+  if [ "$inspect_status" -ne 0 ]; then
+    case "$inspect_status" in 124|137) return "$inspect_status" ;; esac
+    error_lower="${inspect_output,,}"
+    case "$error_lower" in
+      *permission\ denied*|*access\ denied*|*operation\ not\ permitted*) ;;
+      *) return 1 ;;
+    esac
+    case "$error_lower" in
+      *docker.sock*|*docker\ daemon\ socket*|*docker\ socket*|*connect\ to\ the\ docker\ daemon*) ;;
+      *) return 1 ;;
+    esac
+
+    if ! command -v sudo >/dev/null 2>&1; then
+      return 1
+    fi
+    if ! authorize_management_sudo "查询生产 Docker health 状态"; then
+      return 1
+    fi
+    if inspect_output="$(run_bounded_docker_inspect "$deadline" sudo -n -- \
+      "$DOCKER_BIN" --host unix:///var/run/docker.sock inspect --format \
+      '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' \
+      "$CONTAINER_NAME" 2>/dev/null)"; then
+      inspect_status=0
+    else
+      inspect_status=$?
+      case "$inspect_status" in 124|137) return "$inspect_status" ;; esac
+      return "$inspect_status"
+    fi
+  fi
+
+  health_status=""
+  while IFS= read -r line; do
+    case "$line" in
+      healthy|starting|unhealthy|none)
+        if [ -n "$health_status" ] && [ "$health_status" != "$line" ]; then
+          return 1
+        fi
+        health_status="$line"
+        ;;
+    esac
+  done <<< "$inspect_output"
+
+  [ -n "$health_status" ] || return 1
+  printf '%s' "$health_status"
 }
 
 validate_venv_location() {

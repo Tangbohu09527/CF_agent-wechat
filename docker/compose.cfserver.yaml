@@ -17,19 +17,19 @@ services:
 
     volumes:
       - type: bind
-        source: "${CF_AGENT_WECHAT_STORAGE_ROOT:-/srv/storage/cf-agent-wechat}/data"
+        source: "${CF_AGENT_WECHAT_RUNTIME_ROOT:-${CF_AGENT_WECHAT_STORAGE_ROOT:-/srv/storage/cf-agent-wechat}}/data"
         target: /data
         bind:
           create_host_path: false
 
       - type: bind
-        source: "${CF_AGENT_WECHAT_STORAGE_ROOT:-/srv/storage/cf-agent-wechat}/wechat-home"
+        source: "${CF_AGENT_WECHAT_RUNTIME_ROOT:-${CF_AGENT_WECHAT_STORAGE_ROOT:-/srv/storage/cf-agent-wechat}}/wechat-home"
         target: /home/wechat
         bind:
           create_host_path: false
 
       - type: bind
-        source: "${CF_AGENT_WECHAT_STORAGE_ROOT:-/srv/storage/cf-agent-wechat}/secrets/auth-token"
+        source: "${CF_AGENT_WECHAT_RUNTIME_ROOT:-${CF_AGENT_WECHAT_STORAGE_ROOT:-/srv/storage/cf-agent-wechat}}/secrets/auth-token"
         target: /data/auth-token
         read_only: true
         bind:
@@ -71,7 +71,9 @@ services:
     stop_grace_period: 30s
 
     networks:
-      - cf-internal
+      cf-internal:
+        aliases:
+          - cf-agent-wechat
 
 networks:
   cf-internal:

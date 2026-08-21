@@ -6,6 +6,8 @@ TEST_ROOT=""
 DEPLOYMENT_DIR="/srv/storage/cf-agent-wechat"
 TEST_USER="cfwtest$$"
 NO_SUDO_USER="cfwnosudo$$"
+PASSWORD_SUDO_USER="cfwpasswd$$"
+PASSWORD_SUDO_PASSWORD="CfPermission-$TEST_USER-A9!"
 MOCK_PID=""
 LOGIN_PID=""
 CONTAINER_CREATED=0
@@ -17,6 +19,7 @@ AUDIT_LOG=""
 AUDIT_PATH=""
 REAL_DOCKER=""
 REAL_SUDO=""
+REAL_SCRIPT=""
 
 fail() {
   printf 'FAIL: %s\n' "$*" >&2
@@ -39,6 +42,7 @@ cleanup() {
   rm -f "$SUDOERS_FILE"
   userdel --force --remove "$TEST_USER" >/dev/null 2>&1
   userdel --force --remove "$NO_SUDO_USER" >/dev/null 2>&1
+  userdel --force --remove "$PASSWORD_SUDO_USER" >/dev/null 2>&1
   if [ -n "$TEST_ROOT" ]; then
     rm -rf "$TEST_ROOT"
   fi
@@ -60,23 +64,29 @@ fi
 if [ -e "$DEPLOYMENT_DIR" ]; then
   fail "refusing to touch an existing deployment path: ${DEPLOYMENT_DIR}"
 fi
-if id "$TEST_USER" >/dev/null 2>&1 || id "$NO_SUDO_USER" >/dev/null 2>&1; then
+if id "$TEST_USER" >/dev/null 2>&1 || id "$NO_SUDO_USER" >/dev/null 2>&1 ||
+  id "$PASSWORD_SUDO_USER" >/dev/null 2>&1; then
   fail "temporary test user already exists"
 fi
 if [ -e "$SUDOERS_FILE" ]; then
   fail "temporary sudoers file already exists: ${SUDOERS_FILE}"
 fi
-for command_name in docker openssl python3 sudo useradd visudo; do
+for command_name in chpasswd docker flock openssl python3 script sudo timeout useradd visudo; do
   command -v "$command_name" >/dev/null 2>&1 || fail "missing command: ${command_name}"
 done
 REAL_DOCKER="$(command -v docker)"
 REAL_SUDO="$(command -v sudo)"
+REAL_SCRIPT="$(command -v script)"
+bash "${REPO_ROOT}/tests/integration/session_recovery.sh"
+printf 'PASS dependency-free restart/session recovery suite\n'
+
 
 TEST_ROOT="$(mktemp -d /tmp/cf-agent-wechat-permissions.XXXXXX)"
 chmod 755 "$TEST_ROOT"
 TEST_REPO="${TEST_ROOT}/repo"
 TEST_HOME="${TEST_ROOT}/home"
 NO_SUDO_HOME="${TEST_ROOT}/no-sudo-home"
+PASSWORD_SUDO_HOME="${TEST_ROOT}/password-sudo-home"
 SECRETS_DIR="${DEPLOYMENT_DIR}/secrets"
 TOKEN_FILE="${SECRETS_DIR}/auth-token"
 STATE_FILE="${TEST_ROOT}/state"
@@ -88,7 +98,7 @@ AUDIT_BIN="${TEST_ROOT}/audit-bin"
 AUDIT_LOG="${TEST_ROOT}/audit.log"
 AUDIT_PATH="${AUDIT_BIN}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
-install -d -o root -g root -m 755 "${TEST_REPO}/scripts"
+install -d -o root -g root -m 755 "${TEST_REPO}/docker" "${TEST_REPO}/scripts"
 install -o root -g root -m 755 \
   "${REPO_ROOT}/scripts/common.sh" \
   "${REPO_ROOT}/scripts/status.sh" \
@@ -98,6 +108,8 @@ install -o root -g root -m 755 \
 install -o root -g root -m 644 \
   "${REPO_ROOT}/scripts/requirements.txt" \
   "${TEST_REPO}/scripts/requirements.txt"
+install -o root -g root -m 644 "${REPO_ROOT}/docker/compose.cfserver.yaml" \
+  "${TEST_REPO}/docker/compose.cfserver.yaml"
 install -d -o root -g root -m 755 "$AUDIT_BIN"
 install -o root -g root -m 755 \
   "${REPO_ROOT}/tests/helpers/audit_docker.sh" "${AUDIT_BIN}/docker"
@@ -106,13 +118,17 @@ install -o root -g root -m 755 \
 
 useradd --create-home --home-dir "$TEST_HOME" --shell /bin/bash "$TEST_USER"
 useradd --create-home --home-dir "$NO_SUDO_HOME" --shell /bin/bash "$NO_SUDO_USER"
+useradd --create-home --home-dir "$PASSWORD_SUDO_HOME" --shell /bin/bash \
+  "$PASSWORD_SUDO_USER"
+printf '%s:%s\n' "$PASSWORD_SUDO_USER" "$PASSWORD_SUDO_PASSWORD" | chpasswd
 : > "$AUDIT_LOG"
 chown "$TEST_USER:$TEST_USER" "$AUDIT_LOG"
 chmod 600 "$AUDIT_LOG"
 if id -nG "$TEST_USER" | tr ' ' '\n' | grep -qx docker; then
   fail "test user must not belong to the docker group"
 fi
-printf '%s ALL=(root) NOPASSWD: ALL\n' "$TEST_USER" > "$SUDOERS_FILE"
+printf '%s ALL=(root) NOPASSWD: ALL\n%s ALL=(root) PASSWD: ALL\n' \
+  "$TEST_USER" "$PASSWORD_SUDO_USER" > "$SUDOERS_FILE"
 chmod 440 "$SUDOERS_FILE"
 visudo -cf "$SUDOERS_FILE" >/dev/null
 
@@ -127,6 +143,23 @@ printf 'logged_in\n' > "$STATE_FILE"
 reset_audit() {
   : > "$AUDIT_LOG"
 }
+write_management_environment() {
+  local port="$1"
+  local env_file="${TEST_REPO}/docker/.env"
+  local temp_file="${env_file}.tmp"
+
+  {
+    printf '%s\n' \
+      'CF_AGENT_WECHAT_RUNTIME_ROOT=/srv/storage/cf-agent-wechat' \
+      'AGENT_WECHAT_BIND_IP=127.0.0.1' \
+      "AGENT_WECHAT_PORT=$port" \
+      "AGENT_WECHAT_CONTAINER_NAME=$TEST_CONTAINER"
+  } > "$temp_file"
+  chown "$TEST_USER:$TEST_USER" "$temp_file"
+  chmod 600 "$temp_file"
+  mv -f -- "$temp_file" "$env_file"
+}
+
 
 audit_count() {
   awk -F '\t' -v category="$1" -v kind="$2" '
@@ -135,16 +168,61 @@ audit_count() {
   ' "$AUDIT_LOG"
 }
 
-assert_token_read_once() {
-  [ "$(audit_count sudo token-reader)" -eq 1 ] || \
-    fail "$1 did not use exactly one sudo token read"
+assert_sudo_contract() {
+  local label="$1" kind="$2" expected="$3"
+  local expected_host="$4" expected_noninteractive="$5"
+
+  awk -F '\t' -v kind="$kind" -v expected="$expected" \
+    -v host="host=$expected_host" \
+    -v noninteractive="noninteractive=$expected_noninteractive" '
+      $1 == "sudo" && $2 == kind {
+        count++
+        if ($3 != host || $4 != noninteractive) invalid = 1
+      }
+      END { exit !((count + 0) == expected && (invalid + 0) == 0) }
+    ' "$AUDIT_LOG" ||
+    fail "$label sudo $kind calls did not match count/host/noninteractive contract"
 }
 
-assert_only_token_sudo() {
-  local sudo_count
+assert_sudo_authorization_count() {
+  assert_sudo_contract "$1" authorization "$2" default 0
+}
+
+assert_sudo_docker_count() {
+  assert_sudo_contract "$1" docker-inspect "$2" \
+    unix:///var/run/docker.sock 1
+}
+
+assert_token_read_count() {
+  local label="$1" expected="${2:-1}"
+  assert_sudo_contract "$label" token-reader "$expected" default 1
+}
+
+assert_token_read_once() {
+  assert_token_read_count "$1" 1
+}
+
+assert_only_authorization_and_token_sudo() {
+  local label="$1" expected="${2:-1}" sudo_count
+
+  assert_sudo_authorization_count "$label" "$expected"
+  assert_token_read_count "$label" "$expected"
   sudo_count="$(awk -F '\t' '$1 == "sudo" { count++ } END { print count + 0 }' \
     "$AUDIT_LOG")"
-  [ "$sudo_count" -eq 1 ] || fail "$1 used sudo for more than the token read"
+  [ "$sudo_count" -eq "$((expected * 2))" ] ||
+    fail "$label used sudo beyond authorization and token reads"
+}
+
+assert_status_sudo_calls() {
+  local sudo_count
+
+  assert_sudo_authorization_count "status.sh" 1
+  assert_token_read_once "status.sh"
+  assert_sudo_docker_count "status.sh" 2
+  sudo_count="$(awk -F '\t' '$1 == "sudo" { count++ } END { print count + 0 }' \
+    "$AUDIT_LOG")"
+  [ "$sudo_count" -eq 4 ] ||
+    fail "status.sh used an unexpected sudo command"
 }
 
 assert_no_sudo_calls() {
@@ -165,6 +243,20 @@ assert_docker_fallback_order() {
   ' "$AUDIT_LOG")"
   [ "$calls" = $'ordinary\nsudo' ] || \
     fail "Docker inspect order was not ordinary then sudo"
+}
+
+assert_process_reaped() {
+  local pid="$1"
+  local label="$2"
+  local attempt
+
+  for attempt in {1..20}; do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      return
+    fi
+    sleep 0.1
+  done
+  fail "$label left process $pid running"
 }
 
 : > "$LOG_FILE"
@@ -262,37 +354,91 @@ PY
 run_script_as() {
   local user_name="$1"
   local script_name="$2"
+  local command_string
+  local -a command
   shift 2
-  "$REAL_SUDO" -u "$user_name" -H env \
-    API_URL="http://127.0.0.1:${HTTP_PORT}" \
-    WS_URL="ws://127.0.0.1:${WS_PORT}/api/ws/login" \
-    TOKEN_FILE="$TOKEN_FILE" \
-    PYTHON_BIN=python3 \
-    LOGIN_CONFIRM_INTERVAL=0 \
-    AUTH_TOKEN=exported-sentinel \
-    NO_COLOR=1 \
-    HTTP_PROXY=http://127.0.0.1:9 \
-    http_proxy=http://127.0.0.1:9 \
-    NO_PROXY= \
-    no_proxy= \
-    PATH="$AUDIT_PATH" \
-    CF_AUDIT_LOG="$AUDIT_LOG" \
-    CF_AUDIT_REAL_DOCKER="$REAL_DOCKER" \
-    CF_AUDIT_REAL_SUDO="$REAL_SUDO" \
-    "$@" \
-    /bin/bash -c 'cd "$1" && exec "./scripts/$2"' \
+
+  command=(
+    "$REAL_SUDO" -u "$user_name" -H env
+    -u XDG_RUNTIME_DIR
+    API_URL="http://127.0.0.1:${HTTP_PORT}"
+    AGENT_WECHAT_PORT="$HTTP_PORT"
+    TOKEN_FILE="$TOKEN_FILE"
+    PYTHON_BIN=python3
+    LOGIN_CONFIRM_INTERVAL=0
+    AUTH_TOKEN=exported-sentinel
+    NO_COLOR=1
+    HTTP_PROXY=http://127.0.0.1:9
+    http_proxy=http://127.0.0.1:9
+    NO_PROXY=
+    no_proxy=
+    PATH="$AUDIT_PATH"
+    CF_AUDIT_LOG="$AUDIT_LOG"
+    CF_AUDIT_REAL_DOCKER="$REAL_DOCKER"
+    CF_AUDIT_REAL_SUDO="$REAL_SUDO"
+    CONTAINER_NAME="$TEST_CONTAINER"
+    "$@"
+    /bin/bash -c 'cd "$1" && exec "./scripts/$2"'
     cf-agent-wechat-test "$TEST_REPO" "$script_name"
+  )
+  if [ "${RUN_WITH_TTY:-0}" = 1 ]; then
+    printf -v command_string '%q ' "${command[@]}"
+    script --quiet --return --command "$command_string" /dev/null
+  else
+    "${command[@]}"
+  fi
 }
 
 assert_secret_permissions
+chmod 644 "$TOKEN_FILE"
+if ROOT_TOKEN_OUTPUT="$(TOKEN_FILE="$TOKEN_FILE" /bin/bash -c '
+  source "$1"
+  if load_auth_token; then
+    exit 0
+  fi
+  printf "%s" "$LAST_ERROR"
+  exit 1
+' cf-agent-wechat-test "$TEST_REPO/scripts/common.sh")"; then
+  fail "root direct read accepted an auth-token with mode 644"
+fi
+grep -q 'auth-token 必须保持 root:root 600' <<< "$ROOT_TOKEN_OUTPUT" ||
+  fail "root direct read did not report auth-token permission drift"
+chmod 600 "$TOKEN_FILE"
+chmod 755 "$SECRETS_DIR"
+if ROOT_TOKEN_OUTPUT="$(TOKEN_FILE="$TOKEN_FILE" /bin/bash -c '
+  source "$1"
+  if load_auth_token; then
+    exit 0
+  fi
+  printf "%s" "$LAST_ERROR"
+  exit 1
+' cf-agent-wechat-test "$TEST_REPO/scripts/common.sh")"; then
+  fail "root direct read accepted a secrets directory with mode 755"
+fi
+grep -q 'secrets 目录必须保持 root:root 700' <<< "$ROOT_TOKEN_OUTPUT" ||
+  fail "root direct read did not report secrets directory permission drift"
+chmod 700 "$SECRETS_DIR"
+assert_secret_permissions
+printf 'PASS privileged token metadata is enforced for direct root reads\n'
 [ "$(/bin/bash -c 'source "$1"; printf "%s" "$CONTAINER_NAME"' \
   cf-agent-wechat-test "${TEST_REPO}/scripts/common.sh")" = "cf-agent-wechat" ] || \
   fail "default container name is not cf-agent-wechat"
 if docker inspect "$TEST_CONTAINER" >/dev/null 2>&1; then
   fail "unique test container already exists: ${TEST_CONTAINER}"
 fi
-docker run --detach --name "$TEST_CONTAINER" alpine:3.20 sleep 300 >/dev/null
+docker run --detach --name "$TEST_CONTAINER" \
+  --health-cmd true --health-interval 1s --health-timeout 1s --health-retries 3 \
+  alpine:3.20 sleep 300 >/dev/null
 CONTAINER_CREATED=1
+for _attempt in $(seq 1 30); do
+  [ "$(docker inspect --format '{{.State.Health.Status}}' "$TEST_CONTAINER")" = \
+    "healthy" ] && break
+  sleep 0.2
+done
+[ "$(docker inspect --format '{{.State.Health.Status}}' "$TEST_CONTAINER")" = \
+  "healthy" ] || fail "test container did not become healthy"
+write_management_environment 6174
+
 
 DOCKER_ERROR="${TEST_ROOT}/docker-error"
 if "$REAL_SUDO" -u "$TEST_USER" -H "$REAL_DOCKER" inspect "$TEST_CONTAINER" \
@@ -301,7 +447,8 @@ if "$REAL_SUDO" -u "$TEST_USER" -H "$REAL_DOCKER" inspect "$TEST_CONTAINER" \
 fi
 grep -Eqi 'permission denied|access denied|operation not permitted' "$DOCKER_ERROR" || \
   fail "ordinary docker inspect did not fail with a socket permission error"
-[ "$("$REAL_SUDO" -u "$TEST_USER" -H "$REAL_SUDO" -- "$REAL_DOCKER" inspect \
+[ "$("$REAL_SUDO" -u "$TEST_USER" -H "$REAL_SUDO" -n -- \
+  "$REAL_DOCKER" --host unix:///var/run/docker.sock inspect \
   --format '{{.State.Running}}' "$TEST_CONTAINER")" = "true" ] || \
   fail "sudo docker inspect did not report a running container"
 
@@ -311,21 +458,115 @@ EXPECTED_AUDIT_COMMANDS="$(printf '%s\n%s' "${AUDIT_BIN}/docker" "${AUDIT_BIN}/s
 [ "$AUDIT_COMMANDS" = "$EXPECTED_AUDIT_COMMANDS" ] || \
   fail "audit wrappers were not selected through PATH"
 
+if "$REAL_SCRIPT" --help 2>&1 | grep -q -- '--echo'; then
+  reset_audit
+  chown "$PASSWORD_SUDO_USER:$PASSWORD_SUDO_USER" "$AUDIT_LOG"
+  "$REAL_SUDO" -u "$PASSWORD_SUDO_USER" -H "$REAL_SUDO" -K
+  password_authorization_command=(
+    env
+    PATH="$AUDIT_PATH"
+    CF_AUDIT_LOG="$AUDIT_LOG"
+    CF_AUDIT_REAL_DOCKER="$REAL_DOCKER"
+    CF_AUDIT_REAL_SUDO="$REAL_SUDO"
+    /bin/bash -c '
+      source "$1"
+      authorize_management_sudo "验证首次密码 sudo 授权" || exit 1
+      [ "$SUDO_AUTHORIZED" -eq 1 ] || exit 1
+      sudo -n -- /usr/bin/true
+    '
+    cf-agent-wechat-test "$TEST_REPO/scripts/common.sh"
+  )
+  printf -v password_authorization_command_string '%q ' \
+    "${password_authorization_command[@]}"
+  PASSWORD_AUTH_OUTPUT="$TEST_ROOT/password-auth.out"
+  if ! printf '%s\n' "$PASSWORD_SUDO_PASSWORD" | \
+    "$REAL_SUDO" -u "$PASSWORD_SUDO_USER" -H \
+    "$REAL_SCRIPT" --quiet --return --echo never \
+    --command "$password_authorization_command_string" /dev/null \
+    > "$PASSWORD_AUTH_OUTPUT" 2>&1; then
+    cat "$PASSWORD_AUTH_OUTPUT" >&2
+    fail "first password-backed sudo authorization failed"
+  fi
+  if grep -Fq "$PASSWORD_SUDO_PASSWORD" "$PASSWORD_AUTH_OUTPUT"; then
+    fail "password-backed authorization echoed the temporary password"
+  fi
+  assert_sudo_authorization_count "password-backed authorization" 1
+  assert_sudo_contract "post-authorization command" other 1 default 1
+  grep -q '需要 sudo 权限以验证首次密码 sudo 授权' "$PASSWORD_AUTH_OUTPUT" ||
+    fail "password-backed authorization did not show the authorization purpose"
+  chown "$TEST_USER:$TEST_USER" "$AUDIT_LOG"
+  reset_audit
+  printf 'PASS first password sudo authorization enables noninteractive follow-up\n'
+else
+  printf 'SKIP first password sudo authorization: script lacks --echo never support\n'
+fi
+
 reset_audit
-DETECT_OUTPUT="$("$REAL_SUDO" -u "$TEST_USER" -H env \
+DETECT_ERROR="${TEST_ROOT}/detect-container-status.err"
+if DETECT_OUTPUT="$("$REAL_SUDO" -u "$TEST_USER" -H env \
   PATH="$AUDIT_PATH" \
   CF_AUDIT_LOG="$AUDIT_LOG" \
   CF_AUDIT_REAL_DOCKER="$REAL_DOCKER" \
   CF_AUDIT_REAL_SUDO="$REAL_SUDO" \
-  CONTAINER_NAME="$TEST_CONTAINER" /bin/bash -c \
-  'cd "$1"; source scripts/common.sh; detect_container_status' \
-  cf-agent-wechat-test "$TEST_REPO")"
+  /bin/bash -c \
+  'cd "$1"; source scripts/common.sh; [ "$CONTAINER_NAME" = "$2" ] || exit 86; detect_container_status' \
+  cf-agent-wechat-test "$TEST_REPO" "$TEST_CONTAINER" 2> "$DETECT_ERROR")"; then
+  :
+else
+  detect_status=$?
+  cat "$DETECT_ERROR" >&2
+  cat "$AUDIT_LOG" >&2
+  fail "detect_container_status returned $detect_status"
+fi
 [ "$DETECT_OUTPUT" = 'running' ] || \
   fail "detect_container_status did not use the sudo fallback"
 assert_docker_fallback_order
+assert_sudo_authorization_count "Docker permission fallback" 1
+assert_sudo_docker_count "Docker permission fallback" 1
 assert_no_sudo_python "Docker permission fallback"
 printf 'PASS ordinary then sudo Docker socket permission fallback\n'
 
+for inspect_target in status health; do
+  inspect_function="detect_container_${inspect_target}"
+  reset_audit
+  SUDO_HANG_PID_FILE="${TEST_HOME}/sudo-docker-${inspect_target}-hang.pid"
+  rm -f -- "$SUDO_HANG_PID_FILE"
+  HANG_STARTED=$SECONDS
+  if "$REAL_SUDO" -u "$TEST_USER" -H env \
+    PATH="$AUDIT_PATH" \
+    CF_AUDIT_LOG="$AUDIT_LOG" \
+    CF_AUDIT_REAL_DOCKER="$REAL_DOCKER" \
+    CF_AUDIT_REAL_SUDO="$REAL_SUDO" \
+    CF_AUDIT_SUDO_MODE=hang-docker-inspect \
+    CF_AUDIT_SUDO_HANG_PID_FILE="$SUDO_HANG_PID_FILE" \
+    DOCKER_INSPECT_TIMEOUT=30 \
+    CONTAINER_NAME="$TEST_CONTAINER" /bin/bash -c '
+      cd "$1"
+      source scripts/common.sh
+      deadline=$((SECONDS + 2))
+      "$2" "$deadline"
+    ' cf-agent-wechat-test "$TEST_REPO" "$inspect_function" >/dev/null 2>&1; then
+    fail "hung sudo Docker ${inspect_target} fallback unexpectedly returned a status"
+  else
+    hang_status=$?
+  fi
+  HANG_ELAPSED=$((SECONDS - HANG_STARTED))
+  case "$hang_status" in
+    124|137) ;;
+    *) fail "hung sudo Docker ${inspect_target} fallback returned $hang_status, expected timeout" ;;
+  esac
+  [ "$HANG_ELAPSED" -le 4 ] ||
+    fail "sudo Docker ${inspect_target} fallback exceeded its 2s remaining budget: ${HANG_ELAPSED}s"
+  [ -s "$SUDO_HANG_PID_FILE" ] ||
+    fail "hung sudo Docker ${inspect_target} fallback did not record its PID"
+  assert_process_reaped "$(cat "$SUDO_HANG_PID_FILE")" \
+    "sudo Docker ${inspect_target} timeout"
+  assert_docker_fallback_order
+  assert_sudo_authorization_count "hung Docker ${inspect_target} fallback" 1
+  assert_sudo_docker_count "hung Docker ${inspect_target} fallback" 1
+  assert_no_sudo_python "hung Docker ${inspect_target} permission fallback"
+done
+printf 'PASS status and health sudo Docker fallbacks share the remaining hard deadline\n'
 reset_audit
 if NONPERMISSION_OUTPUT="$("$REAL_SUDO" -u "$TEST_USER" -H env \
   PATH="$AUDIT_PATH" \
@@ -361,16 +602,30 @@ done
 [ -s "$READY_FILE" ] || fail "mock server did not become ready"
 HTTP_PORT="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["http_port"])' "$READY_FILE")"
 WS_PORT="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["ws_port"])' "$READY_FILE")"
+[ "$WS_PORT" = "$HTTP_PORT" ] || fail "mock HTTP and WebSocket ports must be identical"
+write_management_environment "$HTTP_PORT"
 
+
+docker restart "$TEST_CONTAINER" >/dev/null
+for _attempt in $(seq 1 30); do
+  [ "$(docker inspect --format '{{.State.Running}} {{.State.Health.Status}}' \
+    "$TEST_CONTAINER")" = "true healthy" ] && break
+  sleep 0.2
+done
+[ "$(docker inspect --format '{{.State.Running}} {{.State.Health.Status}}' \
+  "$TEST_CONTAINER")" = "true healthy" ] ||
+  fail "test container did not recover to running/healthy after docker restart"
+printf 'PASS actual Docker container restart returns to running/healthy\n'
 reset_audit
 STATUS_OUTPUT="${TEST_ROOT}/status.out"
 run_script_as "$TEST_USER" status.sh > "$STATUS_OUTPUT" 2>&1
 grep -q 'logged_in' "$STATUS_OUTPUT" || fail "status.sh did not report logged_in"
-grep -q 'wxid_permissions_test' "$STATUS_OUTPUT" || fail "status.sh did not report account"
+if grep -q 'wxid_permissions_test' "$STATUS_OUTPUT"; then
+  fail "status.sh exposed the account identifier"
+fi
 assert_file_has_no_token "$STATUS_OUTPUT"
 assert_secret_permissions
-assert_token_read_once "status.sh"
-assert_only_token_sudo "successful management script"
+assert_status_sudo_calls
 assert_no_sudo_python "status.sh"
 printf 'PASS root-only token with ordinary-user status.sh\n'
 
@@ -379,9 +634,10 @@ chown "$TEST_USER:$TEST_USER" "${TEST_HOME}/.curlrc"
 TRACE_OUTPUT="${TEST_ROOT}/trace.out"
 sudo -u "$TEST_USER" -H env \
   API_URL="http://127.0.0.1:${HTTP_PORT}" \
-  WS_URL="ws://127.0.0.1:${WS_PORT}/api/ws/login" \
+  AGENT_WECHAT_PORT="$HTTP_PORT" \
   TOKEN_FILE="$TOKEN_FILE" \
   PYTHON_BIN=python3 \
+  CONTAINER_NAME="$TEST_CONTAINER" \
   NO_PROXY=127.0.0.1,localhost \
   /bin/bash -x "${TEST_REPO}/scripts/status.sh" > "$TRACE_OUTPUT" 2>&1
 assert_file_has_no_token "$TRACE_OUTPUT"
@@ -394,9 +650,9 @@ printf 'PASS shell trace and curlrc token protection\n'
 reset_audit
 LOGIN_SHORT_OUTPUT="${TEST_ROOT}/login-short.out"
 run_script_as "$TEST_USER" login.sh > "$LOGIN_SHORT_OUTPUT" 2>&1
-grep -q '微信已经登录。' "$LOGIN_SHORT_OUTPUT" || fail "logged_in did not short-circuit"
-assert_only_token_sudo "successful management script"
-assert_token_read_once "logged-in login.sh"
+grep -q '持久化 session 可继续使用' "$LOGIN_SHORT_OUTPUT" ||
+  fail "logged_in did not short-circuit with persisted-session guidance"
+assert_only_authorization_and_token_sudo "successful management script"
 assert_no_sudo_python "logged-in login.sh"
 if grep -Eq '^(POST|WS|EVENT) ' "$LOG_FILE"; then
   fail "logged_in short-circuit called POST or WebSocket"
@@ -415,11 +671,14 @@ reset_audit
   CF_AUDIT_REAL_SUDO="$REAL_SUDO" \
   PYTHON_BIN=python3 \
   /bin/bash -c \
-  'set -e; cd "$1"; source scripts/common.sh; ensure_login_environment' \
+  'set -e; umask 077; cd "$1"; source scripts/common.sh; ensure_login_environment' \
   cf-agent-wechat-test "$TEST_REPO" > "${TEST_ROOT}/venv-setup.out" 2>&1
 assert_no_sudo_calls "venv setup"
 assert_no_sudo_python "venv setup"
-VENV_DIR="${TEST_HOME}/.local/share/cf-agent-wechat/venv"
+LOGIN_DATA_DIR="${TEST_HOME}/.local/share/cf-agent-wechat"
+VENV_DIR="${LOGIN_DATA_DIR}/venv"
+[ "$(stat -c '%U:%a' "$LOGIN_DATA_DIR")" = "$TEST_USER:700" ] ||
+  fail "login data directory is not owned by the ordinary user with mode 700"
 [ -x "${VENV_DIR}/bin/python" ] || fail "default ordinary-user venv was not created"
 if find "$VENV_DIR" ! -user "$TEST_USER" -print -quit | grep -q .; then
   fail "venv contains files not owned by the ordinary user"
@@ -431,7 +690,7 @@ printf 'logged_out\n' > "$STATE_FILE"
 reset_audit
 rm -f "$PAUSE_FILE" "$CONTINUE_FILE"
 LOGIN_OUTPUT="${TEST_ROOT}/login.out"
-run_script_as "$TEST_USER" login.sh > "$LOGIN_OUTPUT" 2>&1 &
+RUN_WITH_TTY=1 run_script_as "$TEST_USER" login.sh > "$LOGIN_OUTPUT" 2>&1 &
 LOGIN_PID=$!
 for _attempt in $(seq 1 900); do
   [ -e "$PAUSE_FILE" ] && break
@@ -443,23 +702,37 @@ for _attempt in $(seq 1 900); do
 done
 [ -e "$PAUSE_FILE" ] || fail "login.sh did not reach WebSocket login"
 assert_user_processes_have_no_token
+
+CONCURRENT_OUTPUT="${TEST_ROOT}/login-concurrent.out"
+if RUN_WITH_TTY=1 run_script_as "$TEST_USER" login.sh \
+  > "$CONCURRENT_OUTPUT" 2>&1; then
+  fail "second concurrent login.sh unexpectedly acquired the login lock"
+fi
+grep -q '已有登录流程正在运行' "$CONCURRENT_OUTPUT" ||
+  fail "concurrent login lock error was not actionable"
+assert_file_has_no_token "$CONCURRENT_OUTPUT"
+printf 'PASS second fresh login fails immediately while the first owns the lock\n'
+
 touch "$CONTINUE_FILE"
 if ! wait "$LOGIN_PID"; then
   cat "$LOGIN_OUTPUT" >&2
   fail "ordinary-user login.sh failed"
 fi
 LOGIN_PID=""
+grep -q '请使用手机微信扫描二维码' "$LOGIN_OUTPUT" || fail "fresh QR was not shown"
 grep -q '请在手机微信确认登录' "$LOGIN_OUTPUT" || fail "phone_confirm was not shown"
 grep -q '登录成功。' "$LOGIN_OUTPUT" || fail "login_success was not shown"
-assert_only_token_sudo "successful management script"
+assert_only_authorization_and_token_sudo \
+  "successful and concurrent management scripts" 2
 grep -q '登录状态已确认' "$LOGIN_OUTPUT" || fail "final logged_in state was not confirmed"
-assert_token_read_once "logged-out login.sh"
 assert_no_sudo_python "logged-out login.sh"
 EXPECTED_LOG="${TEST_ROOT}/expected.log"
 printf '%s\n' \
   'GET /api/status/auth' \
-  'POST /api/status/login' \
+  'GET /api/status/auth' \
   'WS /api/ws/login' \
+  'GET /api/status/auth' \
+  'EVENT qr' \
   'EVENT phone_confirm' \
   'EVENT login_success' \
   'GET /api/status/auth' > "$EXPECTED_LOG"
@@ -478,16 +751,19 @@ if run_script_as "$TEST_USER" status.sh > "$MISSING_OUTPUT" 2>&1; then
 fi
 grep -q 'token 文件不存在' "$MISSING_OUTPUT" || \
   fail "missing token was not distinguished from a permission failure"
-assert_token_read_once "missing-token status.sh"
+assert_only_authorization_and_token_sudo "missing-token status.sh"
 assert_no_sudo_python "missing-token status.sh"
 mv "${TOKEN_FILE}.saved" "$TOKEN_FILE"
 assert_secret_permissions
 printf 'PASS missing root-only token distinction\n'
 
 NO_SUDO_OUTPUT="${TEST_ROOT}/no-sudo.out"
+chown "root:$(id -gn "$NO_SUDO_USER")" "${TEST_REPO}/docker/.env"
+chmod 640 "${TEST_REPO}/docker/.env"
+
 if timeout 15s sudo -u "$NO_SUDO_USER" -H env \
   API_URL="http://127.0.0.1:${HTTP_PORT}" \
-  WS_URL="ws://127.0.0.1:${WS_PORT}/api/ws/login" \
+  AGENT_WECHAT_PORT="$HTTP_PORT" \
   TOKEN_FILE="$TOKEN_FILE" \
   PYTHON_BIN=python3 \
   NO_COLOR=1 \
