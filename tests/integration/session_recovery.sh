@@ -42,7 +42,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-for command_name in awk bash grep install mktemp sleep uname; do
+for command_name in awk bash env grep install mktemp sleep uname; do
   command -v "$command_name" >/dev/null 2>&1 ||
     fail "missing command: $command_name"
 done
@@ -72,12 +72,13 @@ REQUEST_LOG="${TEST_ROOT}/requests.log"
 STATUS_OUTPUT="${TEST_ROOT}/status.out"
 LOGIN_OUTPUT="${TEST_ROOT}/login.out"
 TOKEN_FILE_PATH="${RUNTIME_ROOT}/secrets/auth-token"
+LOGIN_HOME="${TEST_ROOT}/login-home"
 
 install -d -m 755 "$MOCK_BIN"
 if [ "$(/usr/bin/uname -s)" = "Linux" ]; then
-  install -d -m 700 "$RUNTIME_ROOT/secrets"
+  install -d -m 700 "$LOGIN_HOME" "$RUNTIME_ROOT/secrets"
 else
-  install -d -m 755 "$RUNTIME_ROOT/secrets"
+  install -d -m 755 "$LOGIN_HOME" "$RUNTIME_ROOT/secrets"
 fi
 install -m 755 "${REPO_ROOT}/tests/helpers/mock_management_docker.sh" \
   "${MOCK_BIN}/docker"
@@ -106,7 +107,8 @@ run_status() {
 }
 
 run_login() {
-  env -u TOKEN_FILE -u CF_AGENT_WECHAT_RUNTIME_ROOT \
+  env -u XDG_RUNTIME_DIR -u TOKEN_FILE -u CF_AGENT_WECHAT_RUNTIME_ROOT \
+    HOME="$LOGIN_HOME" \
     CF_RUNTIME_ROOT="$RUNTIME_ROOT" \
     API_URL="http://127.0.0.1:6174" \
     CURL_BIN="${MOCK_BIN}/curl" \
@@ -329,7 +331,7 @@ if [ "$HOST_KERNEL" = Linux ]; then
   LOCK_RELEASE="${TEST_ROOT}/lock.release"
   install -d -m 700 "$LOCK_HOME"
   (
-    HOME="$LOCK_HOME" bash -c '
+    env -u XDG_RUNTIME_DIR HOME="$LOCK_HOME" bash -c '
       source "$1" --help >/dev/null
       acquire_login_lock || {
         printf "%s\n" "$LAST_ERROR" >&2
@@ -350,7 +352,7 @@ if [ "$HOST_KERNEL" = Linux ]; then
   done
   [ -e "$LOCK_READY" ] || fail "lock holder did not acquire login lock"
   lock_error="$(
-    HOME="$LOCK_HOME" bash -c '
+    env -u XDG_RUNTIME_DIR HOME="$LOCK_HOME" bash -c '
       source "$1" --help >/dev/null
       if acquire_login_lock; then
         release_login_lock

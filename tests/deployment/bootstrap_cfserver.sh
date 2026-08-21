@@ -1101,6 +1101,24 @@ grep -Eq '^[[:space:]]+restart: unless-stopped$' \
   fail "production Compose does not use one persistent runtime root for all mounts"
 [ "$(grep -Fc 'CF_AGENT_WECHAT_STORAGE_ROOT' "${REPO_ROOT}/docker/compose.cfserver.yaml")" -eq 3 ] || \
   fail "production Compose does not retain legacy runtime-root fallback"
+for bind_target in /data /home/wechat /data/auth-token; do
+  awk -v target="$bind_target" '
+    $0 == ("        target: " target) {
+      in_target = 1
+      next
+    }
+    in_target && $0 == "          create_host_path: false" {
+      disabled = 1
+    }
+    in_target && /^      - type:/ {
+      exit
+    }
+    END {
+      exit(disabled ? 0 : 1)
+    }
+  ' "${REPO_ROOT}/docker/compose.cfserver.yaml" || \
+    fail "production bind $bind_target must explicitly disable create_host_path"
+done
 pass "production Compose persistence and restart policy"
 
 printf '%s\n' 'All CFserver bootstrap deployment tests passed.'

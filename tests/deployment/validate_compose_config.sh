@@ -86,7 +86,9 @@ for target, source in expected.items():
     volume = volumes[target]
     assert volume.get("type") == "bind", (label, target, volume)
     assert volume.get("source") == source, (label, target, volume)
-    assert volume.get("bind", {}).get("create_host_path") is False, (label, target, volume)
+    create_host_path = volume.get("bind", {}).get("create_host_path")
+    assert create_host_path is None or create_host_path is False, (
+        label, target, volume)
 
 assert volumes["/data/auth-token"].get("read_only") is True
 assert volumes["/data"].get("read_only", False) is False
