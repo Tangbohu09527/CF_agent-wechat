@@ -3,7 +3,7 @@ set -euo pipefail
 
 REPO_ROOT="$(CDPATH='' cd -- "$(dirname -- "$0")/../.." && pwd -P)"
 TEST_ROOT=""
-DEPLOYMENT_DIR="/srv/storage/cf-agent-wechat"
+DEPLOYMENT_DIR=""
 TEST_USER="cfwtest$$"
 NO_SUDO_USER="cfwnosudo$$"
 MOCK_PID=""
@@ -57,16 +57,13 @@ fi
 if [ "$(id -u)" -ne 0 ]; then
   fail "this integration test must run as root"
 fi
-if [ -e "$DEPLOYMENT_DIR" ]; then
-  fail "refusing to touch an existing deployment path: ${DEPLOYMENT_DIR}"
-fi
 if id "$TEST_USER" >/dev/null 2>&1 || id "$NO_SUDO_USER" >/dev/null 2>&1; then
   fail "temporary test user already exists"
 fi
 if [ -e "$SUDOERS_FILE" ]; then
   fail "temporary sudoers file already exists: ${SUDOERS_FILE}"
 fi
-for command_name in docker openssl python3 sudo useradd visudo; do
+for command_name in docker flock openssl python3 sudo useradd visudo; do
   command -v "$command_name" >/dev/null 2>&1 || fail "missing command: ${command_name}"
 done
 REAL_DOCKER="$(command -v docker)"
@@ -74,6 +71,13 @@ REAL_SUDO="$(command -v sudo)"
 
 TEST_ROOT="$(mktemp -d /tmp/cf-agent-wechat-permissions.XXXXXX)"
 chmod 755 "$TEST_ROOT"
+DEPLOYMENT_DIR="${TEST_ROOT}/deployment"
+STORAGE_ROOT="$DEPLOYMENT_DIR"
+RUNTIME_ROOT="${STORAGE_ROOT}/runtime"
+ARCHIVE_ROOT="${STORAGE_ROOT}/session-archive"
+RUNTIME_LOCK_FILE="${TEST_ROOT}/runtime.lock"
+DOCKER_SOCKET="${TEST_ROOT}/docker.sock"
+TEST_AGENT_PORT=16174
 TEST_REPO="${TEST_ROOT}/repo"
 TEST_HOME="${TEST_ROOT}/home"
 NO_SUDO_HOME="${TEST_ROOT}/no-sudo-home"
@@ -91,12 +95,69 @@ AUDIT_PATH="${AUDIT_BIN}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin
 AGENT_COMPOSE_FILE="${TEST_ROOT}/agent-compose.yaml"
 AGENT_ENV_FILE="${TEST_ROOT}/agent.env"
 AGENT_ENV_SENTINEL="agent-env-fixture-sensitive-permissions-$$"
+APPROVED_AGENT_IMAGE="ghcr.io/example/agent-wechat@sha256:$(printf '%064d' 0)"
+APPROVED_PROXY="http://${AGENT_ENV_SENTINEL}.invalid:8080"
 GATEWAY_PROJECT_DIR="${TEST_ROOT}/gateway"
 GATEWAY_COMPOSE_FILE="${GATEWAY_PROJECT_DIR}/compose.yaml"
 GATEWAY_ENV_FILE="${GATEWAY_PROJECT_DIR}/.env"
 GATEWAY_ENV_SENTINEL="gateway-env-fixture-sensitive-permissions-$$"
-GATEWAY_HEARTBEAT_COMMAND="${GATEWAY_PROJECT_DIR}/check-wechat-worker-heartbeat"
-AGENT_STATE_FILE="${TEST_ROOT}/agent-state"
+GATEWAY_DEPLOY_DIR="${GATEWAY_PROJECT_DIR}/deploy"
+GATEWAY_HEARTBEAT_COMMAND="${GATEWAY_DEPLOY_DIR}/check-wechat-worker-heartbeat"
+GATEWAY_CONTRACT_FILE="${GATEWAY_DEPLOY_DIR}/wechat-runtime-contract.json"
+MOCK_DOCKER_BACKEND="${AUDIT_BIN}/docker-backend"
+MOCK_DOCKER_STATE_DIR="${TEST_ROOT}/docker-state"
+MOCK_DOCKER_LOG="${TEST_ROOT}/docker-backend.log"
+MOCK_DOCKER_MUTATION_LOG="${TEST_ROOT}/docker-mutations.log"
+
+useradd --create-home --home-dir "$TEST_HOME" --shell /bin/bash "$TEST_USER"
+useradd --create-home --home-dir "$NO_SUDO_HOME" --shell /bin/bash "$NO_SUDO_USER"
+chown "${TEST_USER}:${TEST_USER}" "$TEST_ROOT"
+TEST_RUNTIME_UID="$(id -u "$TEST_USER")"
+TEST_RUNTIME_GID="$(id -g "$TEST_USER")"
+
+TEST_DOCKER_ENV=(
+  "CF_AGENT_WECHAT_TEST_ROOT=${TEST_ROOT}"
+  "TMPDIR=${TEST_ROOT}"
+  "CF_AGENT_WECHAT_DOCKER_BIN=${AUDIT_BIN}/docker"
+  "CF_AGENT_WECHAT_SYSTEMCTL_BIN=${AUDIT_BIN}/systemctl"
+  "CF_AGENT_WECHAT_DF_BIN=${AUDIT_BIN}/df"
+  "CF_AGENT_WECHAT_DOCKER_SOCKET_PATH=${DOCKER_SOCKET}"
+  "CONTAINER_NAME=${TEST_CONTAINER}"
+  "CF_AUDIT_DOCKER_BACKEND=${MOCK_DOCKER_BACKEND}"
+  "MOCK_DOCKER_STATE_DIR=${MOCK_DOCKER_STATE_DIR}"
+  "MOCK_DOCKER_LOG=${MOCK_DOCKER_LOG}"
+  "MOCK_DOCKER_MUTATION_LOG=${MOCK_DOCKER_MUTATION_LOG}"
+  "MOCK_APPROVED_AGENT_IMAGE=${APPROVED_AGENT_IMAGE}"
+  "MOCK_APPROVED_AGENT_CONTAINER=${TEST_CONTAINER}"
+  "MOCK_APPROVED_AGENT_PROJECT=cf-agent-wechat"
+  "MOCK_APPROVED_STORAGE_ROOT=${STORAGE_ROOT}"
+  "MOCK_APPROVED_RUNTIME_ROOT=${RUNTIME_ROOT}"
+  "MOCK_APPROVED_ARCHIVE_ROOT=${ARCHIVE_ROOT}"
+  "MOCK_APPROVED_TOKEN_FILE=${TOKEN_FILE}"
+  "MOCK_APPROVED_BIND_IP=127.0.0.1"
+  "MOCK_APPROVED_PORT=${TEST_AGENT_PORT}"
+  "MOCK_APPROVED_PROXY=${APPROVED_PROXY}"
+  "MOCK_APPROVED_RUST_LOG=info"
+  "MOCK_APPROVED_DOCKER_SOCKET=${DOCKER_SOCKET}"
+  "MOCK_AGENT_COMPOSE_FILE=${AGENT_COMPOSE_FILE}"
+  "MOCK_AGENT_PROJECT_DIR=${TEST_REPO}"
+  "MOCK_GATEWAY_COMPOSE_FILE=${GATEWAY_COMPOSE_FILE}"
+  "MOCK_GATEWAY_ENV_FILE=${GATEWAY_ENV_FILE}"
+  "MOCK_GATEWAY_PROJECT_DIR=${GATEWAY_PROJECT_DIR}"
+  "MOCK_AUTH_STATE_FILE=${STATE_FILE}"
+)
+TEST_MANAGEMENT_ENV=(
+  "CF_AGENT_WECHAT_TEST_ROOT=${TEST_ROOT}"
+  "TMPDIR=${TEST_ROOT}"
+  "TOKEN_FILE=${TOKEN_FILE}"
+  "CF_AGENT_WECHAT_STORAGE_ROOT=${STORAGE_ROOT}"
+  "CF_AGENT_WECHAT_RUNTIME_ROOT=${RUNTIME_ROOT}"
+  "CF_AGENT_WECHAT_ARCHIVE_ROOT=${ARCHIVE_ROOT}"
+  "CF_AGENT_WECHAT_LOCK_FILE=${RUNTIME_LOCK_FILE}"
+  "CF_AGENT_GATEWAY_PROJECT_DIR=${GATEWAY_PROJECT_DIR}"
+  "CF_AGENT_GATEWAY_COMPOSE_FILE=${GATEWAY_COMPOSE_FILE}"
+  "CF_AGENT_GATEWAY_ENV_FILE=${GATEWAY_ENV_FILE}"
+)
 
 install -d -o root -g root -m 755 "${TEST_REPO}/scripts"
 install -o root -g root -m 755 \
@@ -106,6 +167,14 @@ install -o root -g root -m 755 \
   "${REPO_ROOT}/scripts/login.sh" \
   "${REPO_ROOT}/scripts/start-qr-login.sh" \
   "${REPO_ROOT}/scripts/qr_login.py" \
+  "${REPO_ROOT}/scripts/ensure-login-environment.sh" \
+  "${REPO_ROOT}/scripts/verify_login_dependencies.py" \
+  "${REPO_ROOT}/scripts/stop-qr-runtime.sh" \
+  "${REPO_ROOT}/scripts/archive-runtime.py" \
+  "${REPO_ROOT}/scripts/scan_runtime_tree.py" \
+  "${REPO_ROOT}/scripts/verify_management_source_secrets.py" \
+  "${REPO_ROOT}/scripts/parse_management_env.py" \
+  "${REPO_ROOT}/scripts/verify_gateway_contract.py" \
   "${TEST_REPO}/scripts/"
 install -o root -g root -m 644 \
   "${REPO_ROOT}/scripts/requirements.txt" \
@@ -115,33 +184,58 @@ install -o root -g root -m 755 \
   "${REPO_ROOT}/tests/helpers/audit_docker.sh" "${AUDIT_BIN}/docker"
 install -o root -g root -m 755 \
   "${REPO_ROOT}/tests/helpers/audit_sudo.sh" "${AUDIT_BIN}/sudo"
-install -d -o root -g root -m 755 "$GATEWAY_PROJECT_DIR"
+install -o root -g root -m 755 \
+  "${REPO_ROOT}/tests/helpers/mock_runtime_systemctl.sh" "${AUDIT_BIN}/systemctl"
+install -o root -g root -m 755 \
+  "${REPO_ROOT}/tests/helpers/mock_df.sh" "${AUDIT_BIN}/df"
+install -o root -g root -m 755 \
+  "${REPO_ROOT}/tests/helpers/mock_docker.sh" "$MOCK_DOCKER_BACKEND"
+python3 - "$DOCKER_SOCKET" <<'PY'
+import socket
+import sys
+
+fixture = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+fixture.bind(sys.argv[1])
+fixture.close()
+PY
+chown root:root "$DOCKER_SOCKET"
+chmod 600 "$DOCKER_SOCKET"
+
+install -d -o root -g root -m 755 "$GATEWAY_DEPLOY_DIR"
+install -d -o root -g root -m 755 "$MOCK_DOCKER_STATE_DIR"
+: > "$MOCK_DOCKER_LOG"
+: > "$MOCK_DOCKER_MUTATION_LOG"
 printf '%s\n' 'services:' '  agent-wechat: {}' > "$AGENT_COMPOSE_FILE"
 printf '%s\n' \
   'COMPOSE_PROJECT_NAME=cf-agent-wechat' \
-  "AGENT_WECHAT_IMAGE=ghcr.io/example/agent-wechat@sha256:$(printf '%064d' 0)" \
+  "AGENT_WECHAT_IMAGE=$APPROVED_AGENT_IMAGE" \
   "AGENT_WECHAT_CONTAINER_NAME=$TEST_CONTAINER" \
-  'CF_AGENT_WECHAT_STORAGE_ROOT=/srv/storage/cf-agent-wechat' \
-  'CF_AGENT_WECHAT_RUNTIME_ROOT=/srv/storage/cf-agent-wechat/runtime' \
-  'CF_AGENT_WECHAT_ARCHIVE_ROOT=/srv/storage/cf-agent-wechat/session-archive' \
+  "CF_AGENT_WECHAT_STORAGE_ROOT=$STORAGE_ROOT" \
+  "CF_AGENT_WECHAT_RUNTIME_ROOT=$RUNTIME_ROOT" \
+  "CF_AGENT_WECHAT_ARCHIVE_ROOT=$ARCHIVE_ROOT" \
+  "CF_AGENT_WECHAT_RUNTIME_UID=$TEST_RUNTIME_UID" \
+  "CF_AGENT_WECHAT_RUNTIME_GID=$TEST_RUNTIME_GID" \
+  'CF_AGENT_WECHAT_RUNTIME_MODE=700' \
+  "CF_AGENT_WECHAT_MANAGEMENT_GID=$TEST_RUNTIME_GID" \
+  'CF_AGENT_WECHAT_MIN_FREE_BYTES=1073741824' \
+  'CF_AGENT_WECHAT_MIN_FREE_PERCENT=10' \
+  'CF_AGENT_WECHAT_MIN_FREE_INODES=1024' \
+  'CF_AGENT_WECHAT_TOKEN_SCAN_MAX_FILES=200000' \
+  'CF_AGENT_WECHAT_TOKEN_SCAN_MAX_BYTES=21474836480' \
   'AGENT_WECHAT_BIND_IP=127.0.0.1' \
-  'AGENT_WECHAT_PORT=6174' \
-  "PROXY=http://${AGENT_ENV_SENTINEL}.invalid" \
+  "AGENT_WECHAT_PORT=$TEST_AGENT_PORT" \
+  "PROXY=$APPROVED_PROXY" \
   'RUST_LOG=info' > "$AGENT_ENV_FILE"
-printf '%s\n' 'services:' '  wechat-worker: {}' > "$GATEWAY_COMPOSE_FILE"
+printf '%s\n' 'services:' '  worker: {}' > "$GATEWAY_COMPOSE_FILE"
 chmod 600 "$AGENT_COMPOSE_FILE" "$GATEWAY_COMPOSE_FILE"
-printf '%s\n' "$GATEWAY_ENV_SENTINEL" > "$GATEWAY_ENV_FILE"
+printf '%s\n' \
+  'CF_AGENT_WECHAT_TOKEN_FILE=/run/secrets/cf-agent-wechat-auth-token' \
+  "FIXTURE_SENTINEL=$GATEWAY_ENV_SENTINEL" > "$GATEWAY_ENV_FILE"
 chown root:root "$AGENT_ENV_FILE" "$GATEWAY_ENV_FILE"
 chmod 600 "$AGENT_ENV_FILE" "$GATEWAY_ENV_FILE"
 printf '%s\n' '#!/bin/sh' 'exit 0' > "$GATEWAY_HEARTBEAT_COMMAND"
 chown root:root "$GATEWAY_HEARTBEAT_COMMAND"
 chmod 755 "$GATEWAY_HEARTBEAT_COMMAND"
-printf '%s\n' 'running' > "$AGENT_STATE_FILE"
-
-useradd --create-home --home-dir "$TEST_HOME" --shell /bin/bash "$TEST_USER"
-useradd --create-home --home-dir "$NO_SUDO_HOME" --shell /bin/bash "$NO_SUDO_USER"
-chown "$TEST_USER:$TEST_USER" "$AGENT_STATE_FILE"
-chmod 600 "$AGENT_STATE_FILE"
 : > "$AUDIT_LOG"
 chown "$TEST_USER:$TEST_USER" "$AUDIT_LOG"
 chmod 600 "$AUDIT_LOG"
@@ -159,6 +253,60 @@ umask 077
 openssl rand -hex 32 > "$TOKEN_FILE"
 chown root:root "$TOKEN_FILE"
 chmod 600 "$TOKEN_FILE"
+NO_SUDO_TOKEN_FILE="${NO_SUDO_HOME}/secrets/auth-token"
+install -d -o root -g root -m 700 -- "${NO_SUDO_HOME}/secrets"
+install -o root -g root -m 600 -- "$TOKEN_FILE" "$NO_SUDO_TOKEN_FILE"
+python3 - "$GATEWAY_CONTRACT_FILE" "$GATEWAY_HEARTBEAT_COMMAND" \
+  "$TOKEN_FILE" <<'PY'
+import hashlib
+import json
+import sys
+from pathlib import Path
+
+contract_path = Path(sys.argv[1])
+checker_path = Path(sys.argv[2])
+token_path = Path(sys.argv[3])
+contract = {
+    "contractVersion": "1",
+    "producer": {
+        "repository": "Tangbohu09527/CF_agent-gateway",
+        "checkerSha256": hashlib.sha256(checker_path.read_bytes()).hexdigest(),
+    },
+    "agent": {
+        "networkAlias": "cf-agent-wechat",
+        "port": 6174,
+        "tokenAuthority": {
+            "hostPath": str(token_path),
+            "ownership": "root:root",
+            "mode": "0600",
+        },
+    },
+    "gateway": {
+        "service": "worker",
+        "composeProject": "cf-agent-gateway",
+        "checker": str(checker_path),
+        "checkerInterfaceVersion": 1,
+        "heartbeatMaxAgeSeconds": 30,
+        "requiresDockerHealth": True,
+        "requiresSuccessfulPoll": True,
+        "requiresLoggedIn": True,
+        "silentOutput": True,
+        "credential": {
+            "type": "file",
+            "environmentVariable": "CF_AGENT_WECHAT_TOKEN_FILE",
+            "workerPath": "/run/secrets/cf-agent-wechat-auth-token",
+            "readOnly": True,
+            "forbiddenEnvironmentVariable": "CF_AGENT_WECHAT_TOKEN",
+        },
+    },
+}
+contract_path.write_text(json.dumps(contract) + "\n", encoding="utf-8")
+PY
+chown root:root "$GATEWAY_CONTRACT_FILE"
+chmod 600 "$GATEWAY_CONTRACT_FILE"
+printf '%s\n' 1 > "${MOCK_DOCKER_STATE_DIR}/agent_exists"
+printf '%s\n' 1 > "${MOCK_DOCKER_STATE_DIR}/agent_running"
+printf '%s\n' 1 > "${MOCK_DOCKER_STATE_DIR}/gateway_running"
 printf 'logged_in\n' > "$STATE_FILE"
 reset_audit() {
   if [ -s "$AUDIT_LOG" ] &&
@@ -170,6 +318,8 @@ reset_audit() {
     fail "Gateway environment sentinel leaked into the audit log"
   fi
   : > "$AUDIT_LOG"
+  : > "$MOCK_DOCKER_LOG"
+  : > "$MOCK_DOCKER_MUTATION_LOG"
 }
 
 audit_count() {
@@ -212,23 +362,17 @@ assert_no_sudo_python() {
     fail "$1 attempted to run Python or pip through sudo"
 }
 
-assert_docker_fallback_order() {
-  local calls
-  calls="$(awk -F '\t' '
-    $1 == "docker" && $2 == "inspect" { print "ordinary" }
-    $1 == "sudo" && $2 == "docker-inspect" { print "sudo" }
-  ' "$AUDIT_LOG")"
-  [ "$calls" = $'ordinary\nsudo' ] || \
-    fail "Docker inspect order was not ordinary then sudo"
+assert_no_sudo_docker() {
+  [ "$(awk -F '\t' '$1 == "sudo" && $2 ~ /^docker-/ { count++ }
+      END { print count + 0 }' "$AUDIT_LOG")" -eq 0 ] ||
+    fail "$1 attempted to execute a testing Docker mock through sudo"
 }
 
-assert_runtime_mock_requires_sudo() {
+assert_runtime_mock_runs_directly() {
   local label="$1"
-  local error_file
   shift
-  error_file="${TEST_ROOT}/runtime-docker-${label}.error"
 
-  if "$REAL_SUDO" -u "$TEST_USER" -H env \
+  if ! "$REAL_SUDO" -u "$TEST_USER" -H env \
     PATH="$AUDIT_PATH" \
     CF_AUDIT_LOG="$AUDIT_LOG" \
     CF_AUDIT_REAL_DOCKER="$REAL_DOCKER" \
@@ -236,27 +380,28 @@ assert_runtime_mock_requires_sudo() {
     CF_AUDIT_GATEWAY_ENV_FILE="$GATEWAY_ENV_FILE" \
     CF_AUDIT_DOCKER_RUNTIME_MOCK=1 \
     CF_AUDIT_DOCKER_VIA_SUDO=0 \
-    docker "$@" > /dev/null 2> "$error_file"; then
-    fail "bare runtime Docker ${label} unexpectedly succeeded"
+    docker "$@" > /dev/null 2>&1; then
+    fail "direct runtime Docker ${label} failed"
   fi
-  if ! grep -Eqi \
-    'permission denied.*docker[.]sock|docker[.]sock.*permission denied' \
-    "$error_file"; then
-    fail "bare runtime Docker ${label} lacked a socket permission error"
-  fi
+  assert_no_sudo_docker "direct runtime Docker $label"
 }
 
-assert_status_sudo_paths() {
-  [ "$(audit_count sudo docker-info)" -eq 3 ] || \
+assert_status_docker_paths() {
+  [ "$(audit_count docker info)" -eq 3 ] || \
     fail "status.sh did not inspect Docker availability, security, and live-restore"
-  [ "$(audit_count sudo docker-context)" -eq 2 ] || \
+  [ "$(audit_count docker context)" -eq 2 ] || \
     fail "status.sh did not inspect the Docker context and socket"
-  [ "$(audit_count sudo docker-compose)" -eq 4 ] || \
+  [ "$(audit_count docker compose)" -ge 7 ] || \
     fail "status.sh used an unexpected Compose query sequence"
-  [ "$(audit_count sudo docker-exec)" -eq 2 ] || \
+  [ "$(audit_count docker exec)" -eq 2 ] || \
     fail "status.sh did not attest a stable WeChat process"
-  [ "$(audit_count sudo docker-inspect)" -eq 3 ] || \
+  [ "$(audit_count docker inspect)" -ge 4 ] || \
     fail "status.sh did not inspect Agent/Worker health and runtime mounts"
+  if [ "$(audit_count docker network)" -lt 1 ] ||
+    [ "$(audit_count docker image)" -lt 1 ]; then
+    fail "status.sh did not attest the approved image and network"
+  fi
+  assert_no_sudo_docker "status.sh"
   assert_token_read_once "status.sh"
   assert_sudo_contract "status.sh"
 }
@@ -279,6 +424,8 @@ assert_secret_permissions() {
     fail "Gateway environment file permissions changed"
   [ "$(stat -c '%U:%G %a' "$GATEWAY_HEARTBEAT_COMMAND")" = "root:root 755" ] || \
     fail "Gateway heartbeat checker permissions changed"
+  [ "$(stat -c '%U:%G %a' "$GATEWAY_CONTRACT_FILE")" = "root:root 600" ] || \
+    fail "Gateway runtime contract permissions changed"
 }
 
 assert_file_has_no_token() {
@@ -400,6 +547,9 @@ run_script_as() {
   local script_name="$2"
   shift 2
   "$REAL_SUDO" -u "$user_name" -H env \
+    CF_AGENT_WECHAT_TESTING=1 \
+    "${TEST_DOCKER_ENV[@]}" \
+    "${TEST_MANAGEMENT_ENV[@]}" \
     API_URL="http://127.0.0.1:${HTTP_PORT}" \
     WS_URL="ws://127.0.0.1:${WS_PORT}/api/ws/login" \
     TOKEN_FILE="$TOKEN_FILE" \
@@ -419,7 +569,6 @@ run_script_as() {
     CF_AUDIT_DOCKER_VIA_SUDO=0 \
     CF_AUDIT_AGENT_ENV_FILE="$AGENT_ENV_FILE" \
     CF_AUDIT_GATEWAY_ENV_FILE="$GATEWAY_ENV_FILE" \
-    CONTAINER_NAME="$TEST_CONTAINER" \
     CF_AGENT_WECHAT_COMPOSE_FILE="$AGENT_COMPOSE_FILE" \
     CF_AGENT_WECHAT_ENV_FILE="$AGENT_ENV_FILE" \
     CF_AGENT_GATEWAY_COMPOSE_FILE="$GATEWAY_COMPOSE_FILE" \
@@ -435,25 +584,39 @@ exec "./scripts/$2"
 }
 
 assert_secret_permissions
-[ "$(/bin/bash -c 'source "$1"; printf "%s" "$CONTAINER_NAME"' \
+[ "$(CF_AGENT_WECHAT_TESTING=1 /bin/bash -c \
+  'source "$1"; printf "%s" "$CONTAINER_NAME"' \
   cf-agent-wechat-test "${TEST_REPO}/scripts/common.sh")" = "cf-agent-wechat" ] || \
   fail "default container name is not cf-agent-wechat"
-if docker inspect "$TEST_CONTAINER" >/dev/null 2>&1; then
-  fail "unique test container already exists: ${TEST_CONTAINER}"
+if "$REAL_SUDO" -u "$TEST_USER" -H test -r "$DOCKER_SOCKET"; then
+  fail "ordinary user unexpectedly reads the isolated Docker socket"
 fi
-docker run --detach --name "$TEST_CONTAINER" alpine:3.20 sleep 300 >/dev/null
-CONTAINER_CREATED=1
+[ -S "$DOCKER_SOCKET" ] || fail "isolated Docker socket fixture is missing"
+printf 'PASS isolated fake Docker socket is root protected\n'
 
-DOCKER_ERROR="${TEST_ROOT}/docker-error"
-if "$REAL_SUDO" -u "$TEST_USER" -H "$REAL_DOCKER" inspect "$TEST_CONTAINER" \
-  > /dev/null 2> "$DOCKER_ERROR"; then
-  fail "ordinary docker inspect unexpectedly succeeded"
+REAL_DOCKER_FALLBACK_OUTPUT="${TEST_ROOT}/real-docker-fallback.out"
+if "$REAL_SUDO" -u "$TEST_USER" -H /usr/bin/docker info \
+  >/dev/null 2>&1; then
+  fail "ordinary test user unexpectedly reached the real Docker socket directly"
 fi
-grep -Eqi 'permission denied|access denied|operation not permitted' "$DOCKER_ERROR" || \
-  fail "ordinary docker inspect did not fail with a socket permission error"
-[ "$("$REAL_SUDO" -u "$TEST_USER" -H "$REAL_SUDO" -- "$REAL_DOCKER" inspect \
-  --format '{{.State.Running}}' "$TEST_CONTAINER")" = "true" ] || \
-  fail "sudo docker inspect did not report a running container"
+if ! "$REAL_SUDO" -u "$TEST_USER" -H /usr/bin/env -i \
+  HOME="$TEST_HOME" \
+  PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+  /bin/bash -p -c '
+scripts_dir="$1"
+_CF_AGENT_WECHAT_INTERNAL_SCRIPTS_DIR="$scripts_dir"
+readonly _CF_AGENT_WECHAT_INTERNAL_SCRIPTS_DIR
+source "$scripts_dir/common.sh" || exit 1
+docker_readonly_capture info --format "{{json .ServerVersion}}"
+' real-docker-fallback "${TEST_REPO}/scripts" \
+  >"$REAL_DOCKER_FALLBACK_OUTPUT" 2>&1; then
+  print_redacted_file "$REAL_DOCKER_FALLBACK_OUTPUT"
+  fail "production fixed Docker did not use sudo -v then sudo -n socket fallback"
+fi
+grep -Eq '"[^"]+"' "$REAL_DOCKER_FALLBACK_OUTPUT" ||
+  fail "real Docker fallback did not return the daemon version fixture"
+assert_file_has_no_token "$REAL_DOCKER_FALLBACK_OUTPUT"
+printf 'PASS production fixed Docker uses real sudo socket fallback in disposable CI\n'
 
 AUDIT_COMMANDS="$("$REAL_SUDO" -u "$TEST_USER" -H env PATH="$AUDIT_PATH" \
   /bin/bash -c 'command -v docker; command -v sudo')"
@@ -461,8 +624,78 @@ EXPECTED_AUDIT_COMMANDS="$(printf '%s\n%s' "${AUDIT_BIN}/docker" "${AUDIT_BIN}/s
 [ "$AUDIT_COMMANDS" = "$EXPECTED_AUDIT_COMMANDS" ] || \
   fail "audit wrappers were not selected through PATH"
 
+LOCK_METADATA="$("$REAL_SUDO" -u "$TEST_USER" -H env \
+  CF_AGENT_WECHAT_TESTING=1 \
+  CF_AGENT_WECHAT_TEST_ROOT="$TEST_ROOT" \
+  TMPDIR="$TEST_ROOT" \
+  CF_AGENT_WECHAT_LOCK_FILE="$RUNTIME_LOCK_FILE" \
+  CF_AGENT_WECHAT_MANAGEMENT_GID="$TEST_RUNTIME_GID" \
+  /bin/bash -c '
+set -e
+cd "$1"
+source scripts/common.sh
+source scripts/qr-runtime-common.sh
+runtime_acquire_lock
+stat -Lc "%u:%g:%a:%h:%s" -- "$RUNTIME_LOCK_FILE"
+' lock-test "$TEST_REPO")"
+[ "$LOCK_METADATA" = \
+  "${TEST_RUNTIME_UID}:${TEST_RUNTIME_GID}:640:1:0" ] || \
+  fail "runtime lock does not have the approved owner/group/mode/link/size"
+[ -f "$RUNTIME_LOCK_FILE" ] || \
+  fail "stale runtime lock file was not retained after holder exit"
+if ! "$REAL_SUDO" -u "$TEST_USER" -H /bin/bash -c \
+  'set -e; exec 9<"$1"; flock -n 9' \
+  lock-reopen "$RUNTIME_LOCK_FILE"; then
+  fail "approved management user could not reacquire the released runtime lock"
+fi
+NON_MANAGEMENT_LOCK_OUTPUT="${TEST_ROOT}/non-management-lock.out"
+if "$REAL_SUDO" -u "$NO_SUDO_USER" -H /bin/bash -c \
+  'set -e; exec 9<"$1"; flock -n 9' \
+  lock-denied "$RUNTIME_LOCK_FILE" \
+  >"$NON_MANAGEMENT_LOCK_OUTPUT" 2>&1; then
+  fail "non-management user unexpectedly opened and held the runtime lock"
+fi
+assert_file_has_no_token "$NON_MANAGEMENT_LOCK_OUTPUT"
+printf 'PASS protected runtime lock ownership, mode, and lifecycle\n'
+
+ROOT_OWNED_RUNTIME="${TEST_ROOT}/root-owned-runtime"
+install -d -o root -g root -m 700 \
+  "$ROOT_OWNED_RUNTIME" \
+  "${ROOT_OWNED_RUNTIME}/data" \
+  "${ROOT_OWNED_RUNTIME}/wechat-home"
+ROOT_OWNED_RUNTIME_OUTPUT="${TEST_ROOT}/root-owned-runtime.out"
+if CF_AGENT_WECHAT_TESTING=1 /bin/bash -c '
+set -e
+cd "$1"
+source scripts/common.sh
+source scripts/qr-runtime-common.sh
+RUNTIME_DEFAULT_UID=1000
+RUNTIME_DEFAULT_GID=1000
+RUNTIME_DEFAULT_MODE=700
+if runtime_validate_approved_runtime_directory "$2" "Runtime root" 1; then
+  exit 0
+fi
+printf "%s\n" "$LAST_ERROR" >&2
+exit 1
+' runtime-owner-contract "$TEST_REPO" "$ROOT_OWNED_RUNTIME" \
+  > "$ROOT_OWNED_RUNTIME_OUTPUT" 2>&1; then
+  fail "root:root 0700 Runtime matched the approved 1000:1000/0700 contract"
+fi
+grep -Fq 'approved UID:GID:mode 1000:1000:700' \
+  "$ROOT_OWNED_RUNTIME_OUTPUT" ||
+  fail "root-owned Runtime rejection did not identify the exact approved contract"
+[ "$(stat -Lc '%u:%g:%a' -- "$ROOT_OWNED_RUNTIME")" = "0:0:700" ] ||
+  fail "root-owned Runtime fixture changed while its permission drift was rejected"
+assert_file_has_no_token "$ROOT_OWNED_RUNTIME_OUTPUT"
+rm -rf -- "$ROOT_OWNED_RUNTIME"
+printf 'PASS root:root 0700 Runtime rejected by approved 1000:1000/0700 contract\n'
+
 reset_audit
 DETECT_OUTPUT="$("$REAL_SUDO" -u "$TEST_USER" -H env \
+  CF_AGENT_WECHAT_TESTING=1 \
+  "${TEST_DOCKER_ENV[@]}" \
+  CF_AUDIT_DOCKER_RUNTIME_MOCK=1 \
+  CF_AUDIT_DOCKER_VIA_SUDO=0 \
   PATH="$AUDIT_PATH" \
   CF_AUDIT_LOG="$AUDIT_LOG" \
   CF_AUDIT_REAL_DOCKER="$REAL_DOCKER" \
@@ -471,14 +704,17 @@ DETECT_OUTPUT="$("$REAL_SUDO" -u "$TEST_USER" -H env \
   'cd "$1"; source scripts/common.sh; detect_container_status' \
   cf-agent-wechat-test "$TEST_REPO")"
 [ "$DETECT_OUTPUT" = 'running' ] || \
-  fail "detect_container_status did not use the sudo fallback"
-assert_docker_fallback_order
-assert_no_sudo_python "Docker permission fallback"
-printf 'PASS ordinary then sudo Docker socket permission fallback\n'
+  fail "detect_container_status did not use the direct testing Docker mock"
+[ "$(audit_count docker inspect)" -eq 1 ] ||
+  fail "detect_container_status did not use exactly one direct Docker inspect"
+assert_no_sudo_calls "direct testing Docker status"
+printf 'PASS testing Docker status runs directly without sudo\n'
 
 reset_audit
 COMMON_IDENTITY_OUTPUT="${TEST_ROOT}/common-identity.out"
 if ! "$REAL_SUDO" -u "$TEST_USER" -H env \
+  CF_AGENT_WECHAT_TESTING=1 \
+  "${TEST_DOCKER_ENV[@]}" \
   PATH="$AUDIT_PATH" \
   CF_AUDIT_LOG="$AUDIT_LOG" \
   CF_AUDIT_REAL_DOCKER="$REAL_DOCKER" \
@@ -492,18 +728,21 @@ if ! "$REAL_SUDO" -u "$TEST_USER" -H env \
   cf-agent-wechat-test "$TEST_REPO" \
   > "$COMMON_IDENTITY_OUTPUT" 2>&1; then
   print_redacted_file "$COMMON_IDENTITY_OUTPUT"
-  fail "common WeChat identity check did not use the sudo Docker fallback"
+  fail "common WeChat identity check did not use direct testing Docker"
 fi
 [ "$(cat "$COMMON_IDENTITY_OUTPUT")" = "4242:9001" ] || \
   fail "common WeChat identity check returned an unexpected identity"
-[ "$(audit_count sudo docker-exec)" -eq 1 ] || \
-  fail "common WeChat identity check did not use exactly one sudo Docker exec"
+[ "$(audit_count docker exec)" -eq 1 ] || \
+  fail "common WeChat identity check did not use exactly one direct Docker exec"
+assert_no_sudo_calls "common WeChat identity direct Docker"
 assert_no_sudo_python "common WeChat identity Docker fallback"
 assert_file_has_no_token "$COMMON_IDENTITY_OUTPUT"
-printf 'PASS canonical WeChat identity with sudo Docker fallback\n'
+printf 'PASS canonical WeChat identity with direct testing Docker\n'
 
 reset_audit
 if NONPERMISSION_OUTPUT="$("$REAL_SUDO" -u "$TEST_USER" -H env \
+  CF_AGENT_WECHAT_TESTING=1 \
+  "${TEST_DOCKER_ENV[@]}" \
   PATH="$AUDIT_PATH" \
   CF_AUDIT_LOG="$AUDIT_LOG" \
   CF_AUDIT_REAL_DOCKER="$REAL_DOCKER" \
@@ -525,18 +764,21 @@ assert_no_sudo_python "non-permission Docker error"
 printf 'PASS non-permission Docker error does not use sudo\n'
 
 reset_audit
-assert_runtime_mock_requires_sudo info info
-assert_runtime_mock_requires_sudo compose \
+assert_runtime_mock_runs_directly info info
+assert_runtime_mock_runs_directly compose \
   compose --env-file "$AGENT_ENV_FILE" \
   --project-directory "$TEST_REPO" -f "$AGENT_COMPOSE_FILE" \
   ps --all --quiet agent-wechat
-assert_runtime_mock_requires_sudo exec exec "$TEST_CONTAINER" true
-assert_runtime_mock_requires_sudo inspect inspect "$TEST_CONTAINER"
-printf 'PASS runtime Docker mock requires the sudo fallback\n'
+assert_runtime_mock_runs_directly exec exec "$TEST_CONTAINER" true
+assert_runtime_mock_runs_directly inspect inspect "$TEST_CONTAINER"
+printf 'PASS runtime Docker mock rejects every sudo execution path\n'
 
 reset_audit
 CLEANUP_ERROR="${TEST_ROOT}/cleanup.err"
 if ! CLEANUP_OUTPUT="$("$REAL_SUDO" -u "$TEST_USER" -H env \
+  CF_AGENT_WECHAT_TESTING=1 \
+  "${TEST_DOCKER_ENV[@]}" \
+  "${TEST_MANAGEMENT_ENV[@]}" \
   PATH="$AUDIT_PATH" \
   CF_AUDIT_LOG="$AUDIT_LOG" \
   CF_AUDIT_REAL_DOCKER="$REAL_DOCKER" \
@@ -545,14 +787,15 @@ if ! CLEANUP_OUTPUT="$("$REAL_SUDO" -u "$TEST_USER" -H env \
   CF_AUDIT_DOCKER_VIA_SUDO=0 \
   CF_AUDIT_AGENT_ENV_FILE="$AGENT_ENV_FILE" \
   CF_AUDIT_GATEWAY_ENV_FILE="$GATEWAY_ENV_FILE" \
-  CF_AUDIT_AGENT_STATE_FILE="$AGENT_STATE_FILE" \
   CF_AGENT_WECHAT_COMPOSE_FILE="$AGENT_COMPOSE_FILE" \
   CF_AGENT_WECHAT_ENV_FILE="$AGENT_ENV_FILE" \
-  CF_AGENT_WECHAT_RUNTIME_ROOT="${TEST_ROOT}/runtime" \
   /bin/bash -c '
 cd "$1"
 source scripts/common.sh
 source scripts/qr-runtime-common.sh
+runtime_authorize_sudo
+runtime_load_management_environment
+runtime_prepare_compose_snapshots
 runtime_select_docker
 cleanup_failed_agent_container
 printf "%s:%s:%s\n" \
@@ -562,22 +805,25 @@ printf "%s:%s:%s\n" \
 ' cf-agent-wechat-test "$TEST_REPO" 2>"$CLEANUP_ERROR")"; then
   print_redacted_file "$CLEANUP_ERROR"
   printf '%s\n' "$CLEANUP_OUTPUT" >&2
-  fail "failed-agent cleanup did not use the sudo Docker fallback"
+  fail "failed-agent cleanup did not use direct testing Docker"
 fi
 [ "$CLEANUP_OUTPUT" = "true:succeeded:succeeded" ] ||
   fail "failed-agent cleanup returned unexpected results"
 [ -s "$CLEANUP_ERROR" ] ||
   fail "failed-agent cleanup did not emit the sudo authorization prompt"
-[ "$(cat "$AGENT_STATE_FILE")" = "absent" ] ||
+[ "$(cat "${MOCK_DOCKER_STATE_DIR}/agent_exists")" = 0 ] ||
   fail "failed-agent cleanup left a restartable container"
-[ "$(audit_count sudo docker-info)" -eq 3 ] ||
+[ "$(cat "${MOCK_DOCKER_STATE_DIR}/agent_running")" = 0 ] ||
+  fail "failed-agent cleanup left the container running"
+[ "$(audit_count docker info)" -eq 3 ] ||
   fail "failed-agent cleanup did not inspect Docker security and live-restore"
-[ "$(audit_count sudo docker-context)" -eq 2 ] ||
+[ "$(audit_count docker context)" -eq 2 ] ||
   fail "failed-agent cleanup did not attest the local Docker endpoint"
+assert_no_sudo_docker "failed-agent cleanup"
 assert_sudo_contract "failed-agent cleanup"
-[ "$(audit_count docker compose-agent-stop)" -eq 1 ] ||
+[ "$(grep -Fxc 'agent container stop' "$MOCK_DOCKER_MUTATION_LOG")" -eq 1 ] ||
   fail "failed-agent cleanup did not stop the agent container"
-[ "$(audit_count docker compose-agent-remove)" -eq 1 ] ||
+[ "$(grep -Fxc 'agent container remove' "$MOCK_DOCKER_MUTATION_LOG")" -eq 1 ] ||
   fail "failed-agent cleanup did not remove the agent container"
 assert_no_sudo_python "failed-agent cleanup"
 CLEANUP_OUTPUT_FILE="${TEST_ROOT}/cleanup.out"
@@ -585,7 +831,13 @@ printf '%s\n' "$CLEANUP_OUTPUT" > "$CLEANUP_OUTPUT_FILE"
 assert_file_has_no_token "$CLEANUP_OUTPUT_FILE"
 assert_file_has_no_token "$CLEANUP_ERROR"
 assert_file_has_no_token "$AUDIT_LOG"
-printf 'PASS failed-agent cleanup with sudo Docker fallback\n'
+assert_file_has_no_token "$MOCK_DOCKER_LOG"
+assert_file_has_no_token "$MOCK_DOCKER_MUTATION_LOG"
+printf 'PASS failed-agent cleanup with direct testing Docker and protected config sudo\n'
+
+printf '%s\n' 1 > "${MOCK_DOCKER_STATE_DIR}/agent_exists"
+printf '%s\n' 1 > "${MOCK_DOCKER_STATE_DIR}/agent_running"
+reset_audit
 
 python3 "${REPO_ROOT}/tests/helpers/mock_agent_wechat.py" \
   --token-file "$TOKEN_FILE" \
@@ -620,7 +872,9 @@ if grep -q 'account-fixture-not-for-output' "$STATUS_OUTPUT"; then
 fi
 assert_file_has_no_token "$STATUS_OUTPUT"
 assert_secret_permissions
-assert_status_sudo_paths
+assert_status_docker_paths
+assert_file_has_no_token "$MOCK_DOCKER_LOG"
+assert_file_has_no_token "$MOCK_DOCKER_MUTATION_LOG"
 printf 'PASS root-only token with ordinary-user status.sh\n'
 
 printf '%s\n' '--verbose' > "${TEST_HOME}/.curlrc"
@@ -629,6 +883,9 @@ TRACE_OUTPUT="${TEST_ROOT}/trace.out"
 # The redirect intentionally belongs to the root test harness, not sudo.
 # shellcheck disable=SC2024
 if sudo -u "$TEST_USER" -H env \
+  CF_AGENT_WECHAT_TESTING=1 \
+  "${TEST_DOCKER_ENV[@]}" \
+  "${TEST_MANAGEMENT_ENV[@]}" \
   API_URL="http://127.0.0.1:${HTTP_PORT}" \
   WS_URL="ws://127.0.0.1:${WS_PORT}/api/ws/login" \
   TOKEN_FILE="$TOKEN_FILE" \
@@ -684,6 +941,8 @@ reset_audit
 TOKEN_PROCESS_OUTPUT="${TEST_ROOT}/token-process.out"
 TOKEN_PROCESS_READY="${TEST_HOME}/token-process.ready"
 "$REAL_SUDO" -u "$TEST_USER" -H env \
+  CF_AGENT_WECHAT_TESTING=1 \
+  CF_AGENT_WECHAT_TEST_ROOT="$TEST_ROOT" TMPDIR="$TEST_ROOT" \
   PATH="$AUDIT_PATH" \
   CF_AUDIT_LOG="$AUDIT_LOG" \
   CF_AUDIT_REAL_SUDO="$REAL_SUDO" \
@@ -719,25 +978,59 @@ assert_no_sudo_python "ordinary-user Token load"
 assert_file_has_no_token "$TOKEN_PROCESS_OUTPUT"
 printf 'PASS sudo -v then sudo -n root-only Token load without process leakage\n'
 
+TOKEN_ANCESTOR_LINK="${TEST_ROOT}/token-ancestor-link"
+ln -s -- "$SECRETS_DIR" "$TOKEN_ANCESTOR_LINK"
+reset_audit
+TOKEN_ANCESTOR_OUTPUT="${TEST_ROOT}/token-ancestor.out"
+if "$REAL_SUDO" -u "$TEST_USER" -H env \
+  CF_AGENT_WECHAT_TESTING=1 \
+  CF_AGENT_WECHAT_TEST_ROOT="$TEST_ROOT" TMPDIR="$TEST_ROOT" \
+  PATH="$AUDIT_PATH" \
+  CF_AUDIT_LOG="$AUDIT_LOG" \
+  CF_AUDIT_REAL_SUDO="$REAL_SUDO" \
+  TOKEN_FILE="${TOKEN_ANCESTOR_LINK}/auth-token" \
+  /bin/bash -c '
+cd "$1"
+source scripts/common.sh
+if ! load_auth_token; then
+  error "$LAST_ERROR"
+  exit 1
+fi
+' cf-agent-wechat-test "$TEST_REPO" > "$TOKEN_ANCESTOR_OUTPUT" 2>&1; then
+  fail "Token loader accepted a symbolic-link ancestor"
+fi
+grep -q 'symbolic link ancestors' "$TOKEN_ANCESTOR_OUTPUT" ||
+  fail "Token ancestor rejection returned an unexpected error"
+assert_token_read_once "symbolic-link Token ancestor"
+assert_sudo_contract "symbolic-link Token ancestor"
+assert_no_sudo_python "symbolic-link Token ancestor"
+assert_file_has_no_token "$TOKEN_ANCESTOR_OUTPUT"
+assert_file_has_no_token "$AUDIT_LOG"
+rm -f -- "$TOKEN_ANCESTOR_LINK"
+printf 'PASS root-only Token rejects symbolic-link ancestors after sudo authorization\n'
+
 reset_audit
 ROOT_TOKEN_OUTPUT="${TEST_ROOT}/root-token.out"
-if ! env TOKEN_FILE="$TOKEN_FILE" /bin/bash -c '
+if env CF_AGENT_WECHAT_TESTING=1 \
+  CF_AGENT_WECHAT_TEST_ROOT="$TEST_ROOT" TMPDIR="$TEST_ROOT" \
+  TOKEN_FILE="$TOKEN_FILE" \
+  /bin/bash -c '
 cd "$1"
 source scripts/common.sh
 load_auth_token
-printf "%s\n" token-loaded
 ' cf-agent-wechat-test "$TEST_REPO" > "$ROOT_TOKEN_OUTPUT" 2>&1; then
-  print_redacted_file "$ROOT_TOKEN_OUTPUT"
-  fail "root could not load the root-only Token"
+  fail "root executed testing Token helpers"
 fi
-grep -qx 'token-loaded' "$ROOT_TOKEN_OUTPUT" || \
-  fail "root Token test returned unexpected output"
+grep -q 'non-root, non-elevated identity' "$ROOT_TOKEN_OUTPUT" || \
+  fail "root testing-helper rejection returned an unexpected error"
 assert_no_sudo_calls "root Token load"
 assert_file_has_no_token "$ROOT_TOKEN_OUTPUT"
-printf 'PASS root reads the protected Token without sudo or disclosure\n'
+printf 'PASS testing helpers reject root execution before reading Token data\n'
 
 reset_audit
 "$REAL_SUDO" -u "$TEST_USER" -H env \
+  CF_AGENT_WECHAT_TESTING=1 \
+  CF_AGENT_WECHAT_TEST_ROOT="$TEST_ROOT" TMPDIR="$TEST_ROOT" \
   PATH="$AUDIT_PATH" \
   CF_AUDIT_LOG="$AUDIT_LOG" \
   CF_AUDIT_REAL_DOCKER="$REAL_DOCKER" \
@@ -763,6 +1056,8 @@ reset_audit
 mv "$TOKEN_FILE" "${TOKEN_FILE}.saved"
 MISSING_OUTPUT="${TEST_ROOT}/missing.out"
 if "$REAL_SUDO" -u "$TEST_USER" -H env \
+  CF_AGENT_WECHAT_TESTING=1 \
+  CF_AGENT_WECHAT_TEST_ROOT="$TEST_ROOT" TMPDIR="$TEST_ROOT" \
   PATH="$AUDIT_PATH" \
   CF_AUDIT_LOG="$AUDIT_LOG" \
   CF_AUDIT_REAL_SUDO="$REAL_SUDO" \
@@ -789,9 +1084,11 @@ printf 'PASS missing root-only token distinction\n'
 
 NO_SUDO_OUTPUT="${TEST_ROOT}/no-sudo.out"
 if timeout 15s sudo -u "$NO_SUDO_USER" -H env \
+  CF_AGENT_WECHAT_TESTING=1 \
+  CF_AGENT_WECHAT_TEST_ROOT="$NO_SUDO_HOME" TMPDIR="$NO_SUDO_HOME" \
   API_URL="http://127.0.0.1:${HTTP_PORT}" \
   WS_URL="ws://127.0.0.1:${WS_PORT}/api/ws/login" \
-  TOKEN_FILE="$TOKEN_FILE" \
+  TOKEN_FILE="$NO_SUDO_TOKEN_FILE" \
   PYTHON_BIN=python3 \
   NO_COLOR=1 \
   NO_PROXY=127.0.0.1,localhost \
@@ -823,6 +1120,8 @@ reset_audit
 ROOT_CONFIG_OUTPUT="${TEST_ROOT}/root-config.out"
 ROOT_CONFIG_ERROR="${TEST_ROOT}/root-config.error"
 if ! "$REAL_SUDO" -u "$TEST_USER" -H env \
+  CF_AGENT_WECHAT_TESTING=1 \
+  "${TEST_MANAGEMENT_ENV[@]}" \
   PATH="$AUDIT_PATH" \
   CF_AUDIT_LOG="$AUDIT_LOG" \
   CF_AUDIT_REAL_SUDO="$REAL_SUDO" \

@@ -36,8 +36,9 @@ SECRETS_DIR="$TEST_ROOT/secrets"
 TOKEN_FILE="$SECRETS_DIR/auth-token"
 READY_FILE="$TEST_ROOT/server.ready"
 SERVER_LOG="$TEST_ROOT/server.log"
-TOKEN_VALUE="api-timeout-sensitive-token-$RANDOM-$RANDOM"
-install -d -m 700 "$SECRETS_DIR"
+TOKEN_VALUE='abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789'
+mkdir -p -- "$SECRETS_DIR"
+chmod 700 "$SECRETS_DIR"
 printf '%s\n' "$TOKEN_VALUE" > "$TOKEN_FILE"
 chmod 600 "$TOKEN_FILE"
 
@@ -73,6 +74,11 @@ PORT="$(cat -- "$READY_FILE")"
 STARTED_AT="$(date +%s)"
 set +e
 OUTPUT="$(env \
+  CF_AGENT_WECHAT_TESTING=1 \
+  CF_AGENT_WECHAT_TEST_ROOT="$TEST_ROOT" \
+  TMPDIR="$TEST_ROOT" \
+  HOME="$TEST_ROOT" \
+  CF_AGENT_WECHAT_CURL_BIN="$(command -v curl)" \
   API_URL="http://127.0.0.1:$PORT" \
   TOKEN_FILE="$TOKEN_FILE" \
   HTTP_CONNECT_TIMEOUT=1 \

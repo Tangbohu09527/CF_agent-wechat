@@ -37,7 +37,7 @@ if [ "${GITHUB_ACTIONS:-}" != "true" ] || \
   fail "refusing to run outside the disposable restart=no CI job"
 fi
 if [ "$(id -u)" -ne 0 ]; then
-  fail "restart=no Docker integration test must run as root"
+  fail "restart=no Docker policy fixture must run as root"
 fi
 if [ -e "$DEPLOYMENT_ROOT" ]; then
   fail "refusing to touch an existing deployment root: ${DEPLOYMENT_ROOT}"
@@ -51,7 +51,7 @@ systemctl is-active --quiet docker || fail "systemd Docker service is not active
 LIVE_RESTORE="$(docker info --format '{{json .LiveRestoreEnabled}}')" ||
   fail "Docker live-restore state could not be inspected"
 [ "$LIVE_RESTORE" = false ] ||
-  fail "restart=no lifecycle E2E requires Docker live-restore=false"
+  fail "restart=no Docker policy fixture requires Docker live-restore=false"
 printf '%s\n' 'PASS Docker live-restore is disabled'
 
 
@@ -166,7 +166,7 @@ for _attempt in $(seq 1 60); do
 done
 docker info >/dev/null 2>&1 || fail "Docker daemon did not return after restart"
 assert_stopped_without_restart "$SERVICE_CONTAINER"
-printf '%s\n' 'PASS Docker daemon restart does not restore agent-wechat'
+printf '%s\n' 'PASS Docker daemon restart does not restore the fixture container'
 
 if systemctl is-enabled --quiet cf-agent-wechat.service 2>/dev/null; then
   fail "a boot-enabled cf-agent-wechat service would violate the manual QR gate"
@@ -178,6 +178,6 @@ for _attempt in $(seq 1 60); do
 done
 docker info >/dev/null 2>&1 || fail "Docker daemon did not return after second initialization"
 assert_stopped_without_restart "$SERVICE_CONTAINER"
-printf '%s\n' 'PASS boot-unit contract is disabled and a second daemon initialization leaves Agent stopped'
+printf '%s\n' 'PASS boot-unit contract is disabled and a second daemon initialization leaves the fixture container stopped'
 
-printf '%s\n' 'All real Docker restart=no lifecycle tests passed.'
+printf '%s\n' 'All restart=no Docker policy fixture checks passed.'

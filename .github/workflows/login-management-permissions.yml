@@ -53,6 +53,9 @@ jobs:
       - name: Run safe management environment tests
         run: bash tests/integration/management_environment.sh
 
+      - name: Run Python dependency integrity tests
+        run: bash tests/integration/login_dependency_integrity.sh
+
       - name: Run API hard-timeout integration test
         run: bash tests/integration/api_hard_timeout.sh
 
@@ -117,12 +120,12 @@ jobs:
         run: bash tests/deployment/validate_compose_config.sh
 
   docker-restart-no:
-    name: Real Docker restart=no lifecycle
+    name: restart=no Docker policy fixture
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
-      - name: Verify exits and daemon initialization never restore Agent
+      - name: Verify fixture exits and daemon restart keep containers stopped
         run: >-
           sudo env GITHUB_ACTIONS=true CF_AGENT_WECHAT_RESTART_NO_TEST=1
           bash tests/integration/docker_restart_no.sh

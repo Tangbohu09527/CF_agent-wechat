@@ -14,6 +14,17 @@ if [ "$sudo_command_count" -gt 0 ]; then
   last_argument="${sudo_command[sudo_command_count - 1]}"
 fi
 
+if [ -n "${MOCK_APPROVED_DOCKER_SOCKET:-}" ] &&
+  [ "${1:-}" = stat ] &&
+  [ "$last_argument" = "$MOCK_APPROVED_DOCKER_SOCKET" ]; then
+  case " $* " in
+    *" -Lc %u:%a "*)
+      printf '%s\n' '0:600'
+      exit 0
+      ;;
+  esac
+fi
+
 if [ -n "${MOCK_SUDO_FAIL_MV_SOURCE:-}" ] &&
   [ -n "${MOCK_SUDO_FAIL_MV_MARKER:-}" ] &&
   [ "${1:-}" = "mv" ] && [ "$#" -ge 3 ]; then

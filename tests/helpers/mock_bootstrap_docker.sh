@@ -108,6 +108,7 @@ case "${1:-}" in
     shift
     compose_file=""
     env_file=""
+    project_name=""
     command_name=""
     command_args=()
     while [ "$#" -gt 0 ]; do
@@ -116,8 +117,15 @@ case "${1:-}" in
           env_file="${2:-}"
           shift 2
           ;;
-        --project-directory|--project-name|-f)
-          if [ "$1" = -f ]; then compose_file="${2:-}"; fi
+        --project-directory)
+          shift 2
+          ;;
+        --project-name)
+          project_name="${2:-}"
+          shift 2
+          ;;
+        -f)
+          compose_file="${2:-}"
           shift 2
           ;;
         version|config|ps|up|start|stop|restart|rm|down)
@@ -132,6 +140,42 @@ case "${1:-}" in
 
     is_gateway=0
     case "$compose_file" in */gateway/*|*/deploy/compose.yaml) is_gateway=1 ;; esac
+    if [ "$is_gateway" -eq 1 ] && [ -e "${STATE_DIR}/assert-gateway-clean-env" ]; then
+      gateway_forbidden_variables=(
+        DOCKER_HOST DOCKER_CONTEXT DOCKER_TLS_VERIFY DOCKER_CERT_PATH
+        COMPOSE_FILE COMPOSE_PROFILES COMPOSE_ENV_FILES COMPOSE_PATH_SEPARATOR
+        COMPOSE_PROJECT_DIR COMPOSE_PARALLEL_LIMIT COMPOSE_IGNORE_ORPHANS
+        COMPOSE_REMOVE_ORPHANS COMPOSE_STATUS_STDOUT COMPOSE_ANSI COMPOSE_PROGRESS
+        COMPOSE_EXPERIMENTAL COMPOSE_MENU COMPOSE_PROJECT_NAME DOCKER_CONFIG
+        BUILDX_BUILDER HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY http_proxy
+        https_proxy all_proxy no_proxy AGENT_WECHAT_IMAGE AGENT_WECHAT_BIND_IP
+        AGENT_WECHAT_PORT AGENT_WECHAT_CONTAINER_NAME CF_AGENT_WECHAT_STORAGE_ROOT
+        CF_AGENT_WECHAT_RUNTIME_ROOT CF_AGENT_WECHAT_ARCHIVE_ROOT
+        CF_AGENT_WECHAT_TOKEN_FILE PROXY RUST_LOG CF_GATEWAY_IMAGE
+        CF_GATEWAY_CONFIG_FILE CF_GATEWAY_DATABASE_URL CF_GATEWAY_BIND_IP
+        CF_GATEWAY_PORT CF_GATEWAY_STOP_GRACE_PERIOD CF_GATEWAY_LOG_LEVEL
+        CF_GATEWAY_WORKER_HEARTBEAT_FILE CF_GATEWAY_WORKER_HEARTBEAT_MAX_AGE
+        CF_GATEWAY_CONFIG CF_AGENT_GATEWAY_DATABASE_URL
+        CF_GATEWAY_STARTUP_MIGRATION_MODE CF_GATEWAY_API_TOKEN
+        CF_AGENT_GATEWAY_ADMIN_TOKEN CF_AGENT_WECHAT_TOKEN HERMES_API_KEY
+        CF_GATEWAY_WORKER_CONCURRENCY CF_GATEWAY_WORKER_LEASE_SECONDS
+        CF_GATEWAY_WORKER_RETRY_LIMIT CF_GATEWAY_WORKER_HEARTBEAT_INTERVAL_SECONDS
+        CF_GATEWAY_WORKER_HEARTBEAT_MAX_AGE_SECONDS
+        CF_GATEWAY_RUNTIME_HEARTBEAT_MAX_AGE_SECONDS CF_GATEWAY_BIND_ADDRESS
+        CF_GATEWAY_LOG_MAX_SIZE CF_GATEWAY_LOG_MAX_FILES
+      )
+      for variable in "${gateway_forbidden_variables[@]}"; do
+        if [[ -v $variable ]]; then
+          printf '%s\n' "$variable" > "${STATE_DIR}/gateway-env-not-clean"
+          exit 88
+        fi
+      done
+      if [ "${CF_GATEWAY_ENV_FILE-}" != "$env_file" ]; then
+        printf '%s\n' CF_GATEWAY_ENV_FILE > "${STATE_DIR}/gateway-env-not-clean"
+        exit 88
+      fi
+      : > "${STATE_DIR}/gateway-env-clean"
+    fi
     case "$command_name" in
       version)
         printf '%s\n' '2.35.1'
@@ -146,54 +190,193 @@ case "${1:-}" in
         arguments=" ${command_args[*]} "
         if [[ "$arguments" == *' --services '* ]]; then
           if [ "$is_gateway" -eq 1 ]; then
-            printf '%s\n' wechat-worker dispatch-worker delivery-worker
+            printf '%s\n' worker dispatch-worker delivery-worker
           else
             printf '%s\n' agent-wechat
           fi
           exit 0
         fi
+        if [[ "$arguments" == *' --format json '* ]] && [ "$is_gateway" -eq 1 ]; then
+          gateway_root="${compose_file%/*}"
+          scenario_root="${gateway_root%/*}"
+          token_host_path="${scenario_root}/storage/secrets/auth-token"
+          token_worker_path="$(read_env_value "$env_file" CF_AGENT_WECHAT_TOKEN_FILE)"
+          token_mount_source="$token_host_path"
+          [ ! -e "${STATE_DIR}/gateway-token-mount-drift" ] ||
+            token_mount_source="${token_host_path}.drift"
+          python3 - "$project_name" "$token_host_path" "$token_worker_path" \
+            "$token_mount_source" <<'PY'
+import json
+import sys
+
+project_name, token_host_path, token_worker_path, token_mount_source = sys.argv[1:]
+print(json.dumps({
+    "name": project_name,
+    "services": {
+        "worker": {
+            "environment": {
+                "CF_AGENT_WECHAT_TOKEN_FILE": token_worker_path,
+            },
+            "volumes": [{
+                "type": "bind",
+                "source": token_mount_source,
+                "target": token_worker_path,
+                "read_only": True,
+                "bind": {"create_host_path": False},
+            }],
+        },
+    },
+}))
+PY
+          exit 0
+        fi
         if [[ "$arguments" == *' --format json '* ]] && [ "$is_gateway" -eq 0 ]; then
-          image="$(read_env_value "$env_file" AGENT_WECHAT_IMAGE)"
+          image="${AGENT_WECHAT_IMAGE:?}"
+          container_name="${AGENT_WECHAT_CONTAINER_NAME:?}"
+          proxy="${PROXY-}"
+          rust_log="${RUST_LOG:?}"
           port="$(read_env_value "$env_file" AGENT_WECHAT_PORT)"
           runtime="${CF_AGENT_WECHAT_RUNTIME_ROOT:?}"
           token="${CF_AGENT_WECHAT_TOKEN_FILE:?}"
           restart_policy=no
+          agent_host=0.0.0.0
+          agent_port=6174
+          agent_db_path=/data/agent.db
+          health_interval=30s
+          health_start_period=1m30s
+          stop_grace_period=30s
+          bad_bind_options=0
+          process_override=0
+          lifecycle_override=0
           [ ! -e "${STATE_DIR}/bad-compose-restart" ] ||
             restart_policy=unless-stopped
-          python3 - "$image" "$port" "$runtime" "$token" "$restart_policy" <<'PY'
+          [ ! -e "${STATE_DIR}/bad-compose-image" ] ||
+            image="registry.example/attacker@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          [ ! -e "${STATE_DIR}/bad-compose-container" ] ||
+            container_name=wrong-agent-container
+          [ ! -e "${STATE_DIR}/bad-compose-project" ] ||
+            project_name=wrong-compose-project
+          [ ! -e "${STATE_DIR}/bad-compose-proxy" ] ||
+            proxy=http://wrong-proxy.invalid:8080
+          [ ! -e "${STATE_DIR}/bad-compose-rust-log" ] ||
+            rust_log=debug
+          [ ! -e "${STATE_DIR}/bad-compose-environment" ] ||
+            agent_host=127.0.0.1
+          [ ! -e "${STATE_DIR}/bad-compose-health-interval" ] ||
+            health_interval=5m
+          [ ! -e "${STATE_DIR}/bad-compose-health-start-period" ] ||
+            health_start_period=0s
+          [ ! -e "${STATE_DIR}/bad-compose-stop-grace-period" ] ||
+            stop_grace_period=5s
+          [ ! -e "${STATE_DIR}/bad-compose-bind-options" ] ||
+            bad_bind_options=1
+          [ ! -e "${STATE_DIR}/bad-compose-process-override" ] ||
+            process_override=1
+          [ ! -e "${STATE_DIR}/bad-compose-lifecycle-override" ] ||
+            lifecycle_override=1
+          python3 - "$image" "$container_name" "$project_name" "$proxy" \
+            "$rust_log" "$port" "$runtime" "$token" "$restart_policy" \
+            "$agent_host" "$agent_port" "$agent_db_path" "$health_interval" \
+            "$health_start_period" "$stop_grace_period" "$bad_bind_options" \
+            "$process_override" "$lifecycle_override" <<'PY'
 import json
 import sys
 
-image, port, runtime, token, restart_policy = sys.argv[1:]
-print(json.dumps({
-    "services": {
-        "agent-wechat": {
-            "image": image,
-            "container_name": "cf-agent-wechat",
-            "restart": restart_policy,
-            "security_opt": ["seccomp=unconfined"],
-            "cap_add": ["SYS_PTRACE"],
-            "ports": [{
-                "host_ip": "127.0.0.1",
-                "published": port,
-                "target": 6174,
-                "protocol": "tcp",
-            }],
-            "volumes": [
-                {"type": "bind", "source": runtime + "/data", "target": "/data", "bind": {"create_host_path": False}},
-                {"type": "bind", "source": runtime + "/wechat-home", "target": "/home/wechat", "bind": {"create_host_path": False}},
-                {"type": "bind", "source": token, "target": "/data/auth-token", "read_only": True, "bind": {"create_host_path": False}},
-            ],
-            "environment": {"ENABLE_VNC": "0"},
-            "healthcheck": {
-                "test": ["CMD", "curl", "--fail", "--silent", "--show-error", "http://127.0.0.1:6174/health"],
-                "timeout": "5s",
-                "retries": 5,
-            },
-            "logging": {"driver": "json-file", "options": {"max-size": "20m", "max-file": "3"}},
-            "networks": {"cf-internal": {"aliases": ["cf-agent-wechat"]}},
-        }
+(
+    image,
+    container_name,
+    project_name,
+    proxy,
+    rust_log,
+    port,
+    runtime,
+    token,
+    restart_policy,
+    agent_host,
+    agent_port,
+    agent_db_path,
+    health_interval,
+    health_start_period,
+    stop_grace_period,
+    bad_bind_options,
+    process_override,
+    lifecycle_override,
+) = sys.argv[1:]
+
+data_bind = {"create_host_path": False}
+if bad_bind_options == "1":
+    data_bind["propagation"] = "rshared"
+
+service = {
+    "image": image,
+    "container_name": container_name,
+    "restart": restart_policy,
+    "security_opt": ["seccomp=unconfined"],
+    "cap_add": ["SYS_PTRACE"],
+    "ports": [{
+        "host_ip": "127.0.0.1",
+        "published": port,
+        "target": 6174,
+        "protocol": "tcp",
+    }],
+    "volumes": [
+        {
+            "type": "bind",
+            "source": runtime + "/data",
+            "target": "/data",
+            "bind": data_bind,
+        },
+        {
+            "type": "bind",
+            "source": runtime + "/wechat-home",
+            "target": "/home/wechat",
+            "bind": {"create_host_path": False},
+        },
+        {
+            "type": "bind",
+            "source": token,
+            "target": "/data/auth-token",
+            "read_only": True,
+            "bind": {"create_host_path": False},
+        },
+    ],
+    "environment": {
+        "AGENT_HOST": agent_host,
+        "AGENT_PORT": agent_port,
+        "AGENT_DB_PATH": agent_db_path,
+        "ENABLE_VNC": "0",
+        "PROXY": proxy,
+        "RUST_LOG": rust_log,
     },
+    "healthcheck": {
+        "test": [
+            "CMD",
+            "curl",
+            "--fail",
+            "--silent",
+            "--show-error",
+            "http://127.0.0.1:6174/health",
+        ],
+        "interval": health_interval,
+        "timeout": "5s",
+        "retries": 5,
+        "start_period": health_start_period,
+    },
+    "logging": {
+        "driver": "json-file",
+        "options": {"max-size": "20m", "max-file": "3"},
+    },
+    "stop_grace_period": stop_grace_period,
+    "networks": {"cf-internal": {"aliases": ["cf-agent-wechat"]}},
+}
+if process_override == "1":
+    service["command"] = ["/bin/false"]
+if lifecycle_override == "1":
+    service["profiles"] = ["automatic"]
+
+print(json.dumps({
+    "name": project_name,
+    "services": {"agent-wechat": service},
     "networks": {"cf-internal": {"name": "cf-internal", "external": True}},
 }))
 PY
@@ -210,7 +393,7 @@ PY
               printf '%s\n' agent-test-id
             fi
           fi
-        elif [ "$service" = wechat-worker ]; then
+        elif [ "$service" = worker ]; then
           if [[ "$arguments" == *' --status running '* ]] && [ -e "${STATE_DIR}/worker-running" ]; then
             printf '%s\n' worker-test-id
           fi

@@ -9,6 +9,7 @@ sudo_arguments=("$@")
 docker_subcommand=""
 docker_arguments=()
 python_or_pip=0
+approved_management_python=0
 token_reader=0
 validation=0
 noninteractive=0
@@ -34,9 +35,21 @@ for argument in "${sudo_arguments[@]}"; do
       ;;
   esac
 done
+if [ "$python_or_pip" -eq 1 ]; then
+  for argument in "${sudo_arguments[@]}"; do
+    case "$argument" in
+      */parse_management_env.py|*/verify_management_source_secrets.py|gateway-verifier-snapshot|*'base64.b64encode(b"".join(chunks))'*)
+        approved_management_python=1
+        ;;
+    esac
+  done
+fi
 
 if [ "$validation" -eq 1 ]; then
   kind="validate"
+elif [ "$python_or_pip" -eq 1 ] &&
+  [ "$approved_management_python" -eq 1 ]; then
+  kind="management-python"
 elif [ "$python_or_pip" -eq 1 ]; then
   kind="python-pip"
 elif [ "$token_reader" -eq 1 ]; then

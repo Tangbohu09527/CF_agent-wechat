@@ -4,11 +4,14 @@
 from __future__ import annotations
 
 import contextlib
+import base64
 import importlib.util
 import io
 import json
+import logging
 import os
 import sys
+import traceback
 import types
 import unittest
 from pathlib import Path
@@ -31,6 +34,7 @@ class FakeConnection:
         self,
         events: list[dict[str, object] | str | bytes] | None = None,
         *,
+        set_timeout_error: Exception | None = None,
         recv_error: Exception | None = None,
         close_error: Exception | None = None,
     ) -> None:
@@ -38,12 +42,15 @@ class FakeConnection:
             json.dumps(event) if isinstance(event, dict) else event
             for event in (events or [])
         ]
+        self.set_timeout_error = set_timeout_error
         self.recv_error = recv_error
         self.close_error = close_error
         self.closed = False
         self.timeouts: list[float] = []
 
     def settimeout(self, timeout: float) -> None:
+        if self.set_timeout_error is not None:
+            raise self.set_timeout_error
         self.timeouts.append(timeout)
 
     def recv(self) -> str | bytes:
@@ -68,11 +75,13 @@ class QrLoginTests(unittest.TestCase):
         new_account: bool = False,
         qr_already_rendered: bool = False,
         require_qr: bool = False,
+        set_timeout_error: Exception | None = None,
         recv_error: Exception | None = None,
         close_error: Exception | None = None,
     ) -> tuple[FakeConnection, Exception]:
         connection = FakeConnection(
             events,
+            set_timeout_error=set_timeout_error,
             recv_error=recv_error,
             close_error=close_error,
         )
@@ -99,6 +108,28 @@ class QrLoginTests(unittest.TestCase):
     def assert_safe_error(self, error: Exception, token: str) -> str:
         message = str(error)
         self.assertNotIn(token, message)
+        self.assertNotIn(token, repr(error))
+        self.assertIsNone(error.__cause__)
+        self.assertIsNone(error.__context__)
+        self.assertNotIn(token, "".join(traceback.format_exception(error)))
+
+        output = io.StringIO()
+        logger = logging.getLogger(f"{__name__}.{self.id()}")
+        logger.handlers.clear()
+        logger.propagate = False
+        logger.setLevel(logging.ERROR)
+        handler = logging.StreamHandler(output)
+        logger.addHandler(handler)
+        try:
+            try:
+                raise error
+            except Exception:
+                logger.exception("captured sanitized login error")
+        finally:
+            logger.removeHandler(handler)
+            handler.close()
+        self.assertNotIn(token, output.getvalue())
+
         for character in message:
             self.assertFalse(
                 ord(character) < 0x20 or ord(character) == 0x7F,
@@ -168,6 +199,10 @@ class QrLoginTests(unittest.TestCase):
 
         query = parse_qs(urlsplit(str(captured["url"])).query)
         self.assertEqual(query["newAccount"], ["true"])
+        connection_options = captured["kwargs"]
+        self.assertIsInstance(connection_options, dict)
+        self.assertEqual(connection_options["redirect_limit"], 0)
+        self.assertEqual(connection_options["http_no_proxy"], ["*"])
         render.assert_called_once_with(
             {"type": "qr", "qrData": "fixture://fresh-device"},
             "fixture-token-never-printed",
@@ -260,6 +295,20 @@ class QrLoginTests(unittest.TestCase):
         self.assertIn("[REDACTED]", message)
         self.assertTrue(connection.closed)
 
+    def test_websocket_settimeout_failure_sanitizes_external_error(self) -> None:
+        token = "fixture-settimeout-secret"
+        connection, error = self.run_listener_for_error(
+            [],
+            token=token,
+            set_timeout_error=OSError(
+                f"settimeout failed {token}\r\n\x1b\x00\t\x7f"
+            ),
+        )
+        message = self.assert_safe_error(error, token)
+        self.assertIn("无法设置登录 WebSocket 超时", message)
+        self.assertIn("[REDACTED]", message)
+        self.assertTrue(connection.closed)
+
     def test_close_failure_does_not_override_receive_error(self) -> None:
         token = "fixture-close-secret"
         connection, error = self.run_listener_for_error(
@@ -313,8 +362,11 @@ class QrLoginTests(unittest.TestCase):
     def test_invalid_json_and_non_utf8_events_fail_closed(self) -> None:
         token = "fixture-malformed-secret"
         cases: list[tuple[str | bytes, str]] = [
-            ("not-json\r\n", "无法解析"),
-            (b"not-json\xff\r\n", "不是 UTF-8"),
+            (f"not-json {token}\r\n", "无法解析"),
+            (
+                f"not-json {token}".encode("utf-8") + b"\xff\r\n",
+                "不是 UTF-8",
+            ),
         ]
 
         for raw_event, expected_message in cases:
@@ -426,6 +478,82 @@ class QrLoginTests(unittest.TestCase):
         message = self.assert_safe_error(raised.exception, token)
         self.assertIn("受保护", message)
         render.assert_not_called()
+
+    def test_png_data_url_requires_png_mime_and_signature(self) -> None:
+        valid_payload = base64.b64encode(QR_LOGIN.PNG_SIGNATURE).decode("ascii")
+        with self.assertRaisesRegex(QR_LOGIN.LoginToolError, "Base64 PNG"):
+            QR_LOGIN._decode_png_base64(
+                f"data:image/jpeg;base64,{valid_payload}"
+            )
+        with self.assertRaisesRegex(QR_LOGIN.LoginToolError, "PNG 签名"):
+            QR_LOGIN._decode_png_base64(
+                "data:image/png;base64,"
+                + base64.b64encode(b"not-a-png").decode("ascii")
+            )
+        self.assertEqual(
+            QR_LOGIN._decode_png_base64(
+                f"data:image/png;base64,{valid_payload}"
+            ),
+            QR_LOGIN.PNG_SIGNATURE,
+        )
+
+    def test_png_encoded_and_decoded_size_limits_fail_before_render(self) -> None:
+        with self.assertRaisesRegex(QR_LOGIN.LoginToolError, "编码长度"):
+            QR_LOGIN._decode_png_base64(
+                "A" * (QR_LOGIN.MAX_QR_BASE64_CHARS + 1)
+            )
+
+        oversized = QR_LOGIN.PNG_SIGNATURE + (
+            b"x" * QR_LOGIN.MAX_QR_IMAGE_BYTES
+        )
+        with mock.patch.object(
+            QR_LOGIN.base64, "b64decode", return_value=oversized
+        ):
+            with self.assertRaisesRegex(QR_LOGIN.LoginToolError, "解码长度"):
+                QR_LOGIN._decode_png_base64("iVBORw0KGgo=")
+
+    def test_png_dimension_pixel_format_and_frame_limits(self) -> None:
+        class FakeImage:
+            def __init__(
+                self,
+                size: tuple[int, int],
+                image_format: str = "PNG",
+                frames: int = 1,
+            ) -> None:
+                self.size = size
+                self.format = image_format
+                self.n_frames = frames
+
+            def __enter__(self) -> "FakeImage":
+                return self
+
+            def __exit__(self, *_args: object) -> None:
+                return None
+
+            def load(self) -> None:
+                raise AssertionError("oversized image must fail before decoding")
+
+        cases = (
+            ((2049, 29), "PNG", 1, "尺寸超过"),
+            ((2001, 2000), "PNG", 1, "像素数超过"),
+            ((29, 29), "JPEG", 1, "必须是 PNG"),
+            ((29, 29), "PNG", 2, "多个图像帧"),
+        )
+        for size, image_format, frames, message in cases:
+            with self.subTest(message=message):
+                image_module = types.SimpleNamespace(
+                    open=lambda *_args, size=size, image_format=image_format,
+                    frames=frames: FakeImage(size, image_format, frames),
+                    Resampling=types.SimpleNamespace(NEAREST=0),
+                )
+                pillow_module = types.SimpleNamespace(
+                    Image=image_module,
+                    ImageOps=types.SimpleNamespace(autocontrast=lambda value: value),
+                    UnidentifiedImageError=OSError,
+                )
+                with mock.patch.dict(sys.modules, {"PIL": pillow_module}):
+                    with self.assertRaisesRegex(QR_LOGIN.LoginToolError, message):
+                        QR_LOGIN._matrix_from_image(QR_LOGIN.PNG_SIGNATURE)
 
     def test_production_fresh_qr_rejects_png_only_events(self) -> None:
         token = "fixture-png-secret"

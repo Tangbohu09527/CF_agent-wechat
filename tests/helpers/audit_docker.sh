@@ -29,14 +29,22 @@ fi
 
 if [ "${CF_AUDIT_DOCKER_RUNTIME_MOCK:-}" = "1" ]; then
   case "${1:-}" in
-    context|info|compose|exec|inspect)
-      if [ "${CF_AUDIT_DOCKER_VIA_SUDO:-0}" != "1" ]; then
-        printf '%s\n' \
-          'permission denied while connecting to docker.sock' >&2
-        exit 1
+    context|info|compose|exec|inspect|network|image)
+      if [ "${CF_AUDIT_DOCKER_VIA_SUDO:-0}" = "1" ]; then
+        printf '%s\n' 'testing Docker mock must not execute through sudo' >&2
+        exit 98
       fi
       ;;
   esac
+  if [ -n "${CF_AUDIT_DOCKER_BACKEND:-}" ]; then
+    if [ ! -f "$CF_AUDIT_DOCKER_BACKEND" ] ||
+      [ ! -x "$CF_AUDIT_DOCKER_BACKEND" ] ||
+      [ -L "$CF_AUDIT_DOCKER_BACKEND" ]; then
+      printf '%s\n' 'audit Docker backend is unsafe' >&2
+      exit 66
+    fi
+    exec "$CF_AUDIT_DOCKER_BACKEND" "$@"
+  fi
 
   case "${1:-}" in
     info)
@@ -50,7 +58,7 @@ if [ "${CF_AUDIT_DOCKER_RUNTIME_MOCK:-}" = "1" ]; then
     context)
       case "${2:-}" in
         show) printf '%s\n' 'default' ;;
-        inspect) printf '%s\n' 'unix:///var/run/docker.sock' ;;
+        inspect) printf 'unix://%s\n' "${CF_AGENT_WECHAT_DOCKER_SOCKET_PATH:-/var/run/docker.sock}" ;;
         *) exit 64 ;;
       esac
       exit 0

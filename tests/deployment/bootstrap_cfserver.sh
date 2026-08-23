@@ -5,6 +5,7 @@ REPO_ROOT="$(CDPATH='' cd -- "$(dirname -- "$0")/../.." && pwd -P)"
 BOOTSTRAP="$REPO_ROOT/scripts/bootstrap-cfserver.sh"
 TEST_ROOT="$(mktemp -d /tmp/cf-agent-wechat-bootstrap.XXXXXX)"
 IMAGE="registry.example/cf-agent-wechat@sha256:$(printf 'a%.0s' {1..64})"
+FIXTURE_TOKEN="$(printf 'c%.0s' {1..64})"
 CURRENT_UID="$(id -u)"
 CURRENT_GID="$(id -g)"
 REQUIRE_TEST="$(printenv CF_REQUIRE_BOOTSTRAP_DEPLOYMENT_TEST 2>/dev/null || printf 0)"
@@ -105,22 +106,24 @@ prepare_fixture() {
   local name="$1"
   SCENARIO_ROOT="$TEST_ROOT/$name"
   APP_ROOT="$SCENARIO_ROOT/agent"
-  GATEWAY_PROJECT="$SCENARIO_ROOT/gateway/deploy"
+  GATEWAY_PROJECT="$SCENARIO_ROOT/gateway"
+  GATEWAY_DEPLOY="$GATEWAY_PROJECT/deploy"
   STORAGE_ROOT="$SCENARIO_ROOT/storage"
   RUNTIME_ROOT="$STORAGE_ROOT/runtime"
   ARCHIVE_ROOT="$STORAGE_ROOT/session-archive"
-  GATEWAY_HEARTBEAT="$GATEWAY_PROJECT/check-wechat-worker-heartbeat"
+  GATEWAY_HEARTBEAT="$GATEWAY_DEPLOY/check-wechat-worker-heartbeat"
+  GATEWAY_CONTRACT="$GATEWAY_DEPLOY/wechat-runtime-contract.json"
   TOKEN_FILE="$STORAGE_ROOT/secrets/auth-token"
   AGENT_ENV="$APP_ROOT/docker/.env"
   AGENT_COMPOSE="$APP_ROOT/docker/compose.cfserver.yaml"
   GATEWAY_ENV="$GATEWAY_PROJECT/.env"
-  GATEWAY_COMPOSE="$GATEWAY_PROJECT/compose.yaml"
+  GATEWAY_COMPOSE="$GATEWAY_PROJECT/docker-compose.prod.yml"
   MOCK_BIN="$SCENARIO_ROOT/bin"
   MOCK_STATE="$MOCK_BIN/state"
   OUTPUT="$SCENARIO_ROOT/bootstrap.out"
   DOCKER_SOCKET="$SCENARIO_ROOT/docker.sock"
 
-  install -d -m 755 -- "$APP_ROOT/docker" "$GATEWAY_PROJECT" "$MOCK_BIN" \
+  install -d -m 755 -- "$APP_ROOT/docker" "$GATEWAY_DEPLOY" "$MOCK_BIN" \
     "$MOCK_STATE" "$SCENARIO_ROOT/tmp"
   install -m 644 -- "$REPO_ROOT/docker/compose.cfserver.yaml" "$AGENT_COMPOSE"
   install -m 755 -- "$REPO_ROOT/tests/helpers/mock_bootstrap_docker.sh" \
@@ -147,6 +150,15 @@ PY
       "CF_AGENT_WECHAT_STORAGE_ROOT=$STORAGE_ROOT" \
       "CF_AGENT_WECHAT_RUNTIME_ROOT=$RUNTIME_ROOT" \
       "CF_AGENT_WECHAT_ARCHIVE_ROOT=$ARCHIVE_ROOT" \
+      "CF_AGENT_WECHAT_RUNTIME_UID=$CURRENT_UID" \
+      "CF_AGENT_WECHAT_RUNTIME_GID=$CURRENT_GID" \
+      'CF_AGENT_WECHAT_RUNTIME_MODE=700' \
+      "CF_AGENT_WECHAT_MANAGEMENT_GID=$CURRENT_GID" \
+      'CF_AGENT_WECHAT_MIN_FREE_BYTES=1' \
+      'CF_AGENT_WECHAT_MIN_FREE_PERCENT=0' \
+      'CF_AGENT_WECHAT_MIN_FREE_INODES=1' \
+      'CF_AGENT_WECHAT_TOKEN_SCAN_MAX_FILES=1000' \
+      'CF_AGENT_WECHAT_TOKEN_SCAN_MAX_BYTES=1048576' \
       'PROXY=' \
       'RUST_LOG=info'
   } > "$AGENT_ENV"
@@ -154,15 +166,67 @@ PY
   {
     printf '%s\n' \
       'services:' \
-      '  wechat-worker:' \
+      '  worker:' \
       '    image: registry.example/gateway@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
   } > "$GATEWAY_COMPOSE"
-  printf '%s\n' 'GATEWAY_ENV=production' > "$GATEWAY_ENV"
+  printf '%s\n' \
+    'GATEWAY_ENV=production' \
+    'CF_AGENT_WECHAT_TOKEN_FILE=/run/secrets/cf-agent-wechat-auth-token' > "$GATEWAY_ENV"
   printf '%s\n' '#!/bin/sh' 'exit 0' > "$GATEWAY_HEARTBEAT"
+  python3 - "$GATEWAY_CONTRACT" "$TOKEN_FILE" "$GATEWAY_HEARTBEAT" <<'PY'
+import hashlib
+import json
+import sys
+
+contract_file, token_file, checker = sys.argv[1:]
+with open(checker, "rb") as stream:
+    checker_sha256 = hashlib.sha256(stream.read()).hexdigest()
+with open(contract_file, "w", encoding="utf-8") as stream:
+    json.dump({
+        "contractVersion": "1",
+        "producer": {
+            "repository": "Tangbohu09527/CF_agent-gateway",
+            "checkerSha256": checker_sha256,
+        },
+        "agent": {
+            "networkAlias": "cf-agent-wechat",
+            "port": 6174,
+            "tokenAuthority": {
+                "hostPath": token_file,
+                "ownership": "root:root",
+                "mode": "0600",
+            },
+        },
+        "gateway": {
+            "service": "worker",
+            "composeProject": "cf-agent-gateway",
+            "checker": checker,
+            "checkerInterfaceVersion": 1,
+            "heartbeatMaxAgeSeconds": 30,
+            "requiresDockerHealth": True,
+            "requiresSuccessfulPoll": True,
+            "requiresLoggedIn": True,
+            "silentOutput": True,
+            "credential": {
+                "type": "file",
+                "environmentVariable": "CF_AGENT_WECHAT_TOKEN_FILE",
+                "workerPath": "/run/secrets/cf-agent-wechat-auth-token",
+                "readOnly": True,
+                "forbiddenEnvironmentVariable": "CF_AGENT_WECHAT_TOKEN",
+            },
+        },
+    }, stream)
+PY
   chmod 644 "$GATEWAY_COMPOSE"
+  chmod 644 "$GATEWAY_CONTRACT"
   chmod 600 "$GATEWAY_ENV"
   chmod 755 "$GATEWAY_HEARTBEAT"
   chmod 660 "$DOCKER_SOCKET"
+  sudo -n -- install -d -o 0 -g 0 -m 700 -- "$STORAGE_ROOT/secrets"
+  printf '%s\n' "$FIXTURE_TOKEN" |
+    sudo -n -- tee "$TOKEN_FILE" >/dev/null
+  sudo -n -- chown 0:0 "$TOKEN_FILE"
+  sudo -n -- chmod 600 "$TOKEN_FILE"
 }
 
 run_bootstrap() {
@@ -174,6 +238,7 @@ run_bootstrap() {
     -u AGENT_WECHAT_CONTAINER_NAME -u COMPOSE_PROJECT_NAME -u PROXY -u RUST_LOG \
     -u CF_AGENT_WECHAT_TOKEN_FILE -u SUDO_UID -u SUDO_GID \
     CF_BOOTSTRAP_TESTING=1 \
+    CF_AGENT_WECHAT_TEST_ROOT="$SCENARIO_ROOT" \
     CF_BOOTSTRAP_DOCKER_BIN="$MOCK_BIN/docker" \
     CF_BOOTSTRAP_SYSTEMCTL_BIN="$MOCK_BIN/systemctl" \
     CF_BOOTSTRAP_DOCKER_SOCKET_PATH="$DOCKER_SOCKET" \
@@ -207,12 +272,81 @@ expect_failure() {
   assert_contains "$OUTPUT" "$expected"
 }
 
+expect_production_override_failure() {
+  local variable="$1" value="$2"
+  local output="$TEST_ROOT/production-${variable}.out"
+
+  if /usr/bin/env -i \
+    PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+    "${variable}=${value}" \
+    /bin/bash -p "$BOOTSTRAP" >"$output" 2>&1; then
+    fail "production Bootstrap accepted $variable"
+  fi
+  assert_contains "$output" \
+    "$variable is forbidden as a production Bootstrap environment override"
+  assert_not_contains "$output" "$value"
+}
+
+expect_production_override_failure CF_BOOTSTRAP_DOCKER_TIMEOUT 424242
+expect_production_override_failure CF_BOOTSTRAP_COMPOSE_TIMEOUT 424243
+expect_production_override_failure TOKEN_FILE /attacker/secret-sentinel
+pass "production Bootstrap rejects inherited overrides without echoing their values"
+
+PRODUCTION_IDENTITY_OUTPUT="$TEST_ROOT/production-identity.out"
+if /usr/bin/env -i \
+  PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+  CF_BOOTSTRAP_TESTING=invalid \
+  SUDO_UID=2147483646 SUDO_GID=2147483646 \
+  /bin/bash -p "$BOOTSTRAP" >"$PRODUCTION_IDENTITY_OUTPUT" 2>&1; then
+  fail "production identity validation unexpectedly succeeded"
+fi
+assert_contains "$PRODUCTION_IDENTITY_OUTPUT" \
+  'CF_BOOTSTRAP_TESTING must be 0 or 1'
+assert_not_contains "$PRODUCTION_IDENTITY_OUTPUT" \
+  'TOKEN_FILE is forbidden as a production Bootstrap environment override'
+pass "internal management variables do not self-trigger and sudo metadata is not an authority"
+
+prepare_fixture sudo-identity-spoof
+run_bootstrap "$OUTPUT" SUDO_UID=0 SUDO_GID=0 || {
+  sed -n '1,200p' "$OUTPUT" >&2
+  fail "caller-controlled sudo identity changed the trusted management owner"
+}
+pass "caller-controlled SUDO_UID/SUDO_GID cannot change management ownership approval"
+
+prepare_fixture docker-timeout-upper-bound
+expect_failure \
+  'CF_BOOTSTRAP_DOCKER_TIMEOUT must not exceed 120 seconds in testing mode' \
+  CF_BOOTSTRAP_DOCKER_TIMEOUT=121
+pass "test Docker timeout has a bounded maximum"
+
+prepare_fixture compose-timeout-upper-bound
+expect_failure \
+  'CF_BOOTSTRAP_COMPOSE_TIMEOUT must not exceed 300 seconds in testing mode' \
+  CF_BOOTSTRAP_COMPOSE_TIMEOUT=301
+pass "test Compose timeout has a bounded maximum"
+
+prepare_fixture oversized-timeout
+OVERSIZED_TIMEOUT=999999999999999999999999999999999999999999
+expect_failure \
+  'CF_BOOTSTRAP_DOCKER_TIMEOUT must not exceed 120 seconds in testing mode' \
+  "CF_BOOTSTRAP_DOCKER_TIMEOUT=$OVERSIZED_TIMEOUT"
+assert_not_contains "$OUTPUT" "$OVERSIZED_TIMEOUT"
+pass "oversized timeout values fail closed without entering error output"
+
 prepare_fixture retry
+sudo -n -- rm -rf -- "$STORAGE_ROOT"
+printf '%s\n' 'GATEWAY_ENV=production' > "$GATEWAY_ENV"
+chmod 600 "$GATEWAY_ENV"
+expect_failure 'Gateway runtime contract or Agent Token agreement could not be verified'
+sudo -n -- test -f "$TOKEN_FILE" ||
+  fail "Gateway contract staging failure did not retain the generated Token"
+TOKEN_BEFORE="$(sudo -n -- cat "$TOKEN_FILE")"
+printf '%s\n' \
+  'GATEWAY_ENV=production' \
+  'CF_AGENT_WECHAT_TOKEN_FILE=/run/secrets/cf-agent-wechat-auth-token' > "$GATEWAY_ENV"
+chmod 600 "$GATEWAY_ENV"
 touch "$MOCK_STATE/fail-agent-compose"
 expect_failure 'production Compose validation failed'
-sudo -n -- test -f "$TOKEN_FILE" ||
-  fail "staged failure did not retain the Token"
-TOKEN_BEFORE="$(sudo -n -- cat "$TOKEN_FILE")"
 [ "$(printf '%s' "$TOKEN_BEFORE" | wc -c)" -eq 64 ] ||
   fail "generated Token length is invalid"
 [ "$(sudo -n -- stat -c '%u:%g:%a:%h' "$TOKEN_FILE")" = '0:0:600:1' ] ||
@@ -339,8 +473,127 @@ pass "unavailable systemd fails closed"
 prepare_fixture agent-unit-enabled
 touch "$MOCK_STATE/agent-unit-enabled"
 expect_failure 'cf-agent-wechat.service must not be enabled for automatic boot'
-[ ! -e "$STORAGE_ROOT" ] || fail "boot-unit rejection mutated deployment state"
+[ ! -e "$ARCHIVE_ROOT" ] || fail "boot-unit rejection mutated deployment state"
 pass "boot-enabled agent-wechat systemd unit is rejected"
+prepare_fixture agent-unit-enable-unknown
+touch "$MOCK_STATE/agent-unit-enable-unknown"
+expect_failure 'cf-agent-wechat.service enablement could not be determined safely'
+[ ! -e "$ARCHIVE_ROOT" ] || fail "unknown boot-unit state mutated deployment state"
+pass "unknown agent-wechat systemd enablement state fails closed"
+
+prepare_fixture agent-unit-enable-error
+touch "$MOCK_STATE/agent-unit-enable-error"
+expect_failure 'cf-agent-wechat.service enablement could not be determined safely'
+[ ! -e "$ARCHIVE_ROOT" ] || fail "failed boot-unit probe mutated deployment state"
+pass "failed agent-wechat systemd enablement probe fails closed"
+
+
+prepare_fixture alternate-agent-unit-enabled
+touch "$MOCK_STATE/alternate-agent-unit-enabled"
+expect_failure 'an enabled systemd unit could automatically start agent-wechat'
+[ ! -e "$ARCHIVE_ROOT" ] || fail "alternate boot-unit rejection mutated deployment state"
+pass "alternate enabled agent-wechat systemd unit is rejected"
+
+prepare_fixture hidden-agent-unit-enabled
+touch "$MOCK_STATE/hidden-agent-unit-enabled"
+expect_failure 'an enabled systemd unit could automatically start agent-wechat'
+[ ! -e "$ARCHIVE_ROOT" ] || fail "hidden boot-unit rejection mutated deployment state"
+pass "enabled systemd Unit content cannot hide agent-wechat automatic startup"
+
+prepare_fixture unreadable-agent-unit-enabled
+touch "$MOCK_STATE/unreadable-agent-unit-enabled"
+expect_failure 'enabled systemd unit definitions could not be inspected'
+[ ! -e "$ARCHIVE_ROOT" ] || fail "unreadable boot-unit rejection mutated deployment state"
+pass "unreadable enabled systemd Unit definitions fail closed"
+
+prepare_fixture generic-agent-service-enabled
+touch "$MOCK_STATE/generic-agent-service-enabled"
+expect_failure 'an enabled systemd unit could automatically start agent-wechat'
+[ ! -e "$ARCHIVE_ROOT" ] || fail "generic service rejection mutated deployment state"
+pass "a generic linked service cannot hide agent-wechat Compose startup"
+
+prepare_fixture generic-agent-timer-enabled
+touch "$MOCK_STATE/generic-agent-timer-enabled"
+expect_failure 'an enabled systemd timer could automatically start agent-wechat'
+[ ! -e "$ARCHIVE_ROOT" ] || fail "generic timer rejection mutated deployment state"
+pass "an enabled generic timer is followed one hop to its agent startup service"
+prepare_fixture default-agent-timer-enabled
+touch "$MOCK_STATE/default-agent-timer-enabled"
+expect_failure 'an enabled systemd timer could automatically start agent-wechat'
+[ ! -e "$ARCHIVE_ROOT" ] || fail "default timer target rejection mutated deployment state"
+pass "an enabled timer without Unit uses and inspects its same-name service"
+
+prepare_fixture generic-agent-path-enabled
+touch "$MOCK_STATE/generic-agent-path-enabled"
+expect_failure 'an enabled systemd path unit could automatically start agent-wechat'
+[ ! -e "$ARCHIVE_ROOT" ] || fail "explicit path rejection mutated deployment state"
+pass "an enabled path follows its explicit Unit to the agent startup service"
+
+prepare_fixture default-agent-path-enabled
+touch "$MOCK_STATE/default-agent-path-enabled"
+expect_failure 'an enabled systemd path unit could automatically start agent-wechat'
+[ ! -e "$ARCHIVE_ROOT" ] || fail "default path rejection mutated deployment state"
+pass "an enabled path follows its resolved same-name service"
+
+prepare_fixture generic-agent-socket-enabled
+touch "$MOCK_STATE/generic-agent-socket-enabled"
+expect_failure 'an enabled systemd socket could automatically start agent-wechat'
+[ ! -e "$ARCHIVE_ROOT" ] || fail "explicit socket rejection mutated deployment state"
+pass "an enabled socket follows its explicit Service to the agent startup service"
+
+prepare_fixture default-agent-socket-enabled
+touch "$MOCK_STATE/default-agent-socket-enabled"
+expect_failure 'an enabled systemd socket could automatically start agent-wechat'
+[ ! -e "$ARCHIVE_ROOT" ] || fail "default socket rejection mutated deployment state"
+pass "an enabled socket follows its resolved same-name service"
+
+prepare_fixture generic-agent-target-wants-enabled
+touch "$MOCK_STATE/generic-agent-target-wants-enabled"
+expect_failure 'an enabled systemd target could automatically start agent-wechat'
+[ ! -e "$ARCHIVE_ROOT" ] || fail "target Wants rejection mutated deployment state"
+pass "an enabled target inspects every resolved Wants dependency"
+
+prepare_fixture generic-agent-target-requires-enabled
+touch "$MOCK_STATE/generic-agent-target-requires-enabled"
+expect_failure 'an enabled systemd target could automatically start agent-wechat'
+[ ! -e "$ARCHIVE_ROOT" ] || fail "target Requires rejection mutated deployment state"
+pass "an enabled target inspects every resolved Requires dependency"
+
+prepare_fixture malformed-activation-target
+touch "$MOCK_STATE/malformed-activation-target"
+expect_failure 'enabled systemd timer target is missing or ambiguous'
+[ ! -e "$ARCHIVE_ROOT" ] || fail "malformed activation target mutated deployment state"
+pass "ambiguous activation targets fail closed"
+
+prepare_fixture unknown-activation-target
+touch "$MOCK_STATE/unknown-activation-target"
+expect_failure 'enabled systemd path target must resolve to a service unit'
+[ ! -e "$ARCHIVE_ROOT" ] || fail "unknown activation target mutated deployment state"
+pass "unsupported activation target types fail closed"
+
+prepare_fixture activation-show-failure
+touch "$MOCK_STATE/activation-show-failure"
+expect_failure 'enabled systemd socket target could not be resolved safely'
+[ ! -e "$ARCHIVE_ROOT" ] || fail "activation inspection failure mutated deployment state"
+pass "activation property inspection failures fail closed"
+
+prepare_fixture templated-socket-enabled
+touch "$MOCK_STATE/templated-socket-enabled"
+expect_failure 'enabled systemd socket target uses unsupported templated activation'
+[ ! -e "$ARCHIVE_ROOT" ] || fail "templated socket rejection mutated deployment state"
+pass "ambiguous templated socket activation fails closed"
+
+prepare_fixture generic-unit-cat-failure
+touch "$MOCK_STATE/generic-unit-cat-failure"
+expect_failure 'enabled systemd unit definitions could not be inspected'
+[ ! -e "$ARCHIVE_ROOT" ] || fail "systemd cat failure mutated deployment state"
+pass "systemd cat failure for a generic enabled unit fails closed"
+
+prepare_fixture docker-unit-cat-failure
+touch "$MOCK_STATE/docker-unit-cat-failure"
+expect_failure 'enabled systemd unit definitions could not be inspected'
+[ ! -e "$ARCHIVE_ROOT" ] || fail "docker.service cat failure mutated deployment state"
+pass "docker.service is included in enabled-unit definition inspection"
 
 
 prepare_fixture docker-timeout
@@ -369,6 +622,117 @@ touch "$MOCK_STATE/bad-compose-restart"
 expect_failure 'Compose attestation failed: restart policy must be no'
 pass "rendered Compose must attest restart=no"
 
+prepare_fixture rendered-image
+touch "$MOCK_STATE/bad-compose-image"
+expect_failure 'Compose attestation failed: image is not the approved digest-pinned reference'
+pass "rendered Compose image must exactly match docker/.env"
+
+prepare_fixture rendered-container
+touch "$MOCK_STATE/bad-compose-container"
+expect_failure 'Compose attestation failed: container name differs from the approved docker/.env value'
+pass "rendered Compose container name must exactly match docker/.env"
+
+prepare_fixture rendered-project
+touch "$MOCK_STATE/bad-compose-project"
+expect_failure 'Compose attestation failed: project name differs from the approved docker/.env value'
+pass "rendered Compose project name must exactly match docker/.env"
+
+prepare_fixture rendered-proxy
+touch "$MOCK_STATE/bad-compose-proxy"
+expect_failure 'Compose attestation failed: PROXY differs from the approved docker/.env value'
+pass "rendered Compose PROXY must exactly match docker/.env"
+
+prepare_fixture rendered-rust-log
+touch "$MOCK_STATE/bad-compose-rust-log"
+expect_failure 'Compose attestation failed: RUST_LOG differs from the approved docker/.env value'
+pass "rendered Compose RUST_LOG must exactly match docker/.env"
+
+prepare_fixture rendered-environment
+touch "$MOCK_STATE/bad-compose-environment"
+expect_failure 'Compose attestation failed: service environment differs from the exact approved values'
+pass "rendered Compose environment must contain only the exact approved values"
+
+prepare_fixture rendered-health-interval
+touch "$MOCK_STATE/bad-compose-health-interval"
+expect_failure 'Compose attestation failed: healthcheck timing contract is invalid'
+pass "rendered Compose healthcheck interval must be exactly 30s"
+
+prepare_fixture rendered-health-start-period
+touch "$MOCK_STATE/bad-compose-health-start-period"
+expect_failure 'Compose attestation failed: healthcheck timing contract is invalid'
+pass "rendered Compose healthcheck start period must be exactly 1m30s"
+
+prepare_fixture rendered-stop-grace-period
+touch "$MOCK_STATE/bad-compose-stop-grace-period"
+expect_failure 'Compose attestation failed: stop grace period must be exactly 30s'
+pass "rendered Compose stop grace period must be exactly 30s"
+
+prepare_fixture rendered-bind-options
+touch "$MOCK_STATE/bad-compose-bind-options"
+expect_failure 'Compose attestation failed: /data bind options differ from the approved set'
+pass "rendered Compose bind options must disable host-path creation without extras"
+
+prepare_fixture rendered-process-override
+touch "$MOCK_STATE/bad-compose-process-override"
+expect_failure 'Compose attestation failed: service contains an unapproved process or lifecycle override'
+pass "rendered Compose cannot override the image process command"
+
+prepare_fixture rendered-lifecycle-override
+touch "$MOCK_STATE/bad-compose-lifecycle-override"
+expect_failure 'Compose attestation failed: service contains an unapproved process or lifecycle override'
+pass "rendered Compose cannot add an automatic activation profile"
+
+prepare_fixture compose-host-overrides
+run_bootstrap "$OUTPUT" \
+  AGENT_WECHAT_IMAGE=registry.example/attacker:latest \
+  AGENT_WECHAT_CONTAINER_NAME=wrong-container \
+  COMPOSE_PROJECT_NAME=wrong-project \
+  PROXY=http://wrong-proxy.invalid:8080 \
+  RUST_LOG=debug || {
+  sed -n '1,200p' "$OUTPUT" >&2
+  fail "caller environment overrode the authoritative docker/.env values"
+}
+pass "caller Compose environment cannot override approved docker/.env values"
+
+prepare_fixture gateway-compose-host-overrides
+touch "$MOCK_STATE/assert-gateway-clean-env"
+GATEWAY_OVERRIDE_SENTINEL='fixture-gateway-override-sentinel'
+run_bootstrap "$OUTPUT" \
+  CF_GATEWAY_CONFIG=/hostile/config.yaml \
+  CF_AGENT_GATEWAY_DATABASE_URL="postgresql://hostile:${GATEWAY_OVERRIDE_SENTINEL}@attacker.invalid/gateway" \
+  CF_GATEWAY_STARTUP_MIGRATION_MODE=migrate \
+  CF_GATEWAY_LOG_LEVEL=TRACE \
+  CF_GATEWAY_API_TOKEN="$GATEWAY_OVERRIDE_SENTINEL" \
+  CF_AGENT_GATEWAY_ADMIN_TOKEN="$GATEWAY_OVERRIDE_SENTINEL" \
+  CF_GATEWAY_WORKER_CONCURRENCY=999 \
+  CF_GATEWAY_WORKER_LEASE_SECONDS=999 \
+  CF_GATEWAY_WORKER_RETRY_LIMIT=999 \
+  CF_GATEWAY_WORKER_HEARTBEAT_INTERVAL_SECONDS=999 \
+  CF_GATEWAY_WORKER_HEARTBEAT_MAX_AGE_SECONDS=999 \
+  CF_GATEWAY_RUNTIME_HEARTBEAT_MAX_AGE_SECONDS=999 \
+  CF_AGENT_WECHAT_TOKEN="$GATEWAY_OVERRIDE_SENTINEL" \
+  HERMES_API_KEY="$GATEWAY_OVERRIDE_SENTINEL" \
+  CF_GATEWAY_IMAGE=registry.example/attacker:latest \
+  CF_GATEWAY_ENV_FILE=/hostile/.env \
+  CF_GATEWAY_CONFIG_FILE=/hostile/config.yaml \
+  CF_GATEWAY_BIND_ADDRESS=0.0.0.0 \
+  CF_GATEWAY_PORT=9999 \
+  CF_GATEWAY_STOP_GRACE_PERIOD=1s \
+  CF_GATEWAY_LOG_MAX_SIZE=999g \
+  CF_GATEWAY_LOG_MAX_FILES=999 || {
+  sed -n '1,200p' "$OUTPUT" >&2
+  fail "Gateway caller environment reached the Compose process"
+}
+[ -e "$MOCK_STATE/gateway-env-clean" ] ||
+  fail "Gateway Compose clean-environment assertion did not run"
+[ ! -e "$MOCK_STATE/gateway-env-not-clean" ] || {
+  sed -n '1,20p' "$MOCK_STATE/gateway-env-not-clean" >&2
+  fail "Gateway Compose retained a scrubbed caller variable"
+}
+assert_not_contains "$OUTPUT" "$GATEWAY_OVERRIDE_SENTINEL"
+assert_not_contains "$MOCK_STATE/docker.log" "$GATEWAY_OVERRIDE_SENTINEL"
+pass "Gateway Compose receives only the approved env-file, not hostile host overrides"
+
 prepare_fixture agent-running
 touch "$MOCK_STATE/agent-running"
 expect_failure 'agent-wechat is running'
@@ -376,7 +740,7 @@ pass "Bootstrap refuses a long-lived agent-wechat container"
 
 prepare_fixture worker-running
 touch "$MOCK_STATE/worker-running"
-expect_failure 'Gateway wechat-worker must be stopped'
+expect_failure 'Gateway worker service must be stopped before a fresh runtime is verified'
 pass "Bootstrap gates Gateway wechat-worker before fresh QR verification"
 
 prepare_fixture existing-restart
@@ -405,10 +769,28 @@ sudo -n -- chown 12345:12345 "$AGENT_ENV"
 expect_failure 'production environment file must be owned by root or the fixed management user'
 pass "unapproved docker/.env owner is rejected"
 
+prepare_fixture env-management-group
+chmod 640 "$AGENT_ENV"
+run_bootstrap "$OUTPUT" || {
+  sed -n '1,200p' "$OUTPUT" >&2
+  fail "management-group-readable docker/.env did not pass its exact contract"
+}
+pass "docker/.env mode 0640 requires and accepts the approved management group"
+
+prepare_fixture env-wrong-group
+wrong_gid=$((CURRENT_GID + 1))
+sudo -n -- chown "${CURRENT_UID}:${wrong_gid}" "$AGENT_ENV"
+sudo -n -- chmod 640 "$AGENT_ENV"
+expect_failure \
+  'production environment file owner, group, and mode do not match the approved management contract'
+[ ! -e "$ARCHIVE_ROOT" ] ||
+  fail "wrong docker/.env group mutated deployment state"
+pass "docker/.env mode 0640 rejects a non-management group"
+
 prepare_fixture env-assignment
 sed -i 's|^PROXY=.*|PROXY=$(printf unsafe)|' "$AGENT_ENV"
 expect_failure 'production environment values must be unquoted, literal, and whitespace-free'
-[ ! -e "$STORAGE_ROOT" ] || fail "unsafe dotenv assignment mutated deployment state"
+[ ! -e "$ARCHIVE_ROOT" ] || fail "unsafe dotenv assignment mutated deployment state"
 pass "unsafe docker/.env assignment is rejected without evaluation"
 
 prepare_fixture env-path-mismatch
@@ -416,7 +798,7 @@ sed -i \
   "s|^CF_AGENT_WECHAT_ARCHIVE_ROOT=.*|CF_AGENT_WECHAT_ARCHIVE_ROOT=$STORAGE_ROOT/wrong-archive|" \
   "$AGENT_ENV"
 expect_failure 'docker/.env archive root differs from the selected production archive root'
-[ ! -e "$STORAGE_ROOT" ] || fail "mismatched docker/.env paths mutated deployment state"
+[ ! -e "$ARCHIVE_ROOT" ] || fail "mismatched docker/.env paths mutated deployment state"
 pass "docker/.env management paths must match the selected deployment paths"
 
 prepare_fixture repo-mode
@@ -439,12 +821,12 @@ prepare_fixture symlink-ancestor
 mv -- "$SCENARIO_ROOT/gateway" "$SCENARIO_ROOT/gateway.real"
 ln -s -- gateway.real "$SCENARIO_ROOT/gateway"
 expect_failure 'Gateway project directory must not contain symbolic link ancestors'
-[ ! -e "$STORAGE_ROOT" ] || fail "symlink ancestor rejection mutated deployment state"
+[ ! -e "$ARCHIVE_ROOT" ] || fail "symlink ancestor rejection mutated deployment state"
 pass "symbolic link ancestors cannot redirect managed paths"
 prepare_fixture heartbeat-missing
 rm -f -- "$GATEWAY_HEARTBEAT"
 expect_failure 'Gateway heartbeat checker must be an existing non-symlink regular file'
-[ ! -e "$STORAGE_ROOT" ] || fail "missing heartbeat checker mutated deployment state"
+[ ! -e "$ARCHIVE_ROOT" ] || fail "missing heartbeat checker mutated deployment state"
 pass "missing Gateway heartbeat checker fails closed"
 
 prepare_fixture heartbeat-symlink
@@ -467,6 +849,82 @@ prepare_fixture heartbeat-not-executable
 chmod 644 "$GATEWAY_HEARTBEAT"
 expect_failure 'Gateway heartbeat checker must be executable by the management user'
 pass "non-executable Gateway heartbeat checker is rejected"
+
+prepare_fixture contract-missing
+rm -f -- "$GATEWAY_CONTRACT"
+expect_failure 'Gateway runtime contract must be an existing non-symlink regular file'
+pass "missing Gateway versioned contract fails closed"
+
+prepare_fixture contract-version
+python3 - "$GATEWAY_CONTRACT" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as stream:
+    payload = json.load(stream)
+payload["contractVersion"] = "2"
+with open(sys.argv[1], "w", encoding="utf-8") as stream:
+    json.dump(payload, stream)
+PY
+expect_failure 'Gateway runtime contract or Agent Token agreement could not be verified'
+pass "incompatible Gateway contract version fails closed"
+
+prepare_fixture contract-checker
+python3 - "$GATEWAY_CONTRACT" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as stream:
+    payload = json.load(stream)
+payload["gateway"]["checker"] = "/tmp/unapproved-checker"
+with open(sys.argv[1], "w", encoding="utf-8") as stream:
+    json.dump(payload, stream)
+PY
+expect_failure 'Gateway runtime contract or Agent Token agreement could not be verified'
+pass "Gateway contract with a different checker path fails closed"
+
+prepare_fixture gateway-token-missing
+printf '%s\n' 'GATEWAY_ENV=production' > "$GATEWAY_ENV"
+expect_failure 'Gateway runtime contract or Agent Token agreement could not be verified'
+pass "missing Gateway file credential assignment fails closed"
+
+prepare_fixture gateway-legacy-plaintext-token
+MISMATCH_TOKEN="$(printf 'd%.0s' {1..64})"
+printf '%s\n' \
+  'GATEWAY_ENV=production' \
+  "CF_AGENT_WECHAT_TOKEN=$MISMATCH_TOKEN" > "$GATEWAY_ENV"
+expect_failure 'Gateway runtime contract or Agent Token agreement could not be verified'
+assert_not_contains "$OUTPUT" "$FIXTURE_TOKEN"
+assert_not_contains "$OUTPUT" "$MISMATCH_TOKEN"
+assert_not_contains "$MOCK_STATE/docker.log" "$FIXTURE_TOKEN"
+assert_not_contains "$MOCK_STATE/docker.log" "$MISMATCH_TOKEN"
+pass "legacy plaintext Gateway Token fails closed without disclosure"
+
+prepare_fixture gateway-file-credential-drift
+printf '%s\n' \
+  'GATEWAY_ENV=production' \
+  'CF_AGENT_WECHAT_TOKEN_FILE=/run/secrets/unapproved-token' > "$GATEWAY_ENV"
+expect_failure 'Gateway runtime contract or Agent Token agreement could not be verified'
+pass "Gateway file credential path drift fails closed"
+
+prepare_fixture gateway-token-mount-drift
+touch "$MOCK_STATE/gateway-token-mount-drift"
+expect_failure 'Gateway runtime contract or Agent Token agreement could not be verified'
+pass "Gateway Token authority mount drift fails closed"
+
+prepare_fixture gateway-token-authority-contract-drift
+python3 - "$GATEWAY_CONTRACT" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as stream:
+    payload = json.load(stream)
+payload["agent"]["tokenAuthority"]["hostPath"] += ".drift"
+with open(sys.argv[1], "w", encoding="utf-8") as stream:
+    json.dump(payload, stream)
+PY
+expect_failure 'Gateway runtime contract or Agent Token agreement could not be verified'
+pass "Gateway Token authority contract drift fails closed"
 
 
 prepare_fixture token-hardlink
