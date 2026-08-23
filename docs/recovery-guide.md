@@ -15,10 +15,12 @@
 | 回滚 | 只回滚受控代码/镜像 | 仍创建全新 runtime 并扫码 |
 | QR/API 验证失败 | Worker 保持停止 | 保留现场，修复后重新执行完整入口 |
 
-旧 archive 只用于受控审计、故障分析和外部保留策略。任何 archive 都不得挂回生产
-`data` 或 `wechat-home` 作为常规恢复目标。
-归档本身可能包含历史微信 session、缓存和消息数据，必须保持 root-protected；Token
-是唯一被明确禁止进入 archive 的运行 secret。
+旧 Archive 是 `restricted` 敏感资产，只用于受控审计、故障分析和批准的受限备份；
+它可能包含完整 session、账号/聊天标识和消息数据。Manifest schema v2 对 manifest
+自身脱敏，不声称 payload 无敏感数据。任何 Archive 都不得挂回生产 `data` 或
+`wechat-home`；独立 Agent Token 被严格禁止进入 payload。容量/inode、inventory、
+默认 dry-run retention 和 schema v1 兼容见
+[Archive Management Contract](archive-management.md)。
 
 ## 标准恢复步骤
 
@@ -28,10 +30,15 @@
 3. 运行 `./scripts/stop-qr-runtime.sh` 进行受控停止，不执行 Compose `down`。
 4. 检查失败 runtime 和 archive，只查看脱敏元数据。
 5. 部署输入变化时运行 `sudo ./scripts/bootstrap-cfserver.sh`。
-6. 在受控 SSH TTY 运行 `./scripts/start-qr-login.sh`。
-7. 扫描当前终端显示的新二维码。
-8. 等待 process、auth、chats 和 messages 验证。
-9. 确认 `wechat-worker` running/healthy/heartbeat 后恢复业务消息。
+6. 清除调用 shell 中全部生产管理覆盖变量，在受控 SSH TTY 运行
+   `./scripts/start-qr-login.sh`。
+7. 等待脚本重新核验 Host/Compose/Gateway contract、精确 Runtime 权限和安全树扫描，
+   停止并确认 Worker，再通过 Archive bytes/percent/inode、inventory 与 Hash 锁定 QR
+   venv 门禁；任一门禁失败时 Worker 保持停止。
+8. 扫描当前终端显示的新二维码。
+9. 等待 process、auth、chats 和 messages 验证。
+10. 确认 Gateway `worker` running/healthy，contract checker 对 heartbeat、最新 Poll
+    Cycle 与 auth 稳定通过后恢复业务消息。
 
 Bootstrap 只准备部署，不登录、不启动 Agent 或 Worker。没有配置变化时，也不能用
 Bootstrap 代替扫码启动。
@@ -47,8 +54,12 @@ Runtime；本仓库只能在脚本取得控制后停止并复核 Worker，不能
 
 ## Docker Daemon 或 Host 重启
 
-Docker 必须保持 local rootful、固定 `unix:///var/run/docker.sock` endpoint、真实
-非符号链接 socket 和 `live-restore=false`；任一条件偏离都先修复再恢复。
+Docker 必须保持 local rootful、default context、固定
+`unix:///var/run/docker.sock` endpoint、真实非符号链接 socket 和
+`live-restore=false`；systemd/docker.service 必须可用，`cf-agent-wechat.service` 和
+同类 auto-start unit 不得 enabled。每次 `start-qr-login.sh` 都重新核验这些条件与
+渲染的 `restart=no`，创建后还精确检查实际 RestartPolicy/image/mount/port/alias；
+任一偏离都在 Archive/QR 前失败。
 
 重启后预期：
 
@@ -79,29 +90,35 @@ Docker 必须保持 local rootful、固定 `unix:///var/run/docker.sock` endpoin
 
 ## 数据与 Token
 
-- 旧 runtime 和失败 runtime 保留，不自动删除。
-- archive root 保持 root-protected，因为归档可能包含历史 session、缓存和消息数据；
-  这些数据不得挂回生产。
-- Token 是独立 API auth secret，可以由 Bootstrap 安全复用，但不代表微信 session
-  复用。
-- Token 不进入 runtime、archive、manifest、日志或备份说明。
-- archive 到期处置只能由本项目之外的审批流程执行。
+- 旧 Runtime 和失败 Runtime 保留，不自动删除。
+- Archive root/顶层目录保持 `root:root 700`，payload 按 `restricted` 管理，不挂回生产。
+- 启动前必须满足容量/inode 阈值并成功 inventory；不会因磁盘压力自动删除 Archive。
+- Retention 默认 dry-run；实际删除必须明确 Archive、审批、TTY 二次确认和审计记录。
+- Token 是 Agent/Gateway 唯一权威 API secret，可以由 Bootstrap 安全复用，但不代表
+  微信 session 复用。
+- Token 不进入 Runtime、Archive、manifest、argv、environment、inspect、Compose
+  config、日志或备份说明。
 - 不通过 PostgreSQL、Checkpoint、`bootstrap_mode=latest` 或 localId 回退修复微信
   Runtime。
 
 ## Gateway 边界
 
-本仓库只协调 `wechat-worker`，不启停 `dispatch-worker` 或
-`delivery-worker`，不修改 Gateway 代码、PostgreSQL、Checkpoint、Hermes 数据或其他
-仓库。Gateway boot stop gate 和 Worker heartbeat 需要在真实 CFserver 验证。
+本仓库只协调 Gateway `worker` service（角色名 WeChat worker），不启停
+`dispatch-worker` 或 `delivery-worker`，不修改 Gateway 代码、PostgreSQL、
+Checkpoint、Hermes 数据或其他仓库。Gateway boot stop gate 和 Worker runtime contract
+需要在真实 CFserver 验证。
 
-固定 heartbeat checker 路径为
-`/opt/cf-agent-gateway/deploy/check-wechat-worker-heartbeat`。它由 Gateway 提供，
-本仓库不创建或修改，并只以管理用户身份在 hard timeout 内执行；不得通过 `sudo`
-运行，也不得输出敏感内容。
+固定 contract/checker 为
+`/opt/cf-agent-gateway/deploy/wechat-runtime-contract.json` 和
+`/opt/cf-agent-gateway/deploy/check-wechat-worker-heartbeat`。它们必须由兼容 Gateway
+commit 部署；checker 只以管理用户无参数执行，10 秒内无输出，并确认当前实例、
+Docker health、30 秒 heartbeat、最新成功 Poll Cycle 和 auth=`logged_in`。缺失、
+版本/Token mismatch、stale、失败、超时或输出内容均撤销 Worker 放行。Gateway PR #4
+尚未兼容，当前状态为 **BLOCKED BY GATEWAY CONTRACT**；不得使用 fake checker。
 
-真实 Docker E2E 已覆盖正常/异常退出和 daemon restart 后 Agent 保持停止，最终以新
-PR 的绿色 Actions Run ID 为证。该 CI 场景不是 Host reboot；真实 Host 与 Gateway
+`restart=no Docker policy fixture` 已用 Alpine/Nginx 容器覆盖正常/异常退出和
+daemon restart 后保持停止，但未运行实际 Agent/WeChat/QR；对应 commit 的成功 GitHub Actions
+run 只证明此 fixture，Run ID 记录在 PR #3。该 CI 场景不是 Host reboot；真实 Host 与 Gateway
 boot stop gate 仍需在 CFserver 验证。
 
 ## 时间与记录

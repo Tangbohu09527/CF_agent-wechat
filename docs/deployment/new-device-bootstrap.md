@@ -29,8 +29,11 @@ sudo ./scripts/bootstrap-cfserver.sh
 - Docker daemon 必须配置 `live-restore=false`。
 - Docker Compose v2 可用。
 - 仓库位于批准的生产路径和 Commit。
-- Gateway 生产 Compose/config 路径已由 CFserver 运维提供。
-- Gateway 已提供固定 heartbeat checker，见下文契约。
+- Gateway 固定 Compose/env/project/profile/service 为
+  `/opt/cf-agent-gateway/docker-compose.prod.yml`、`/opt/cf-agent-gateway/.env`、
+  `/opt/cf-agent-gateway`、`worker`、`worker`。
+- Gateway 兼容 commit 已部署 versioned contract 和固定 checker；当前 PR #4 尚未兼容，
+  因而现状为 **BLOCKED BY GATEWAY CONTRACT**。
 - 镜像已批准并以完整 digest 配置。
 - CFserver Host 时区为 `Asia/Shanghai`；容器和日志使用 UTC。
 
@@ -40,40 +43,45 @@ Bootstrap 不修改真实微信账号、Gateway 数据库、PostgreSQL、Checkpo
 
 Bootstrap 按阶段 fail closed：
 
-1. 检查 Debian 必需工具和 systemd。
-2. 检查 Docker service 为 running。
-3. 检查 Docker context、非符号链接 Unix socket、endpoint 和
-   `live-restore=false`，拒绝 rootless/remote daemon。
-4. 检查 Docker Compose v2。
-5. 校验仓库路径、owner、mode、符号链接和 hardlink。
-6. 校验 `docker/compose.cfserver.yaml`。
-7. 安全解析 `docker/.env`，不执行任意 shell 内容。
-8. 校验 runtime、archive 和 secrets root。
-9. 校验目录和文件的 owner、mode、symlink 与 link count。
-10. 校验镜像引用是 `@sha256:<64-hex>`。
-11. 校验 6174 只绑定 loopback。
-12. 校验外部 `cf-internal` 和固定 alias `cf-agent-wechat`。
-13. 校验 Token 是 root-only 普通文件，且只读挂载到容器。
-14. 校验 Gateway Compose/config 和固定 heartbeat checker 存在、可读且权限安全。
-15. 创建必要的管理目录。
-16. 创建或复用独立的 agent-wechat API auth Token。
-17. 渲染生产 Compose，并确认 `restart: "no"`。
-18. 确认 `agent-wechat` 没有被 Bootstrap 作为长期服务运行。
-19. 确认 `wechat-worker` 不会读取未验证的 fresh runtime。
+1. 检查 Debian 固定系统工具、systemd 与 `docker.service`。
+2. 检查 default context、真实非 symlink Unix socket、
+   `unix:///var/run/docker.sock`、local rootful daemon 与 `live-restore=false`。
+3. 检查 Docker Compose v2，并拒绝已启用的 `cf-agent-wechat.service` 或同类
+   auto-start unit。
+4. 校验仓库、脚本、Compose 与 `docker/.env` 的固定路径、owner、mode、symlink 和
+   hardlink。
+5. 安全解析 `docker/.env` 完整白名单，不执行 shell；拒绝 Secret、重复键、控制字符、
+   非批准路径/digest/loopback/UID/GID/mode/阈值和带凭证 Proxy。
+6. 校验 Runtime/legacy 目录精确符合批准非 root UID/GID 与 mode `700`，不接受
+   `root:root 700` 或 mode `755`；校验 Archive root、secrets 和管理锁合同。
+7. 创建或复用唯一 root-only Agent Token，确认它在 Runtime/Archive 外并只读挂载。
+8. 校验 Gateway contract v1、checker 元数据、固定 project/profile/service、file
+   credential pointer 和唯一只读 Token bind；不 source/eval 或改写 Gateway `.env`。
+9. 校验外部 `cf-internal` 为 local bridge，固定 alias `cf-agent-wechat`。
+10. 在 clean environment 中渲染 Compose，精确确认批准 image/project/container、
+    `restart=no`、三项 mount、loopback port、alias、`PROXY`、`RUST_LOG`、
+    healthcheck/log rotation、`seccomp=unconfined` 与 `SYS_PTRACE`。
+11. 真实创建临时 `python3 -m venv`，确认 ensurepip 和 pip 可执行。
+12. 确认 Agent 未作为长期服务运行，Gateway `worker` 不会读取未验证 fresh Runtime。
 
 Docker、Compose 和 curl/API 探测必须有 connect/total 或 hard timeout。普通用户管理路径
 需要提权时，先通过 `sudo -v` 获得授权，后续只使用 `sudo -n`；不得让自动步骤无限
 等待密码。
 
-固定 checker 路径为：
+Gateway 固定 contract/checker 为：
 
 ```text
+/opt/cf-agent-gateway/deploy/wechat-runtime-contract.json
 /opt/cf-agent-gateway/deploy/check-wechat-worker-heartbeat
 ```
 
-它由 Gateway 部署提供，本仓库不创建或修改。它必须是无符号链接、无额外 hardlink、
-owner/mode 合规且由管理用户直接执行的普通文件；脚本不得通过 `sudo` 执行它。checker
-无参数运行，只在当前 `wechat-worker` 应用 heartbeat 可用时返回 `0`，且不输出敏感值。
+它们必须由 Gateway 仓库兼容 commit 部署，本仓库不创建或修改。contract 精确固定版本、
+alias/port、Token source、project/service、30 秒 heartbeat freshness 和 checker interface。
+checker 由管理用户从匹配批准摘要的只读密封快照无参数执行，不用 `sudo`，也不在
+provenance 后按原路径二次执行；必须在 10 秒内无输出，并同时确认当前 `worker`
+running/healthy、heartbeat 新鲜、最新 Poll Cycle 成功和 auth=`logged_in`。Bootstrap
+只验证接口合同，不运行 checker 来宣称登录成功。完整规范见
+[Gateway-WeChat Runtime Contract v1](../contracts/gateway-wechat-runtime-contract.md)。
 
 ## Token
 
@@ -88,12 +96,21 @@ Token 路径：
 - secrets 目录为 `root:root 700`。
 - Token 为 `root:root 600` 的普通非符号链接文件。
 - Token 不得有额外 hardlink。
-- Token 不进入 `docker/.env`、runtime、archive、manifest、日志、命令行或 CI。
+- Token 是 Agent/Gateway 唯一权威 credential，不进入 `docker/.env`、Runtime、
+  Archive、manifest、argv、process environment、inspect、Compose config、日志或 CI。
+- Gateway 目标使用
+  `CF_AGENT_WECHAT_TOKEN_FILE=/run/secrets/cf-agent-wechat-auth-token`；Gateway Compose
+  必须把宿主权威文件单次、只读 bind 到该 Worker 路径，且不得注入明文 Token。
+- legacy 环境副本只能用于常量时间迁移审计，即使一致也不构成生产兼容；Bootstrap 在
+  准备放行前 fail closed，生产 start 先停止并确认 Worker，再在 Agent/Archive/QR 变更前
+  fail closed。本仓库不自动同步 Gateway 配置。
 - 重试 Bootstrap 可以复用同一 API Token，但不能复用微信 session。
-- Bootstrap 只验证 Token 元数据和受控读取路径，不输出内容、摘要或指纹。
+- Bootstrap 只验证 Token 元数据和受控读取路径，不输出内容、摘要、指纹或长度。
 
-旧 runtime archive 可能包含历史 session、缓存和消息数据，因此 archive root 必须保持
-root-protected。只有 Token 被明确禁止进入 archive；旧 session 数据仍不得挂回生产复用。
+旧 Archive 是 `restricted` 资产，可能包含完整 session、账号/聊天标识、消息元数据和
+内容；Manifest schema v2 只保证 manifest 自身不写这些值。Token 被明确禁止进入 payload，
+Archive 不得挂回生产。扫码前容量/inode、inventory、默认 dry-run retention 与受限备份见
+[Archive Management Contract](../archive-management.md)。
 
 ## Compose 结果
 
@@ -116,6 +133,8 @@ Agent API 健康，不证明微信登录、chats/messages 或 Gateway 链路。
 
 Bootstrap 不得：
 
+- 接受调用环境中的 `API_URL`、`WS_URL`、Token/session、Agent/Compose/Proxy、
+  Python/venv、Runtime/Archive 或 Gateway 管理覆盖；
 - 启动并长期保持 `agent-wechat` 在线；
 - 启动 `wechat-worker`；
 - 启停 `dispatch-worker` 或 `delivery-worker`；

@@ -81,27 +81,31 @@ Hermes 数据。Gateway 和 Hermes 上下文仍由各自数据库持久化。
     └── login.sh  # 仅兼容包装，无条件 exec 到 start-qr-login.sh
 ```
 
-agent-wechat 的 Compose 项目目录保持 `/opt/cf-agent-wechat`。生命周期脚本显式通过
-`--env-file` 使用 `/opt/cf-agent-wechat/docker/.env`；非标准环境文件路径通过
-`CF_AGENT_WECHAT_ENV_FILE` 覆盖，不得把项目目录改成 `docker/`。
+agent-wechat 的 Compose、环境文件和项目目录固定为
+`/opt/cf-agent-wechat/docker/compose.cfserver.yaml`、
+`/opt/cf-agent-wechat/docker/.env` 和 `/opt/cf-agent-wechat`。生产入口不接受路径
+覆盖；非标准路径只用于显式 `CF_AGENT_WECHAT_TESTING=1` 的隔离测试。
 
-Gateway 标准 Compose 输入：
+Gateway 生产布局固定为：
 
 ```text
-/opt/cf-agent-gateway/deploy/
-├── compose.yaml
+/opt/cf-agent-gateway/
+├── docker-compose.prod.yml
 ├── .env
-└── check-wechat-worker-heartbeat
+└── deploy/
+    ├── wechat-runtime-contract.json
+    └── check-wechat-worker-heartbeat
 ```
 
-其 Compose 项目目录为 `/opt/cf-agent-gateway/deploy`。标准布局下从
-`/opt/cf-agent-wechat` 运行生命周期脚本无需导出 Gateway 路径变量。
+Gateway Compose project 为 `cf-agent-gateway`，profile/service 均为 `worker`；
+本文所称 WeChat worker 指该 service。生命周期脚本不接受调用环境覆盖这些路径或身份。
 
-固定 heartbeat checker 为
-`/opt/cf-agent-gateway/deploy/check-wechat-worker-heartbeat`。它必须是无符号链接、
-无额外 hardlink、owner/mode 合规并可由管理用户直接执行的普通文件。本仓库不创建或
-修改 checker，也不通过 `sudo` 执行；checker 无参数运行，只在当前 Worker 应用
-heartbeat 可用时返回 `0`，且不得输出敏感值。
+contract 和 checker 必须由 Gateway 仓库兼容 commit 部署，不能是手工文件。checker
+必须无参数、无输出，并在 10 秒内同时确认当前 `worker` running、Docker health
+正常、heartbeat 不超过 30 秒、最新 Poll Cycle 成功和 auth=`logged_in`。缺文件、
+版本不兼容、Token 不一致、checker 非零/超时/有输出都 fail closed。Gateway PR #4
+当前尚无兼容 producer，状态为 **BLOCKED BY GATEWAY CONTRACT**；完整固定值见
+[Gateway-WeChat Runtime Contract v1](../contracts/gateway-wechat-runtime-contract.md)。
 
 存储目录：
 
@@ -122,7 +126,7 @@ heartbeat 可用时返回 `0`，且不得输出敏感值。
 - `runtime/data` 挂载到 `/data`。
 - `runtime/wechat-home` 挂载到 `/home/wechat`。
 - `secrets/auth-token` 单独只读挂载到 `/data/auth-token`。
-- `session-archive` 保存每次启动前的旧 runtime 和脱敏 manifest。
+- `session-archive` 保存完整旧 Runtime 与 schema v2 manifest；payload 按 `restricted` 管理。
 
 Token 不属于 runtime。移动 runtime 时不得移动、复制或读取 Token 内容。
 旧 runtime archive 本身可能包含历史微信 session、缓存和消息数据，必须保持
@@ -181,51 +185,48 @@ Token 继续使用独立只读挂载：
 
 ## 生产环境输入
 
-| 变量 | 要求 |
+`docker/.env` 为 root-protected、单 hardlink、非 symlink 的白名单字面值文件。以下
+键必须全部存在；不得加入 Token、密码或任意 shell 语法：
+metadata 只能是以下精确元组：
+
+- `root:root 0600`；
+- 固定管理用户及其 primary GID，mode `0600`；
+- owner 为 root 或固定管理用户、group 精确为 `CF_AGENT_WECHAT_MANAGEMENT_GID`，
+  mode `0640`。
+
+owner 合法但 group 漂移同样 fail closed，已验证 metadata 会在 Archive preflight 再次复核。
+
+| 键 | 精确生产合同 |
 | --- | --- |
-| `AGENT_WECHAT_IMAGE` | 必填，使用批准的不可变 digest，禁止 `latest` |
-| `AGENT_WECHAT_BIND_IP` | 必须是 loopback 地址，禁止 wildcard、LAN 或公网绑定 |
-| `AGENT_WECHAT_PORT` | 保持现有 6174 映射 |
-| `AGENT_WECHAT_CONTAINER_NAME` | 默认 `cf-agent-wechat` |
-| `CF_AGENT_WECHAT_RUNTIME_ROOT` | 默认 `/srv/storage/cf-agent-wechat/runtime` |
-| `CF_AGENT_WECHAT_ARCHIVE_ROOT` | 默认 `/srv/storage/cf-agent-wechat/session-archive`，必须与 runtime 位于同一文件系统 |
-| `CF_AGENT_WECHAT_COMPOSE_FILE` | 默认使用本仓库 `docker/compose.cfserver.yaml` |
-| `CF_AGENT_WECHAT_ENV_FILE` | 默认使用仓库根目录下 `docker/.env` |
-| `CF_AGENT_GATEWAY_COMPOSE_FILE` | 默认 `/opt/cf-agent-gateway/deploy/compose.yaml`；只用于控制 `wechat-worker` |
-| `CF_AGENT_GATEWAY_ENV_FILE` | 默认 `/opt/cf-agent-gateway/deploy/.env`；只作为 Gateway Compose 的环境文件 |
-| `CF_AGENT_GATEWAY_PROJECT_DIR` | 默认 `/opt/cf-agent-gateway/deploy`；Gateway Compose 项目目录 |
-| heartbeat checker | 固定为 Gateway 项目目录下的 `check-wechat-worker-heartbeat`；不能用环境变量覆盖 |
-| `CF_AGENT_WECHAT_RUNTIME_UID` / `GID` | 仅在没有旧目录可继承时使用，默认 `1000:1000` |
-| `CF_AGENT_WECHAT_RUNTIME_MODE` | 仅在没有旧目录可继承时使用，默认 `700` |
-| `CF_AGENT_WECHAT_LOCK_FILE` | 默认 `/run/lock/cf-agent-wechat-qr-runtime.lock`；start/stop 共用 |
-| `POST_LOGIN_READY_TIMEOUT` | 登录后 auth/chats/messages 有界等待，默认 `120` 秒 |
-| `PROXY` | 可选；若含认证信息按敏感配置保护 |
-| `RUST_LOG` | 默认 `info`；提高详细度前评估泄露风险 |
+| `COMPOSE_PROJECT_NAME` | 固定 `cf-agent-wechat` |
+| `AGENT_WECHAT_IMAGE` | 批准的完整 `name@sha256:<64 hex>`，禁止 tag-only/`latest` |
+| `AGENT_WECHAT_BIND_IP` / `PORT` | `127.0.0.1` / 批准端口；容器 target 固定 6174/tcp |
+| `AGENT_WECHAT_CONTAINER_NAME` | 批准容器名，默认合同 `cf-agent-wechat` |
+| `CF_AGENT_WECHAT_STORAGE_ROOT` | 固定 `/srv/storage/cf-agent-wechat` |
+| `CF_AGENT_WECHAT_RUNTIME_ROOT` | 固定 `/srv/storage/cf-agent-wechat/runtime` |
+| `CF_AGENT_WECHAT_ARCHIVE_ROOT` | 固定 `/srv/storage/cf-agent-wechat/session-archive`，与 runtime 同文件系统 |
+| `CF_AGENT_WECHAT_RUNTIME_UID` / `GID` / `MODE` | 批准非 root UID/GID，默认 `1000:1000`；mode 固定 `700` |
+| `CF_AGENT_WECHAT_MANAGEMENT_GID` | 批准的非 root 管理组，用于 mode `0640` 运行锁 |
+| `CF_AGENT_WECHAT_MIN_FREE_BYTES` | Archive 最少可用字节，默认合同 `1073741824` |
+| `CF_AGENT_WECHAT_MIN_FREE_PERCENT` | Archive 最少可用百分比，默认合同 `10` |
+| `CF_AGENT_WECHAT_MIN_FREE_INODES` | Archive 最少可用 inode，默认合同 `1024` |
+| `CF_AGENT_WECHAT_TOKEN_SCAN_MAX_FILES` | Runtime/Archive 安全扫描最大普通文件数 |
+| `CF_AGENT_WECHAT_TOKEN_SCAN_MAX_BYTES` | Runtime/Archive 安全扫描最大总字节 |
+| `PROXY` | 空值或无凭证的 `http/https/socks5/socks5h://host:port` |
+| `RUST_LOG` | 仅 `error`、`warn` 或 `info` |
 
-标准布局分别使用 `/opt/cf-agent-wechat/docker/.env` 和
-`/opt/cf-agent-gateway/deploy/.env`，直接运行 `./scripts/start-qr-login.sh`
-时无需 `export`。路径不同时保留 `CF_AGENT_WECHAT_ENV_FILE` 以及
-`CF_AGENT_GATEWAY_COMPOSE_FILE`、`CF_AGENT_GATEWAY_ENV_FILE` 和
-`CF_AGENT_GATEWAY_PROJECT_DIR` 覆盖能力。start/stop 在任何容器、worker、runtime、
-归档或锁变更前，要求 agent-wechat 环境文件路径为绝对路径，且为已存在的普通非符号
-链接文件。管理脚本安全解析 agent-wechat `docker/.env` 的受支持键值，不执行任意
-shell 内容，也不输出文件内容。Gateway 环境文件只检查路径和元数据，通过
-`--env-file` 交给 Docker Compose；脚本不解析、复制或输出其内容。Token 禁止写入
-本仓库或 Gateway 的任何 `.env`；生产变量实值不得粘贴到文档、工单或日志。
+生产入口拒绝调用进程中的 `API_URL`、`WS_URL`、`TOKEN_FILE`、`SESSION_ID`、
+Python/venv、Agent/Compose、Proxy、Runtime/Archive 和 Gateway 管理覆盖。API 与
+WebSocket URL 只由批准 loopback/port 派生，Token 路径固定为
+`/srv/storage/cf-agent-wechat/secrets/auth-token`，session 固定 `default`。
+`CF_AGENT_WECHAT_TESTING=1` 是唯一测试覆盖门禁，不属于生产运行方式。
 
-使用与实际部署相同的环境输入做静态校验：
-
-```bash
-cd /opt/cf-agent-wechat
-sudo docker compose \
-  --env-file /opt/cf-agent-wechat/docker/.env \
-  --project-directory /opt/cf-agent-wechat \
-  -f /opt/cf-agent-wechat/docker/compose.cfserver.yaml \
-  config --quiet
-```
-
-静态校验和生命周期脚本必须使用同一份环境输入。不要输出完整 Compose 渲染结果或
-完整环境。
+Compose 调用先以 `env -u` 语义清除 Docker/Compose/Agent/Gateway/Proxy 同名宿主变量，
+再显式注入解析后的批准值。渲染和实际容器都精确核验 project、image、container、
+`restart=no`、mount、loopback port、`cf-internal` alias、`PROXY` 与 `RUST_LOG`；
+不只是检查“某个 digest”。Token 不进入 Compose config、container environment 或
+inspect。不要在普通 shell 裸跑 `docker compose config/up/ps`；静态验证使用
+`sudo ./scripts/bootstrap-cfserver.sh`，生产启停使用生命周期脚本。
 
 ## Bootstrap 基础准备
 
@@ -239,40 +240,27 @@ sudo ./scripts/bootstrap-cfserver.sh
 
 Bootstrap 必须可以在配置修复后安全重试。它只完成以下基础准备：
 
-1. 确认代码处于批准 Commit，镜像为批准 digest。
-2. 确认 agent-wechat Compose、环境文件和项目目录依次为
-   `/opt/cf-agent-wechat/docker/compose.cfserver.yaml`、
-   `/opt/cf-agent-wechat/docker/.env` 和 `/opt/cf-agent-wechat`；环境文件路径
-   必须为绝对路径，且为已存在的普通非符号链接文件。使用相同输入运行 Compose
-   `config --quiet`。
-3. 确认 `cf-internal` 已存在。
-4. 检查 runtime 与 legacy `data`/`wechat-home` 布局；mixed layout 必须先保留现场并
-   明确受控来源，不能让脚本猜测或自动合并。
-5. 确认 Token 为独立文件，secrets 和 Token 权限分别为 `root:root 700` 与
-   `root:root 600`。
-6. 确认旧 runtime 的 UID、GID 和权限可继承；首次运行没有旧目录时，确认
-   `CF_AGENT_WECHAT_RUNTIME_UID/GID/MODE` 的默认 `1000:1000/700` 与镜像匹配，
-   不匹配时必须显式覆盖后再运行。
-7. 确认 Gateway 默认 Compose、环境文件和项目目录依次为
-   `/opt/cf-agent-gateway/deploy/compose.yaml`、
-   `/opt/cf-agent-gateway/deploy/.env` 和
-   `/opt/cf-agent-gateway/deploy`，且只控制 `wechat-worker`；标准布局无需
-   导出变量，路径不同时必须通过上述变量显式覆盖。
-   固定 heartbeat checker 始终位于所选 Gateway 项目目录下，由 Gateway 部署提供；
-   Bootstrap 校验其 owner/mode/symlink/hardlink 和管理用户可执行权限，但不创建、
-   修改或通过 `sudo` 执行。
-8. 在 CFserver 实机确认 Gateway restart policy/Compose/systemd boot stop gate，确保
-   Debian 启动至人工运行脚本前 `wechat-worker` 持续停止；本仓库未修改 Gateway。
-9. 确认 Python 3、curl、Docker Compose 及二维码依赖可用。
-10. 校验固定系统工具、本机 rootful Docker、systemd Docker 状态和 Docker Compose v2；
-    context endpoint 必须是 `unix:///var/run/docker.sock`，socket 必须是真实非符号
-    链接 Unix socket，daemon 必须为 `live-restore=false`；拒绝 rootless 或 remote
-    daemon。
-11. 创建必要管理目录，并创建或复用独立 root-only API auth Token。
-12. 渲染生产 Compose，确认 `restart: "no"`、loopback、固定 alias 和只读 Token
-    挂载。
-13. 确认 `agent-wechat` 未作为长期服务运行，`wechat-worker` 不会读取未验证的
-    fresh runtime。
+1. 确认代码、管理脚本、Compose 和 `docker/.env` 为批准的非 symlink、单 hardlink、
+   owner/mode 合规文件；安全解析完整白名单，不执行内容。
+2. 校验 systemd、`docker.service`、固定系统工具、真实
+   `/var/run/docker.sock`、default context、local rootful endpoint、
+   `live-restore=false` 和 Docker Compose v2；拒绝 remote/rootless。
+3. 拒绝已启用的 `cf-agent-wechat.service` 或名称可匹配 Agent 的其他 auto-start
+   systemd unit，并确认 Agent 未作为长期服务运行。
+4. 校验固定生产存储路径、mixed layout、Archive root、secrets/Token 与管理锁父目录；
+   Runtime/legacy 目录必须精确等于批准非 root UID/GID 和 mode `700`，不继承漂移。
+5. 创建或复用唯一 root-only Agent Token，并确认它在 runtime/archive 外；校验 Gateway
+   contract v1、固定 checker、file credential pointer 和唯一只读 Token bind，不
+   source/eval Gateway `.env`，也不静默改写它。
+6. 校验 `cf-internal` 为 local bridge，并对 clean-environment Compose JSON 做精确
+   attestation：批准 image/project/container、`restart=no`、三项 mount、loopback port、
+   固定 alias、`PROXY`、`RUST_LOG`、`seccomp=unconfined` 和 `SYS_PTRACE`。
+7. 真实运行 `python3 -m venv` 创建临时环境，确认 ensurepip/pip 可执行；不是只检查
+   `import venv`。
+8. 确认 Gateway 固定项目 `cf-agent-gateway` 的 profile/service `worker` 可渲染；
+   Bootstrap 不运行 checker 来伪造登录或 heartbeat 成功。
+9. 在 CFserver 实机确认 Gateway restart/boot stop gate，确保 Debian 启动到人工脚本前
+   `worker` 持续停止；该保障不属于本仓库。
 
 Bootstrap 不创建微信 session、不创建登录成功标记、不启动 `agent-wechat`，也不启动
 `wechat-worker`。完成只表示基础部署准备完成；下一步始终是
@@ -290,26 +278,37 @@ cd /opt/cf-agent-wechat
 
 脚本必须按顺序：
 
-1. 验证配置、目录和命令；非 dry-run 获取
-   `/run/lock/cf-agent-wechat-qr-runtime.lock` 独占锁。
-2. 停止 Gateway `wechat-worker`。
-3. 停止并删除旧 `agent-wechat` 容器，不执行 Compose `down`。
-4. 将当前 runtime 原子移动到新的 UTC 时间戳归档；首次上线只有 legacy
-   `data`/`wechat-home` 时，将两者迁入同一个归档。mixed layout 在步骤 2 前失败。
-5. 创建全新的 `runtime/data` 与 `runtime/wechat-home`，继承正确 UID、GID 和权限。
-6. 以 `restart: "no"` 启动容器，确认正式容器 running，等待 Docker health 为
-   `healthy`，并确认 agent-server API 可访问。
-7. 解析 `/usr/bin/wechat` launcher（包括符号链接）得到 canonical executable，
-   只接受 `/proc/<pid>/exe` 的链接目标精确匹配 canonical executable 的进程，记录
-   其 `PID:start_time` 并等待稳定；不使用进程名或命令行字符串宽松匹配。
-8. `start-qr-login.sh` 直接以 `newAccount=true` 请求并监听二维码；SSH 终端必须
-   实际渲染至少一个 QR，否则不接受登录成功。
-9. 等待手机扫码和 `logged_in`。
-10. 在 `POST_LOGIN_READY_TIMEOUT` 有界窗口内等待同一 `PID:start_time` 身份持续
-    存在且 canonical executable 仍精确匹配、auth 为 `logged_in`、chats 至少返回
-    一个聊天，并对 API 返回的一个聊天读取 messages。
-11. 只有全部通过才启动 `wechat-worker`，确认 running/healthy 和可用的 heartbeat
-    状态后输出最终状态。
+1. 校验受控 SSH TTY，拒绝全部生产管理环境覆盖，并安全读取固定 `docker/.env`。
+2. 在任何 Worker/Archive/QR 变更前重新校验 systemd、`docker.service`、local rootful
+   default Docker、socket、`live-restore=false`、auto-start unit、`cf-internal`、
+   Gateway contract/Token 和 clean Compose 精确 attestation。
+3. 精确检查现有 Runtime 或 legacy `data`/`wechat-home` 的批准 UID/GID/mode；使用
+   有界 no-follow scanner 拒绝 symlink/hardlink、FIFO/socket/device、跨文件系统内容，
+   并确认树中没有独立 Agent Token。
+4. 获取 owner/group/mode/link-count 均合规的 `0640` 独占管理锁。
+5. 停止并确认 Gateway `worker`。
+6. 检查 Archive 可用 bytes、百分比和 inode，运行受限 inventory；失败时 Worker 保持
+   停止，不移动 Archive、不显示 QR。
+7. 验证固定 `/usr/bin/python3`、仓库 Hash lock 与 passwd home 下 QR venv；正确环境
+   快速复用，不匹配则在 hard timeout 内事务式重建。失败时不变更 Agent/Archive，
+   Worker 保持停止。
+8. 把 Token 读入仅当前进程内存；Token 不进入 argv、
+   environment、inspect、Compose config、日志或错误。
+9. 停止并删除旧 `agent-wechat` 容器，不执行 Compose `down`；原子归档当前 Runtime，
+   或把 legacy 两目录迁入同一个 UTC Archive。
+10. 始终以 `CF_AGENT_WECHAT_RUNTIME_UID/GID/MODE` 批准值创建全新的
+   `runtime/data` 和 `runtime/wechat-home`，不继承旧目录漂移。
+11. 以 `restart: "no"` 创建容器，立即用 Docker inspect 精确核验实际 image、name、
+    project、RestartPolicy、mount、loopback port、network alias 和 environment；偏离时
+    cleanup 并失败，不显示 QR。
+12. 等待容器 running/healthy、Agent API 和 canonical `/usr/bin/wechat`
+    `PID:start_time` 稳定，再以 `newAccount=true` 请求 fresh QR。
+13. SSH 终端必须实际渲染至少一个 QR，之后才接受手机确认和登录成功事件。
+14. 在有界窗口内验证同一 WeChat 进程、auth=`logged_in`、chats 非空，并读取一个
+    API 返回 chat 的 messages。
+15. 只有全部通过才启动 Gateway `worker`；contract checker 在稳定窗口内持续无输出且
+    返回 0 才成功。checker stale、失败、超时或输出内容时立即撤销 Worker 放行，Agent
+    与 Archive 现场保留。
 
 进入 agent 容器轮换阶段后，后续任何失败都会触发统一 cleanup：脚本尝试重新停止并
 确认 worker，再依次 stop/remove `agent-wechat`。remove 使用
@@ -336,9 +335,11 @@ Dry run 不修改目录、容器或 worker，并在获取锁前返回；它不�
 
 ### 并发与重复执行
 
-start/stop 共用 `/run/lock/cf-agent-wechat-qr-runtime.lock` 的 `flock`。普通执行后空
-锁文件可以保留，文件存在不代表锁正被持有。重复执行使用新的 UTC 时间戳目录，绝不
-覆盖既有归档。
+start/stop/retention 共用 `/run/lock/cf-agent-wechat-qr-runtime.lock` 的 `flock`。
+锁文件必须为空、非 symlink、单 hardlink，精确使用批准 owner、
+`CF_AGENT_WECHAT_MANAGEMENT_GID` 和 mode `0640`；普通非管理用户不能打开并持锁。
+空文件可以保留，文件存在不代表锁正被持有，进程退出会释放 flock。重复 fresh QR 使用
+新的 UTC 时间戳目录，绝不覆盖既有 Archive。
 
 ## 停止
 
@@ -389,36 +390,26 @@ forced production 只接受能够在渲染前检查 Token 的文本 QR payload�
 容器 `healthy`、WebSocket `login_success` 或 auth `logged_in` 任一单项都不足以证明
 生产可用。worker 放行还要求 chats 非空和 messages 读取成功。
 
-## 归档 Manifest
+## Archive 与 Manifest
 
-每个 `session-archive/<UTC时间戳>/` 至少保存：
+Archive 是完整旧 Runtime，可能包含 WeChat session、账号/聊天标识、消息元数据和内容，
+整体为 `restricted` 敏感资产。不得自动上传、分享、加入 CI artifact 或挂回生产；
+独立 Agent API Token 被严格禁止进入 payload。
 
-- 原 `runtime/data`；
-- 原 `runtime/wechat-home`；
-- manifest schema version；
-- 流程启动与结束 UTC 时间；
-- 旧 runtime path 或脱敏 source path；
-- 当前批准的镜像 digest；
-- 原 runtime、data、wechat-home 的 UID、GID 和 mode；
-- archive result、流程结果类别和执行阶段；
-- failed manifest 更新成功时，失败 cleanup 是否执行，以及 agent 容器 stop/remove
-  的脱敏结果。
+Manifest schema v2 使用 `manifestData` 表示 manifest 自身不含实际 Token/账号/Chat ID/
+消息正文；`archivePayloadClassification` 则明确 payload 可能包含这些 WeChat 数据，
+`productionSessionRecoveryAllowed=false` 始终固定。只有移动后的隔离扫描验证通过，
+`containsIndependentAgentApiToken` 才为 `false` 且扫描状态为 `verified`；预扫或失败状态
+下该字段为 `null`，流程 fail closed。schema v1 按未知且 restricted 兼容读取，不原地
+改写，也不推断它不含敏感数据。
 
-legacy `data` 与 `wechat-home` 必须进入同一个时间戳归档。manifest 的
-`sourceLayout` 和 `sourcePaths` 记录其非敏感来源；mixed 新旧布局不会产生迁移归档，
-而是在任何状态变更前失败。
-
-manifest 禁止包含 Token 或指纹、微信账号、联系人、聊天 ID、消息正文、二维码、服务器
-凭据或数据库内容。
-
-上述限制针对 manifest。归档目录本身包含原 runtime，可能带有历史 session、缓存和
-消息数据，因此必须 root-protected；Token 仍被严格禁止进入任何 archive。
-
-### 保留策略
-
-启动和停止脚本都不删除历史归档。运维平台应监控容量，并由数据所有者、安全负责人和
-审计要求共同确定保存期限。任何到期处置必须通过本项目之外的独立审批流程执行；本说明
-不授权自动清理。
+每次启动先停止并确认 Worker，再在 Archive/QR 变更前检查 bytes/percent/inode 三项
+阈值并输出 inventory。门禁失败时 Worker 保持停止。
+容量不足、Archive symlink、路径逃逸、额外 hardlink、特殊文件、跨文件系统或 inventory
+超限/超时都 fail closed，且不会自动清理。独立 retention 工具默认 dry-run；实际删除
+必须明确一个 UTC Archive、增加 `--execute --confirm DELETE:<name>`、在 TTY 二次确认，
+并写受保护审计。完整命令、schema、受限备份和 v1 兼容规则见
+[Archive Management Contract](../archive-management.md)。
 
 ## Debian 重启、重建和回滚
 
@@ -454,6 +445,13 @@ SSH -> start-qr-login.sh -> 手机扫码 -> 自动验证 -> worker 启动
 
 ## 安全边界
 
+- 固定管理用户及 `CF_AGENT_WECHAT_MANAGEMENT_GID` 对应的批准管理组属于 trusted
+  deployment principal。其账户、组成员资格和仓库写权限必须按 root 等级审批，不得授予
+  普通用户；Docker access 本身等价于 root 权限。
+- inode/FD/content metadata 与稳定 snapshot 防止并发混合加载，但同一受信任 UID 仍可
+  修改其自有管理文件或自身进程。脚本不声称抵御恶意 root、已失陷的 trusted principal，
+  或在检查前已持有旧 inode 可写 FD 的进程；元数据防护不能替代该信任边界。Runtime、
+  container、Worker 和 CI runner 不会因此自动成为生产 deployment principal。
 - 不执行 Compose `down`。
 - 不修改 PostgreSQL、Gateway 或 Hermes 数据库。
 - 不修改 `CF_agent-gateway` 或其他仓库。
@@ -469,9 +467,11 @@ SSH -> start-qr-login.sh -> 手机扫码 -> 自动验证 -> worker 启动
 2026-08-13 的已信任设备登录和 2026-08-14 的消息接口证据属于旧生产基线。它们不能
 替代本次强制全新二维码流程的 CFserver 现场验证。
 
-真实 Docker E2E 已覆盖正常退出、异常退出和 daemon restart 后保持停止，最终证据以
-新 PR 的绿色 GitHub Actions Run ID 为准。该 CI 场景不执行真实 Host reboot，因此
-Host、Gateway boot stop gate 和真实手机扫码仍必须在 CFserver 验证。
+`restart=no Docker policy fixture` 已在真实 Docker daemon 上用 Alpine/Nginx 容器
+覆盖正常退出、异常退出和 daemon restart 后保持停止。对应 commit 的成功 GitHub Actions run
+只证明此 fixture，Run ID 记录在 PR #3。它不运行实际 agent-wechat 镜像、WeChat 进程或 QR，也不执行
+真实 Host reboot；实际 Agent、Host、Gateway boot stop gate 和真实手机扫码仍必须在
+CFserver 验证。
 
 本变更合入后仍需在 CFserver 完成一次真实手机扫码，并验证 legacy 首次迁移、mixed
 layout fail-fast、终端实际 QR、锁、API 有界等待、WeChat 进程稳定和脚本内 worker

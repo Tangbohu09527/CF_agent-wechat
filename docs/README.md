@@ -17,6 +17,8 @@
 | [QR Login Guide](qr-login-guide.md) | 唯一生产入口、TTY 扫码、API 验证和 Worker 放行 |
 | [Recovery Guide](recovery-guide.md) | crash、daemon、Host、升级与回滚后的 fresh-QR 恢复 |
 | [Deployment Audit](deployment-audit.md) | PR #2 选择性移植、安全控制和实机待验证项 |
+| [Gateway-WeChat Runtime Contract v1](contracts/gateway-wechat-runtime-contract.md) | Agent Token、Worker checker 与 heartbeat 的版本化跨仓契约；当前 BLOCKED |
+| [Archive Management Contract](archive-management.md) | Manifest schema v2、敏感资产分类、容量/inode 门禁、inventory、retention 与受限备份 |
 | [微信登录管理](login-management.md) | 唯一启动入口、兼容包装、返回码、权限模型和登录验证矩阵 |
 | [API 边界](api.md) | agent-server 当前生产端点、登录接口和历史能力边界 |
 | [生产运维](operations.md) | 日常检查、启停、备份恢复、升级与交接 |

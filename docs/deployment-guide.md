@@ -11,7 +11,9 @@
 ## 生产不变量
 
 - 正式 Compose：`docker/compose.cfserver.yaml`。
-- 正式环境文件：`docker/.env`。
+- 正式环境文件：`docker/.env`；生产不接受调用环境覆盖。
+- API/WS 仅由批准的 `127.0.0.1:<port>` 派生，Token 与 session 使用固定合同。
+- Compose 在 clean environment 中执行，并精确核验批准 image/project/container/环境。
 - 镜像使用批准的 digest，禁止 tag-only 和 `latest`。
 - 6174 只绑定 loopback。
 - 使用外部 `cf-internal`，固定 alias 为 `cf-agent-wechat`。
@@ -35,12 +37,12 @@ cd /opt/cf-agent-wechat
 sudo ./scripts/bootstrap-cfserver.sh
 ```
 
-Bootstrap 检查 Debian 固定系统工具、systemd、本机 rootful Docker、真实 Unix socket、
-固定 context endpoint、`live-restore=false`、Compose v2、仓库、Compose、环境文件、
-runtime/archive/secrets、owner/mode/link count、镜像 digest、loopback、网络 alias、
-Gateway 路径、固定 `check-wechat-worker-heartbeat` 和 Token。它准备管理目录、
-`cf-internal` 和独立 API Token，渲染生产 Compose，并确认 Agent 和 Worker 没有被
-Bootstrap 投入生产。
+Bootstrap 检查 Debian 固定系统工具、systemd/docker.service、本机 rootful default
+Docker、真实 socket、`live-restore=false`、未启用的 Agent auto-start unit、Compose
+v2、固定生产路径、白名单 `docker/.env`、精确 Runtime 权限、Archive/secrets/锁、
+digest/loopback/alias、Gateway contract/checker/Token 一致性，并真实创建临时 Python
+venv 验证 ensurepip。它准备管理目录、`cf-internal` 和唯一 root-only API Token，在
+clean environment 中精确 attest Compose，但不把 Agent 或 Worker 投入生产。
 
 Bootstrap 完成只表示基础部署准备完成。它不创建或恢复微信 session，不启动
 `agent-wechat`，不启动 `wechat-worker`，不表示微信已经登录或 Runtime 已上线。
@@ -58,16 +60,19 @@ cd /opt/cf-agent-wechat
 固定状态机：
 
 ```text
-停止并确认 wechat-worker
+拒绝生产环境覆盖并重新核验 Host/Compose/Gateway/Runtime 合同
+  -> 获取 0640 管理锁
+  -> 停止并确认 Gateway worker service
+  -> Archive bytes/percent/inode + inventory
+  -> Hash 锁定 QR venv 验证
   -> 停止并移除旧 agent-wechat 容器
-  -> 原子归档旧 runtime
-  -> 创建全新 data/wechat-home
-  -> 以 restart=no 启动 agent-wechat
+  -> 原子归档旧 runtime，按批准权限创建全新 data/wechat-home
+  -> 以 restart=no 创建并精确 attest 实际容器
   -> 显示 fresh/new-account QR
   -> 手机确认
   -> container + Docker health + WeChat process
   -> auth logged_in + chats readable + messages readable
-  -> 启动并确认 wechat-worker
+  -> 启动 worker，contract checker 稳定通过
 ```
 
 已有 `logged_in` 也不能跳过 fresh QR。未在当前 TTY 实际显示二维码前，任何成功事件
@@ -86,7 +91,8 @@ cd /opt/cf-agent-wechat
 4. auth 为 `logged_in`。
 5. chats 可读且非空。
 6. 对 API 返回的一个聊天读取 messages 成功。
-7. `wechat-worker` running/healthy，Gateway 提供的 heartbeat 正常。
+7. Gateway `worker` running/healthy，contract v1 checker 在 10 秒 hard timeout 内
+   无输出，并确认 heartbeat 新鲜、最新 Poll Cycle 成功与 auth=`logged_in`。
 
 Compose healthcheck 只证明容器和 Agent API 健康，不能证明第 3 至第 7 项。
 
@@ -107,8 +113,9 @@ session 获得绿色状态。
 Bootstrap -> `start-qr-login.sh`”执行。不得把 recreate 后 bind mount 仍存在描述为
 session recovery。完整流程见 [Recovery Guide](recovery-guide.md)。
 
-真实 Docker E2E 已覆盖正常退出、异常退出和 daemon restart 后保持停止；最终证据以
-新 PR 的绿色 GitHub Actions Run ID 为准。CI 只模拟 daemon 初始化，不能证明真实 Host
+`restart=no Docker policy fixture` 已用 Alpine/Nginx 容器覆盖正常退出、异常退出和
+daemon restart 后保持停止；它不运行实际 Agent/WeChat/QR。对应 commit 的成功 GitHub Actions run
+只证明此 fixture，Run ID 记录在 PR #3。CI 只模拟 daemon 初始化，不能证明真实 Host
 reboot；Host 与 Gateway boot stop gate 仍必须在 CFserver 实机验证。
 
 ## 安全与时间
@@ -117,10 +124,18 @@ reboot；Host 与 Gateway boot stop gate 仍必须在 CFserver 实机验证。
 - CFserver Host 使用 `Asia/Shanghai`。
 - 容器、日志、archive manifest 和原始审计证据使用 UTC。
 - 展示层可以转换时区，但必须标明时区。
-- 旧 runtime archive 可能包含历史 session、缓存和消息数据，必须 root-protected；
-  Token 严禁进入 archive，且任何 archive 都不得挂回生产复用。
-- 本仓库只协调 Gateway `wechat-worker`，不启停 `dispatch-worker` 或
+- 旧 Archive 是 `restricted` 资产，可能含完整 session、账号/聊天标识和消息数据；
+  Manifest schema v2 只对自身脱敏，Token 严禁进入 payload，且不得挂回生产。
+- 扫码前执行 Archive bytes/percent/inode 与 inventory 门禁；retention 默认 dry-run，
+  不自动删除。见 [Archive Management Contract](archive-management.md)。
+- `PROXY` 只允许无凭证 `scheme://host:port`；QR Python 依赖使用 Hash lock、
+  binary-only wheel、clean environment 和 hard timeout。
+- 本仓库只协调 Gateway `worker` 服务（WeChat worker 角色），不启停 `dispatch-worker` 或
   `delivery-worker`，不修改 Gateway、PostgreSQL、Checkpoint 或其他仓库。
+
+> [!CAUTION]
+> Gateway PR #4 尚未发布 contract v1 兼容 producer。当前实现保持
+> **BLOCKED BY GATEWAY CONTRACT**，不得以 fake checker 或 CI fixture 宣称跨仓长期目标完成。
 
 ## 下一步
 
@@ -131,3 +146,5 @@ reboot；Host 与 Gateway boot stop gate 仍必须在 CFserver 实机验证。
 - [故障排查](troubleshooting.md)
 - [验证总览](validation.md)
 - [Deployment Audit](deployment-audit.md)
+- [Gateway-WeChat Runtime Contract v1](contracts/gateway-wechat-runtime-contract.md)
+- [Archive Management Contract](archive-management.md)
