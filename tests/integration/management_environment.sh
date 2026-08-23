@@ -28,7 +28,7 @@ read_contract() {
     bash -c '
       source "$1/scripts/common.sh"
       source "$1/scripts/qr-runtime-common.sh"
-      if [ -n "$RUNTIME_MANAGEMENT_ENV_ERROR" ]; then
+      if ! runtime_load_management_environment; then
         printf "%s" "$RUNTIME_MANAGEMENT_ENV_ERROR" >&2
         exit 1
       fi

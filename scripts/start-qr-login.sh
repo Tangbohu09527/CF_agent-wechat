@@ -753,7 +753,7 @@ main() {
 
   FLOW_PHASE="force_qr_login"
   if ! run_forced_login; then
-    error "Forced QR login did not complete."
+    error "$LAST_ERROR"
     return 1
   fi
 

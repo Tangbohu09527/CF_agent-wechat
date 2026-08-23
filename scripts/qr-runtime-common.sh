@@ -188,10 +188,6 @@ runtime_load_management_environment() {
   fi
 }
 
-if [ -r "$AGENT_ENV_FILE" ]; then
-  runtime_load_management_environment || true
-fi
-
 runtime_require_command() {
   if ! command -v "$1" >/dev/null 2>&1; then
     LAST_ERROR="Required command is missing: $1"

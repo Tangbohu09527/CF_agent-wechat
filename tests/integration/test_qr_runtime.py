@@ -1142,7 +1142,9 @@ class ForcedQrRuntimeTests(unittest.TestCase):
             stop_result="failed",
         )
         self.assertEqual(manifest["phase"], "force_qr_login")
-        self.assertIn("Forced QR login did not complete.", result.stdout)
+        self.assertIn(
+            "Fresh QR WebSocket login did not complete.", result.stdout
+        )
         self.assertIn(
             "cleanup encountered errors (stop: failed; remove: succeeded)",
             result.stdout,
@@ -1183,7 +1185,9 @@ class ForcedQrRuntimeTests(unittest.TestCase):
                 "volumesRemoved": False,
             },
         )
-        self.assertIn("Forced QR login did not complete.", result.stdout)
+        self.assertIn(
+            "Fresh QR WebSocket login did not complete.", result.stdout
+        )
         self.assertIn(
             "cleanup encountered errors (stop: succeeded; remove: failed)",
             result.stdout,

@@ -75,6 +75,20 @@ class AgentRuntimeContractTests(unittest.TestCase):
         self.assertEqual(self.content.count(file_condition), 2)
         self.assertEqual(self.content.count(file_error), 2)
 
+    def test_management_environment_load_follows_file_validation(self) -> None:
+        for function_name in (
+            "runtime_validate_configuration",
+            "runtime_validate_stop_configuration",
+        ):
+            body = function_body(self.content, function_name)
+            self.assertLess(
+                body.index('runtime_privileged test -L "$AGENT_ENV_FILE"'),
+                body.index("runtime_load_management_environment"),
+            )
+        self.assertEqual(
+            self.content.count("runtime_load_management_environment"), 3
+        )
+
 
 class ArchiveSafetyContractTests(unittest.TestCase):
     @classmethod
@@ -165,6 +179,14 @@ class FailedFlowCleanupContractTests(unittest.TestCase):
         first_agent_stop = self.main_body.index("if ! stop_agent_container; then")
         self.assertLess(token_load, cleanup_guard)
         self.assertLess(cleanup_guard, first_agent_stop)
+
+    def test_forced_login_failure_preserves_safe_stage_error(self) -> None:
+        forced_login = self.main_body.index("if ! run_forced_login; then")
+        next_phase = self.main_body.index(
+            'FLOW_PHASE="verify_wechat_process"', forced_login
+        )
+        failure_block = self.main_body[forced_login:next_phase]
+        self.assertIn('error "$LAST_ERROR"', failure_block)
 
 
 class WeChatProcessIdentityContractTests(unittest.TestCase):
