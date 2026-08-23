@@ -12,6 +12,8 @@ cd /opt/cf-agent-wechat
 不要用 `docker compose up`、`restart` 或 `down` 恢复服务，不要执行 UI logout，也
 不要手工删除 runtime。脚本确认 `wechat-worker` 已停止后，后续失败必须保持停止；
 若初始停止无法确认，脚本会失败并报告，不能声称本仓已阻断 worker。已有归档必须保留。
+生产 Compose 必须为 `restart: "no"`，Docker daemon 必须为
+`live-restore=false`，所以 crash、daemon 重启或 Debian 重启都不会自动恢复 Agent。
 
 ## 排查顺序
 
@@ -43,6 +45,24 @@ sudo docker compose \
 
 `docker/docker-compose.yml` 是实验配置，不得用于 CFserver。
 
+## Bootstrap 失败
+
+首次部署时运行。已运行环境的部署输入变化时，先运行
+`./scripts/stop-qr-runtime.sh` 并确认 Agent/Worker 均已停止，再运行：
+
+```bash
+cd /opt/cf-agent-wechat
+sudo ./scripts/bootstrap-cfserver.sh
+```
+
+Bootstrap 失败只表示基础部署尚未准备完成。它不得启动 `agent-wechat` 或
+`wechat-worker`，不得创建或复用微信 session，也不得伪造 initialized 状态。按脱敏
+错误检查固定系统工具、systemd、本机 rootful Docker、default context、固定 endpoint、
+真实非符号链接 `/var/run/docker.sock`、`live-restore=false`、Compose v2、仓库、
+环境文件、目录、owner/mode、symlink/hardlink、digest、loopback、`cf-internal` alias、
+Token、Gateway 路径和固定 heartbeat checker。修复配置后安全重跑 Bootstrap，然后才
+运行 `start-qr-login.sh`。
+
 ## Dry run 与配置失败
 
 先执行：
@@ -62,7 +82,8 @@ worker，并在锁获取
 - 必要命令和外部 `cf-internal` 网络是否存在；
 - runtime、archive 和 secrets 父目录是否为预期类型；
 - Token 是否为独立文件且权限正确；
-- Gateway worker 控制配置是否完整。
+- Gateway worker 控制配置和固定 `check-wechat-worker-heartbeat` 是否完整、
+  权限安全且可由管理用户直接执行。
 
 生命周期脚本显式通过 `--env-file` 使用 agent-wechat 环境文件，Compose 项目目录
 仍为 `/opt/cf-agent-wechat`。非标准路径检查 `CF_AGENT_WECHAT_ENV_FILE` 覆盖值。
@@ -76,9 +97,14 @@ Gateway 默认 Compose、环境文件和项目目录分别为
 `cd /opt/cf-agent-wechat` 后的 `./scripts/start-qr-login.sh`，无需导出变量。
 若现场路径不同，检查 `CF_AGENT_GATEWAY_COMPOSE_FILE`、
 `CF_AGENT_GATEWAY_ENV_FILE` 和 `CF_AGENT_GATEWAY_PROJECT_DIR` 覆盖值；
-运维检查只确认 agent-wechat 和 Gateway 环境文件是否位于预期路径及其元数据。
-生命周期脚本不自行读取、解析、复制或输出内容；Docker Compose 通过 `--env-file`
-使用对应文件。
+管理脚本安全解析 agent-wechat `docker/.env` 的受支持键值，不执行任意 shell 内容，
+也不输出文件内容。Gateway 环境文件只检查路径和元数据，通过 `--env-file` 交给
+Docker Compose；脚本不解析、复制或输出其内容。
+
+固定 heartbeat checker 路径为
+`/opt/cf-agent-gateway/deploy/check-wechat-worker-heartbeat`。本仓库不创建、修改或
+通过 `sudo` 执行它。若 checker 缺失、不可直接执行、超时或返回非零，Worker 不得
+放行；排障只能检查路径、元数据和退出类别，不得让 checker 输出敏感内容。
 
 不要通过创建假 Token、放宽权限、修改其他仓库或跳过检查继续启动。
 
@@ -115,6 +141,9 @@ sudo stat -c '%F %U:%G %a %n' \
 ```
 
 修复原因后重新运行完整入口。不要手工拼接不完整归档，不要把 Token 复制进归档。
+
+归档本身可能包含历史 session、缓存和消息数据，必须保持 root-protected；这不改变
+Token 严禁进入 archive 的要求，也不授权将旧 archive 挂回生产。
 
 首次上线若只有 `${STORAGE_ROOT}/data` 和 `${STORAGE_ROOT}/wechat-home`，两者应进入
 同一个时间戳归档；第二个目录移动失败时脚本会尝试回滚第一个。新 `runtime` 与任一
@@ -153,8 +182,11 @@ sudo docker exec cf-agent-wechat \
 ```
 
 重点检查镜像、Xvfb、端口、资源限制、挂载和 agent-server 日志。不要直接执行 Compose
-重启；保留现场后重新运行完整入口。`restart: on-failure:3` 已限制容器失败重试，不应
-改回 `always` 或 `unless-stopped`。
+重启；保留现场后重新运行完整入口。`restart: "no"` 禁止自动失败重试，不得改成
+`on-failure`、`always` 或 `unless-stopped`。
+
+Compose healthcheck 只证明容器和 Agent API 可访问。即使显示 `healthy`，仍必须验证
+WeChat 进程、auth、chats、messages 和 Gateway Worker；不得把 healthcheck 当登录证据。
 
 进入 agent 容器轮换阶段后，`start-qr-login.sh` 的任何非零退出都会尝试重新停止并
 确认 `wechat-worker`，再依次 stop/remove 本次 `agent-wechat` 容器。remove 只使用
@@ -200,12 +232,12 @@ sudo docker compose \
 前的预期中间状态，不代表可投入生产。保持当前 `start-qr-login.sh` 运行并扫描终端中的
 二维码。
 
-如果原流程已经退出，重新运行完整入口。不要单独运行普通 `login.sh` 恢复旧会话，也
-不要手工删除 data 或 wechat-home。
+如果原流程已经退出，重新运行完整入口。不要手工删除 data 或 wechat-home。
+`login.sh` 只是无条件进入同一完整生命周期的兼容包装，不是恢复或诊断入口。
 
 ## `runtime is not clean`
 
-`login.sh --force-qr` 在全新 runtime 中发现 `logged_in` 时必须报：
+`start-qr-login.sh` 在全新 runtime 中发现 `logged_in` 时必须报：
 
 ```text
 runtime is not clean; use start-qr-login.sh
@@ -224,6 +256,10 @@ runtime is not clean; use start-qr-login.sh
 
 强制模式必须实际在 SSH 终端渲染至少一个 QR；未渲染 QR 即使收到 `login_success`
 也会拒绝成功。不要把仅出现“登录成功”文本当作完整证据。
+
+如果错误指出 PNG-only `qrDataUrl` 被拒绝，这是预期的 fail-closed 行为：当前依赖
+无法在渲染前可靠检查 PNG 编码的 QR 内容是否含 Token。不得改用诊断渲染、写文件或
+跳过检查；应修复上游事件，使其提供可审计的文本 QR payload。
 
 不要截图或转发二维码，不要并发启动登录流程，不要尝试通过 UI logout 修复
 `Unknown IAState`。
@@ -307,11 +343,16 @@ sudo stat -c '%F %U:%G %a %n' \
 
 - `status.sh` 返回生产可用；
 - messages 读取验证成功；
-- `Gateway WeChat Worker` 已启动；
+- `Gateway WeChat Worker` running/healthy，且可用 heartbeat 正常；
 - 容器仍连接 `cf-internal`。
 
+heartbeat 证据必须来自上述固定 checker。脚本以管理用户身份在 hard timeout 内执行，
+不使用 `sudo`；checker 只有在当前 `wechat-worker` 应用 heartbeat 可用时返回
+`0`，不得把容器 `healthy` 或固定成功脚本伪装成 heartbeat。
+
 Gateway 和 Hermes 上下文仍由各自数据库持久化。轮换微信 runtime 不修改这些数据库；
-本项目故障处理也不得修改 `CF_agent-gateway`、PostgreSQL 或 Hermes 数据。
+本项目故障处理也不得启停 `dispatch-worker` 或 `delivery-worker`，不得修改
+`CF_agent-gateway`、PostgreSQL、Checkpoint 或 Hermes 数据。
 
 重启期间收到的消息可能不会由微信本地客户端补拉。必须等登录和完整验证完成后再发送
 业务消息。
@@ -332,3 +373,6 @@ sudo docker exec cf-agent-wechat ps -ef |
 只记录时间、Commit、镜像 digest、脱敏状态项、脚本返回码和归档路径。不得附带 Token
 或指纹、二维码、账号、联系人、聊天 ID、聊天正文、媒体、服务器地址、API Key、密码
 或任何数据库内容。
+
+CFserver Host 时间按 `Asia/Shanghai` 展示，容器、日志、archive manifest 和原始审计
+证据使用 UTC；故障记录必须注明转换后的时区。

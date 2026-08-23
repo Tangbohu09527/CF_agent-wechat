@@ -5,8 +5,10 @@
 `cf-agent-wechat`。
 
 > [!IMPORTANT]
-> 生产环境不再恢复旧微信登录会话。Debian 重启、容器重建或人工重新启动微信入口后，
-> 必须 SSH 登录 CFserver，运行 `./scripts/start-qr-login.sh` 并用手机扫描全新二维码。
+> 生产环境分为“Bootstrap 基础准备”和“人工 forced fresh QR 启动”两个阶段。
+> Bootstrap 不登录微信，也不启动 `agent-wechat` 或 `wechat-worker`。Debian 重启、
+> 容器重建或人工重新启动微信入口后，必须在受控 SSH TTY 运行
+> `./scripts/start-qr-login.sh` 并用手机扫描全新二维码。
 
 > [!CAUTION]
 > 不得执行 `docker compose down`，也不得用 `docker compose up` 或 `restart` 代替
@@ -23,17 +25,20 @@
 - 应用：`/usr/bin/wechat`、agent-server `:6174`
 - VNC：`ENABLE_VNC=0`
 - 网络：外部 `cf-internal`
-- 容器重启策略：`on-failure:3`
+- 容器重启策略：`"no"`
+- Bootstrap 入口：`sudo ./scripts/bootstrap-cfserver.sh`
 - 唯一启动入口：`./scripts/start-qr-login.sh`
 - 停止入口：`./scripts/stop-qr-runtime.sh`
 
-`on-failure:3` 仅允许当前人工启动流程中的有限失败重试。不得使用 `always` 或
-`unless-stopped`，也不得在 Debian 重启后自动复用旧会话投入工作。
+`restart: "no"` 是生产生命周期的一部分。进程 crash、Docker daemon 重启和 Debian
+重启都不得自动恢复 `agent-wechat`，更不得复用旧 session。只有人工 forced-QR
+入口可以创建并启动新的生产 runtime。
 
 ## 组件与放行门槛
 
 ```mermaid
 flowchart LR
+    B["bootstrap-cfserver.sh"]
     O["start-qr-login.sh"]
     R["全新 runtime"]
     X["Xvfb / fluxbox / dunst"]
@@ -42,6 +47,7 @@ flowchart LR
     V["进程 + auth + chats + messages 验证"]
     G["Gateway wechat-worker"]
 
+    B -->|"只准备；不启动、不登录"| O
     O -->|"停止 worker，归档旧 runtime"| R
     R --> X
     X --> W
@@ -50,9 +56,10 @@ flowchart LR
     V -->|"全部通过后才启动"| G
 ```
 
-Gateway 经 `cf-internal` 访问 `http://cf-agent-wechat:6174`。启动脚本只控制
-`wechat-worker` 的停止和启动，不修改 Gateway 代码、配置数据库、PostgreSQL 或 Hermes
-数据。Gateway 和 Hermes 上下文仍由各自数据库持久化。
+Gateway 经 `cf-internal` 的固定 alias `cf-agent-wechat` 访问 Agent API。启动脚本
+只控制 `wechat-worker` 的停止和启动，不启停 `dispatch-worker` 或
+`delivery-worker`，不修改 Gateway 代码、配置数据库、PostgreSQL、Checkpoint 或
+Hermes 数据。Gateway 和 Hermes 上下文仍由各自数据库持久化。
 
 因此，本仓库只能保证脚本取得控制后执行 stop/verify/start，不能保证 Debian 或 Docker
 启动到人工执行脚本之前 worker 已停止。Gateway restart/boot stop gate 是 CFserver
@@ -71,7 +78,7 @@ Gateway 经 `cf-internal` 访问 `http://cf-agent-wechat:6174`。启动脚本只
     ├── start-qr-login.sh
     ├── stop-qr-runtime.sh
     ├── status.sh
-    └── login.sh
+    └── login.sh  # 仅兼容包装，无条件 exec 到 start-qr-login.sh
 ```
 
 agent-wechat 的 Compose 项目目录保持 `/opt/cf-agent-wechat`。生命周期脚本显式通过
@@ -83,11 +90,18 @@ Gateway 标准 Compose 输入：
 ```text
 /opt/cf-agent-gateway/deploy/
 ├── compose.yaml
-└── .env
+├── .env
+└── check-wechat-worker-heartbeat
 ```
 
 其 Compose 项目目录为 `/opt/cf-agent-gateway/deploy`。标准布局下从
 `/opt/cf-agent-wechat` 运行生命周期脚本无需导出 Gateway 路径变量。
+
+固定 heartbeat checker 为
+`/opt/cf-agent-gateway/deploy/check-wechat-worker-heartbeat`。它必须是无符号链接、
+无额外 hardlink、owner/mode 合规并可由管理用户直接执行的普通文件。本仓库不创建或
+修改 checker，也不通过 `sudo` 执行；checker 无参数运行，只在当前 Worker 应用
+heartbeat 可用时返回 `0`，且不得输出敏感值。
 
 存储目录：
 
@@ -111,11 +125,22 @@ Gateway 标准 Compose 输入：
 - `session-archive` 保存每次启动前的旧 runtime 和脱敏 manifest。
 
 Token 不属于 runtime。移动 runtime 时不得移动、复制或读取 Token 内容。
+旧 runtime archive 本身可能包含历史微信 session、缓存和消息数据，必须保持
+root-protected，且永远不能挂回生产复用。
 
 首次上线 forced-QR 模式前可能仍有 legacy
 `${STORAGE_ROOT}/data`、`${STORAGE_ROOT}/wechat-home`。只有 legacy 布局时，脚本把
 存在的两个目录迁入同一个时间戳归档；新 runtime 与任一 legacy 目录并存时 fail-fast，
 不修改任一布局。
+
+## Docker Host 契约
+
+生产只允许受信任的 Debian 固定系统工具；Bootstrap 对生产工具路径和元数据 fail closed。
+`/usr/bin/docker`、`/usr/bin/systemctl`、`/usr/bin/timeout` 和
+`/usr/bin/openssl` 不得由普通用户 PATH 替换。Docker context 必须为 default，endpoint
+必须是 `unix:///var/run/docker.sock`；`/var/run/docker.sock` 必须是真实 Unix
+socket 且不是符号链接。daemon 必须为 rootful 并配置 `live-restore=false`。任一条件
+不满足时 Bootstrap 和生产生命周期脚本都不得继续。
 
 ## Compose 约束
 
@@ -125,13 +150,18 @@ Token 不属于 runtime。移动 runtime 时不得移动、复制或读取 Token
 - `security_opt: seccomp=unconfined`；
 - `SYS_PTRACE`；
 - `ENABLE_VNC=0`；
-- `cf-internal`；
-- 6174 的现有受控绑定；
+- 外部 `cf-internal` 网络及固定 alias `cf-agent-wechat`；
+- 6174 仅绑定 loopback；
 - 现有 healthcheck；
 - JSON 日志大小和文件数限制；
-- `restart: on-failure:3`。
+- `restart: "no"`。
 
 不得新增公网端口。
+
+`seccomp=unconfined` 和 `SYS_PTRACE` 是当前上游镜像要求，不是一般性安全默认值。
+每次镜像 digest 变化都必须重新审查其必要性、影响和可替代方案。Compose healthcheck
+只证明容器和 Agent API 健康，不能证明微信已登录、chats/messages 可读或 Gateway 链路
+可用。
 
 运行目录挂载必须为：
 
@@ -154,7 +184,7 @@ Token 继续使用独立只读挂载：
 | 变量 | 要求 |
 | --- | --- |
 | `AGENT_WECHAT_IMAGE` | 必填，使用批准的不可变 digest，禁止 `latest` |
-| `AGENT_WECHAT_BIND_IP` | 保持现有受控绑定；真实值不进入公共文档 |
+| `AGENT_WECHAT_BIND_IP` | 必须是 loopback 地址，禁止 wildcard、LAN 或公网绑定 |
 | `AGENT_WECHAT_PORT` | 保持现有 6174 映射 |
 | `AGENT_WECHAT_CONTAINER_NAME` | 默认 `cf-agent-wechat` |
 | `CF_AGENT_WECHAT_RUNTIME_ROOT` | 默认 `/srv/storage/cf-agent-wechat/runtime` |
@@ -164,6 +194,7 @@ Token 继续使用独立只读挂载：
 | `CF_AGENT_GATEWAY_COMPOSE_FILE` | 默认 `/opt/cf-agent-gateway/deploy/compose.yaml`；只用于控制 `wechat-worker` |
 | `CF_AGENT_GATEWAY_ENV_FILE` | 默认 `/opt/cf-agent-gateway/deploy/.env`；只作为 Gateway Compose 的环境文件 |
 | `CF_AGENT_GATEWAY_PROJECT_DIR` | 默认 `/opt/cf-agent-gateway/deploy`；Gateway Compose 项目目录 |
+| heartbeat checker | 固定为 Gateway 项目目录下的 `check-wechat-worker-heartbeat`；不能用环境变量覆盖 |
 | `CF_AGENT_WECHAT_RUNTIME_UID` / `GID` | 仅在没有旧目录可继承时使用，默认 `1000:1000` |
 | `CF_AGENT_WECHAT_RUNTIME_MODE` | 仅在没有旧目录可继承时使用，默认 `700` |
 | `CF_AGENT_WECHAT_LOCK_FILE` | 默认 `/run/lock/cf-agent-wechat-qr-runtime.lock`；start/stop 共用 |
@@ -177,9 +208,10 @@ Token 继续使用独立只读挂载：
 `CF_AGENT_GATEWAY_COMPOSE_FILE`、`CF_AGENT_GATEWAY_ENV_FILE` 和
 `CF_AGENT_GATEWAY_PROJECT_DIR` 覆盖能力。start/stop 在任何容器、worker、runtime、
 归档或锁变更前，要求 agent-wechat 环境文件路径为绝对路径，且为已存在的普通非符号
-链接文件。生命周期脚本只检查环境文件路径和元数据，不自行读取、解析、复制或输出其
-内容；Docker Compose 通过 `--env-file` 使用对应文件。Token 禁止写入本仓库或
-Gateway 的任何 `.env`；生产变量实值不得粘贴到文档、工单或日志。
+链接文件。管理脚本安全解析 agent-wechat `docker/.env` 的受支持键值，不执行任意
+shell 内容，也不输出文件内容。Gateway 环境文件只检查路径和元数据，通过
+`--env-file` 交给 Docker Compose；脚本不解析、复制或输出其内容。Token 禁止写入
+本仓库或 Gateway 的任何 `.env`；生产变量实值不得粘贴到文档、工单或日志。
 
 使用与实际部署相同的环境输入做静态校验：
 
@@ -195,7 +227,17 @@ sudo docker compose \
 静态校验和生命周期脚本必须使用同一份环境输入。不要输出完整 Compose 渲染结果或
 完整环境。
 
-## 首次部署前检查
+## Bootstrap 基础准备
+
+首次部署时执行。已运行环境的部署输入发生变化时，必须先运行
+`./scripts/stop-qr-runtime.sh`，确认 Agent/Worker 均已停止，再执行：
+
+```bash
+cd /opt/cf-agent-wechat
+sudo ./scripts/bootstrap-cfserver.sh
+```
+
+Bootstrap 必须可以在配置修复后安全重试。它只完成以下基础准备：
 
 1. 确认代码处于批准 Commit，镜像为批准 digest。
 2. 确认 agent-wechat Compose、环境文件和项目目录依次为
@@ -216,19 +258,35 @@ sudo docker compose \
    `/opt/cf-agent-gateway/deploy/.env` 和
    `/opt/cf-agent-gateway/deploy`，且只控制 `wechat-worker`；标准布局无需
    导出变量，路径不同时必须通过上述变量显式覆盖。
+   固定 heartbeat checker 始终位于所选 Gateway 项目目录下，由 Gateway 部署提供；
+   Bootstrap 校验其 owner/mode/symlink/hardlink 和管理用户可执行权限，但不创建、
+   修改或通过 `sudo` 执行。
 8. 在 CFserver 实机确认 Gateway restart policy/Compose/systemd boot stop gate，确保
    Debian 启动至人工运行脚本前 `wechat-worker` 持续停止；本仓库未修改 Gateway。
 9. 确认 Python 3、curl、Docker Compose 及二维码依赖可用。
-10. 先运行 `./scripts/start-qr-login.sh --dry-run`。
+10. 校验固定系统工具、本机 rootful Docker、systemd Docker 状态和 Docker Compose v2；
+    context endpoint 必须是 `unix:///var/run/docker.sock`，socket 必须是真实非符号
+    链接 Unix socket，daemon 必须为 `live-restore=false`；拒绝 rootless 或 remote
+    daemon。
+11. 创建必要管理目录，并创建或复用独立 root-only API auth Token。
+12. 渲染生产 Compose，确认 `restart: "no"`、loopback、固定 alias 和只读 Token
+    挂载。
+13. 确认 `agent-wechat` 未作为长期服务运行，`wechat-worker` 不会读取未验证的
+    fresh runtime。
 
-检查时只读取元数据，不读取 Token 或数据库内容。
+Bootstrap 不创建微信 session、不创建登录成功标记、不启动 `agent-wechat`，也不启动
+`wechat-worker`。完成只表示基础部署准备完成；下一步始终是
+`./scripts/start-qr-login.sh`。失败时 fail closed，不删除 archive，不输出 Token，
+修复配置后重新运行 Bootstrap。
 
-## 唯一启动流程
+## 唯一登录与启动流程
 
 ```bash
 cd /opt/cf-agent-wechat
 ./scripts/start-qr-login.sh
 ```
+
+该命令必须由人工在受控 SSH TTY 中运行。Bootstrap 不能替代它。
 
 脚本必须按顺序：
 
@@ -239,17 +297,19 @@ cd /opt/cf-agent-wechat
 4. 将当前 runtime 原子移动到新的 UTC 时间戳归档；首次上线只有 legacy
    `data`/`wechat-home` 时，将两者迁入同一个归档。mixed layout 在步骤 2 前失败。
 5. 创建全新的 `runtime/data` 与 `runtime/wechat-home`，继承正确 UID、GID 和权限。
-6. 启动容器并等待 agent-server 可访问。
+6. 以 `restart: "no"` 启动容器，确认正式容器 running，等待 Docker health 为
+   `healthy`，并确认 agent-server API 可访问。
 7. 解析 `/usr/bin/wechat` launcher（包括符号链接）得到 canonical executable，
    只接受 `/proc/<pid>/exe` 的链接目标精确匹配 canonical executable 的进程，记录
    其 `PID:start_time` 并等待稳定；不使用进程名或命令行字符串宽松匹配。
-8. 调用 `login.sh --force-qr`，以 `newAccount=true` 请求二维码；SSH 终端必须实际
-   渲染至少一个 QR，否则不接受登录成功。
+8. `start-qr-login.sh` 直接以 `newAccount=true` 请求并监听二维码；SSH 终端必须
+   实际渲染至少一个 QR，否则不接受登录成功。
 9. 等待手机扫码和 `logged_in`。
 10. 在 `POST_LOGIN_READY_TIMEOUT` 有界窗口内等待同一 `PID:start_time` 身份持续
     存在且 canonical executable 仍精确匹配、auth 为 `logged_in`、chats 至少返回
     一个聊天，并对 API 返回的一个聊天读取 messages。
-11. 只有全部通过才启动 `wechat-worker`，随后输出最终状态。
+11. 只有全部通过才启动 `wechat-worker`，确认 running/healthy 和可用的 heartbeat
+    状态后输出最终状态。
 
 进入 agent 容器轮换阶段后，后续任何失败都会触发统一 cleanup：脚本尝试重新停止并
 确认 worker，再依次 stop/remove `agent-wechat`。remove 使用
@@ -294,8 +354,8 @@ cd /opt/cf-agent-wechat
 
 ## 登录行为
 
-`login.sh --force-qr` 必须使用 `newAccount=true`。若全新 runtime 仍返回
-`logged_in`，脚本不得短路成功，而应返回：
+`start-qr-login.sh` 必须直接使用 `newAccount=true` 请求和监听 fresh QR。若全新
+runtime 仍返回 `logged_in`，脚本不得短路成功，而应返回：
 
 ```text
 runtime is not clean; use start-qr-login.sh
@@ -303,7 +363,11 @@ runtime is not clean; use start-qr-login.sh
 
 登录工具不执行 UI logout，不删除用户数据。HTTP 响应或 WebSocket 事件必须在当前 SSH
 终端实际渲染至少一个 QR；未渲染 QR 时拒绝接受 `login_success`。二维码不进入日志或
-验证记录。
+验证记录。`login.sh` 只无条件 `exec` 到唯一入口，不提供替代路径。
+
+forced production 只接受能够在渲染前检查 Token 的文本 QR payload。PNG-only
+`qrDataUrl` 无法在当前依赖下可靠审计，必须 fail closed；不得绕过检查或把 PNG
+二维码写入文件。
 
 ## 生产可用状态
 
@@ -331,9 +395,12 @@ runtime is not clean; use start-qr-login.sh
 
 - 原 `runtime/data`；
 - 原 `runtime/wechat-home`；
+- manifest schema version；
 - 流程启动与结束 UTC 时间；
+- 旧 runtime path 或脱敏 source path；
+- 当前批准的镜像 digest；
 - 原 runtime、data、wechat-home 的 UID、GID 和 mode；
-- 流程结果类别和执行阶段；
+- archive result、流程结果类别和执行阶段；
 - failed manifest 更新成功时，失败 cleanup 是否执行，以及 agent 容器 stop/remove
   的脱敏结果。
 
@@ -344,6 +411,9 @@ legacy `data` 与 `wechat-home` 必须进入同一个时间戳归档。manifest 
 manifest 禁止包含 Token 或指纹、微信账号、联系人、聊天 ID、消息正文、二维码、服务器
 凭据或数据库内容。
 
+上述限制针对 manifest。归档目录本身包含原 runtime，可能带有历史 session、缓存和
+消息数据，因此必须 root-protected；Token 仍被严格禁止进入任何 archive。
+
 ### 保留策略
 
 启动和停止脚本都不删除历史归档。运维平台应监控容量，并由数据所有者、安全负责人和
@@ -352,13 +422,23 @@ manifest 禁止包含 Token 或指纹、微信账号、联系人、聊天 ID、�
 
 ## Debian 重启、重建和回滚
 
-三种场景使用同一规则：
+进程 crash、Docker daemon restart 或 Debian/Host restart 后，不等待容器自动恢复旧
+会话。`restart: "no"` 与 Docker `live-restore=false` 要求 Agent 保持停止；部署
+输入没有变化时，恢复流程为：
 
 ```text
 SSH -> start-qr-login.sh -> 手机扫码 -> 自动验证 -> worker 启动
 ```
 
-- Debian 重启后不等待容器自动恢复旧会话。
+显式 `docker compose up --force-recreate` 会启动容器，不属于上述自动重启保证，也
+禁止作为生产恢复入口。重建、升级或回滚必须严格按以下顺序：
+
+1. 在旧的已批准代码、Compose 和环境输入下运行 `stop-qr-runtime.sh`，确认
+   Agent/Worker 均已停止。
+2. 修改到新的已批准 Commit、Compose、环境输入或镜像 digest。
+3. 运行 Bootstrap 验证新输入，不启动 Agent/Worker。
+4. 人工运行 `start-qr-login.sh`，扫描新二维码并完成完整验证。
+
 - cleanup 已确认 remove 成功时，不存在可由 Docker daemon 重启恢复的 agent 容器。
 - 容器重建后不挂载旧会话继续工作。
 - 镜像或代码回滚后仍创建全新 runtime。
@@ -380,11 +460,18 @@ SSH -> start-qr-login.sh -> 手机扫码 -> 自动验证 -> worker 启动
 - 不新增公网端口。
 - 不输出 Token、二维码、微信账号、联系人、聊天 ID、聊天正文、API Key 或密码。
 - VNC、noVNC、x11vnc、websockify、宿主 X11、XFCE 和 RDP 均不属于生产流程。
+- CFserver Host 时区为 `Asia/Shanghai`；容器和日志使用 UTC。展示层可以转换时区，
+  archive manifest 和原始审计证据保持 UTC。
+- `seccomp=unconfined` 与 `SYS_PTRACE` 必须持续安全审查。
 
 ## 实机验证边界
 
 2026-08-13 的已信任设备登录和 2026-08-14 的消息接口证据属于旧生产基线。它们不能
 替代本次强制全新二维码流程的 CFserver 现场验证。
+
+真实 Docker E2E 已覆盖正常退出、异常退出和 daemon restart 后保持停止，最终证据以
+新 PR 的绿色 GitHub Actions Run ID 为准。该 CI 场景不执行真实 Host reboot，因此
+Host、Gateway boot stop gate 和真实手机扫码仍必须在 CFserver 验证。
 
 本变更合入后仍需在 CFserver 完成一次真实手机扫码，并验证 legacy 首次迁移、mixed
 layout fail-fast、终端实际 QR、锁、API 有界等待、WeChat 进程稳定和脚本内 worker

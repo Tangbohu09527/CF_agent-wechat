@@ -1,10 +1,13 @@
-# CF_agent-wechat Docker 部署手册
+# CF_agent-wechat Docker 历史实验手册
 
 > [!CAUTION]
 > **V1 实验室部署，已废弃，非 CFserver 当前生产方案。**
 > 本文包含 VNC/noVNC 等历史实验步骤，严禁在 CFserver 上作为生产 runbook 使用。
 > 当前生产入口为
 > [CFserver 正式部署](../docs/deployment/cfserver-production.md)。
+> 当前生产 Compose 必须为 `restart: "no"`，Bootstrap 不登录或启动服务，每次启动
+> 必须人工运行 `start-qr-login.sh` 并扫描全新二维码。下文的裸 Compose、自动恢复、
+> 旧 session 和 VNC 内容均不得用于生产。
 
 本目录提供 V1 容器部署基线。镜像 `ghcr.io/thisnick/agent-wechat:0.11.15` 已在
 Debian 13 环境完成基础部署和 API 验证，但仓库 Compose 与验证环境在重启策略和
@@ -168,18 +171,20 @@ contacts / chats / messages API 可用
 GUI 登录不等于 agent-wechat 初始化完成。接口和验证能力见
 [API 文档](../docs/api.md)。
 
-## 自动恢复与 VNC
+## 历史自动恢复与 VNC（禁止用于生产）
 
 ### Verified
 
-验证环境使用 `restart: unless-stopped`。Docker 重启后容器自动恢复、container
+以下只是早期实验事实，不是当前建议：验证环境使用 `restart: unless-stopped`。
+Docker 重启后容器自动恢复、container
 health 正常且 VNC 可访问。微信客户端需要重新登录；重新登录后 agent-server 状态
 恢复正常，`/api/status/auth` 返回 `status=logged_in`。
 
 ### Known Issue
 
 仓库 `docker-compose.yml` 当前使用 `restart: "no"`，所以直接部署此文件不会
-获得相同的容器自动恢复行为。本次文档工作没有修改 Docker 运行逻辑。
+获得相同的容器自动恢复行为；该差异也不构成恢复旧 session 的生产授权。CFserver
+只能使用 `compose.cfserver.yaml` 和 forced fresh QR runbook。
 
 agent-wechat 默认 VNC 交互状态不稳定。验证环境使用：
 
@@ -191,7 +196,7 @@ agent-wechat 默认 VNC 交互状态不稳定。验证环境使用：
 
 ## 停止与日志
 
-保留数据停止：
+以下停止命令只用于复现已废弃实验环境，禁止在 CFserver 执行：
 
 ```bash
 docker compose --env-file .env down

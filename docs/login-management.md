@@ -10,9 +10,14 @@ cd /opt/cf-agent-wechat
 ./scripts/start-qr-login.sh
 ```
 
-这是唯一生产启动入口。`scripts/login.sh --force-qr` 是该入口调用的底层登录步骤，不是
-绕过 runtime 轮换的独立恢复命令。VNC、noVNC、RDP、宿主桌面和 UI logout 都不属于
+这是唯一生产启动入口。`scripts/login.sh` 只是无条件 `exec` 到该入口的兼容包装，
+不提供独立登录、诊断或恢复语义。VNC、noVNC、RDP、宿主桌面和 UI logout 都不属于
 当前流程。
+
+首次部署时先运行 `sudo ./scripts/bootstrap-cfserver.sh`。已运行环境的部署输入变化时，
+必须先用 `./scripts/stop-qr-runtime.sh` 受控停止并确认 Agent/Worker 均已停止，再运行
+Bootstrap。Bootstrap 只完成基础准备，不创建或恢复微信 session，不启动
+`agent-wechat` 或 `wechat-worker`。扫码入口必须由人工在受控 SSH TTY 单独运行。
 
 ## 启动编排
 
@@ -31,11 +36,13 @@ cd /opt/cf-agent-wechat
 7. 启动 `agent-wechat`，等待 agent-server 可访问。
 8. 确认 `/usr/bin/wechat` 真实进程存在并稳定，认证状态进入 `logged_out` 或二维码
    登录界面。
-9. 调用 `login.sh --force-qr`；当前 SSH 终端必须实际渲染至少一个 QR，才接受登录成功。
+9. 直接以 `newAccount=true` 请求并监听 fresh QR；当前 SSH 终端必须实际渲染至少
+   一个 QR，才接受登录成功。
 10. 登录后在 `POST_LOGIN_READY_TIMEOUT` 有界时间内等待 WeChat 进程持续存在、
     `/api/status/auth` 为 `logged_in`、`/api/chats` 至少返回一个聊天，并对 API
     返回的一个聊天执行消息读取。
-11. 只有全部验证通过，才启动 Gateway `wechat-worker` 并输出最终状态。
+11. 只有全部验证通过，才启动 Gateway `wechat-worker`，确认其 running/healthy 和
+    可用的 heartbeat 状态，并输出最终状态。
 
 脚本确认 worker 已停止后，后续任一步失败都会让它保持停止，不启动 AI 调度；若初始
 停止无法确认，流程立即失败并明确报告，不能声称 worker 已被本仓保证停止。当前或历史
@@ -60,15 +67,9 @@ Dry run 在获取锁前返回，因此不会创建或遗留
 - 锁已被占用时，后启动的流程必须失败并保持现状，不得绕过锁。
 - 上一次失败不妨碍后续重新执行，但失败产生的 runtime 和归档仍必须保留。
 
-## 强制二维码参数
+## Fresh QR 协议
 
-底层强制登录命令为：
-
-```bash
-./scripts/login.sh --force-qr
-```
-
-`--force-qr` 的约束：
+`start-qr-login.sh` 自身执行二维码请求与事件监听，并遵守：
 
 - 登录 WebSocket 参数使用 `newAccount=true`，请求全新设备二维码。
 - HTTP 响应或 WebSocket 事件必须在当前 SSH 终端实际渲染至少一个 QR；强制模式在未
@@ -81,11 +82,12 @@ Dry run 在获取锁前返回，因此不会创建或遗留
   ```
 
 - 不自动执行 UI logout，避免在失效状态下触发 `Unknown IAState`。
-- 不删除 `data`、`wechat-home` 或其他用户数据。目录轮换只由
-  `start-qr-login.sh` 在登录前完成。
+- 不删除 `data`、`wechat-home` 或其他用户数据。目录轮换由同一
+  `start-qr-login.sh` 生命周期在二维码请求前完成。
 
-生产运维不应单独运行无参数 `login.sh` 来恢复旧会话。若需要重新登录，应重新执行唯一
-生产启动入口，让现有 runtime 先归档，再创建全新 runtime。
+`login.sh` 不接受另一套生产协议；它把参数原样交给唯一入口，因此未知参数仍由
+`start-qr-login.sh` 拒绝。若需要重新登录，应重新执行唯一生产启动入口，让现有
+runtime 先归档，再创建全新 runtime。
 
 ## SSH 扫码
 
@@ -120,6 +122,9 @@ Dry run 在获取锁前返回，因此不会创建或遗留
 
 `logged_in` 不能单独作为成功结论。启动流程的放行条件更严格：聊天列表必须至少有一个
 聊天，且对其中一个 API 返回的聊天执行消息读取不能报错。
+
+Compose healthcheck 只证明容器和 Agent API 可访问，不证明微信登录、chats/messages
+可读、Gateway 可达或 Worker heartbeat 正常。
 
 ## Token 安全模型
 
@@ -163,18 +168,11 @@ Python 包，也不要修改系统 Python。可用 `CF_AGENT_WECHAT_VENV` 覆盖
 - 返回非零：容器、agent-server、WeChat 进程、认证或消息 API 任一条件不满足。
 - `logged_out` 表示需要重新执行完整启动入口，不代表服务可投入生产。
 
-### `login.sh --force-qr`
-
-- 返回 `0`：全新二维码流程收到成功事件并确认认证为 `logged_in`。
-- 返回非零：runtime 不干净、配置或依赖失败、进程未运行、API/WebSocket 失败、超时、
-  取消或登录后认证复核失败。
-- 即使该命令返回 `0`，仍由 `start-qr-login.sh` 完成 chats/messages 验证和 worker
-  放行。
-
 ### `start-qr-login.sh`
 
 - 返回 `0`：完整登录和运行时验证通过，`wechat-worker` 已启动。
 - 返回非零：任一准备、归档、启动、登录或验证步骤失败；worker 保持停止。
+- `login.sh` 兼容包装无条件 `exec` 到这里，因此没有独立退出语义。
 
 登录后 API 不是单次抢跑检查；启动脚本会按 `RUNTIME_POLL_INTERVAL` 轮询，最长等待
 `POST_LOGIN_READY_TIMEOUT`（默认 120 秒），超时后才失败。
@@ -221,7 +219,13 @@ ID 或正文。
 通过覆盖变量绕过以下约束：`newAccount=true`、全新 runtime、独占锁、完整 API 验证、
 Token 独立挂载和 worker 放行门槛。
 
-6174 只保持既有受控绑定，并通过 `cf-internal` 供 Gateway 访问；不得新增公网端口。
+6174 只绑定 loopback，并通过 `cf-internal` 固定 alias `cf-agent-wechat` 供
+Gateway 访问；不得新增公网端口。
+生产 Compose 必须保持 `restart: "no"`。进程 crash、Docker daemon 重启和 Debian
+重启后均不得自动恢复 Agent；必须再次运行唯一入口并显示新二维码。
+
+CFserver Host 使用 `Asia/Shanghai`，容器和日志使用 UTC。二维码只显示在当前 TTY，
+archive manifest 和原始审计时间保持 UTC。
 
 ## 实机验证边界
 
@@ -232,6 +236,9 @@ Token 独立挂载和 worker 放行门槛。
 本仓库只能在脚本运行后停止并复核 worker，不能配置 Gateway 的 boot/restart 行为。
 必须另行实机确认 Debian 启动到人工运行脚本之前 `wechat-worker` 持续停止；未确认前
 不能宣称启动窗口已被本仓库保证。
+
+本仓库只协调 `wechat-worker`，不启停 `dispatch-worker` 或 `delivery-worker`，
+不修改 Gateway、PostgreSQL、Checkpoint 或其他仓库。
 
 实机记录必须脱敏，不得包含二维码、Token、账号、联系人、聊天 ID、聊天正文、服务器
 地址或数据库内容。详细状态见 [验证总览](validation.md)。

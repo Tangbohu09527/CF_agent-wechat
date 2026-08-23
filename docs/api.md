@@ -19,8 +19,10 @@ http://cf-agent-wechat:6174
 占位符 `<AGENT_WECHAT_TOKEN>`，不得读取、打印或提交真实 Token。
 
 生产 Token 由 Compose 只读挂载到 `/data/auth-token`。宿主文件保持
-`root:root 600`，其父目录保持 `root:root 700`。日常状态和登录操作应使用
-`scripts/status.sh` 与 `scripts/login.sh`，不要为了手工调用放宽权限。
+`root:root 600`，其父目录保持 `root:root 700`。日常状态检查使用
+`scripts/status.sh`；生产登录只能由人工在受控 SSH TTY 运行
+`scripts/start-qr-login.sh`。`scripts/login.sh` 只会无条件 `exec` 到该入口，
+不提供独立登录或诊断能力。不要为了手工调用放宽权限。
 
 ## 2026-08-13 生产验证
 
@@ -49,6 +51,10 @@ http://cf-agent-wechat:6174
 已验证链路是已信任设备的手机确认登录。二维码事件处理与 SSH 终端渲染已经实现，
 但完全新设备扫码闭环尚未实机验证。详细行为见
 [微信登录管理](login-management.md)。
+
+当前生产流程每次都创建 fresh runtime 并要求新的 `newAccount=true` 二维码。已有
+`logged_in` 不得短路。Compose healthcheck 只证明容器和 Agent API 健康，不证明
+微信登录、chats/messages 或 Gateway 链路。
 
 `GET /api/status/auth` 的当前关键状态为：
 
@@ -138,7 +144,9 @@ agent-wechat 的文本发送行为，不描述调用方身份、权限或 Hermes
 - 调用方应设置连接、请求和重试上限，不得假设未记录的响应字段已经冻结。
 - 不得在日志、异常、URL 查询参数或命令历史中写入认证凭据。
 - 账号、联系人、聊天标识和消息正文均按敏感数据处理。
-- 容器健康不等于微信已登录；业务调用前应检查认证状态。
+- 容器健康和单独的认证状态都不等于生产可用；只有本轮 forced-QR 已完成 WeChat
+  process 稳定、auth `logged_in`、chats/messages 可读验证，并且
+  `wechat-worker` running/healthy/heartbeat 门槛全部通过后，才允许业务调用。
 - Gateway 只作为本服务调用方出现，其内部故障应转交 Gateway 项目处理。
 
 当前生产验证证据见

@@ -11,15 +11,22 @@
 | --- | --- |
 | [项目说明](00_项目说明.md) | 项目职责、边界、当前状态与安全口径 |
 | [架构设计](01_架构设计.md) | 容器内 Xvfb 链路、组件职责与 Gateway 调用关系 |
+| [Deployment Guide](deployment-guide.md) | Bootstrap 与人工 forced fresh QR 两阶段总览 |
 | [CFserver 正式部署](deployment/cfserver-production.md) | 正式 Compose、目录、权限、启停、重建、重启检查和回滚 |
-| [微信登录管理](login-management.md) | `status.sh`、`login.sh`、返回码、权限模型和登录验证矩阵 |
+| [新设备 Bootstrap](deployment/new-device-bootstrap.md) | 只做基础准备，不登录或启动 Agent/Worker |
+| [QR Login Guide](qr-login-guide.md) | 唯一生产入口、TTY 扫码、API 验证和 Worker 放行 |
+| [Recovery Guide](recovery-guide.md) | crash、daemon、Host、升级与回滚后的 fresh-QR 恢复 |
+| [Deployment Audit](deployment-audit.md) | PR #2 选择性移植、安全控制和实机待验证项 |
+| [微信登录管理](login-management.md) | 唯一启动入口、兼容包装、返回码、权限模型和登录验证矩阵 |
 | [API 边界](api.md) | agent-server 当前生产端点、登录接口和历史能力边界 |
 | [生产运维](operations.md) | 日常检查、启停、备份恢复、升级与交接 |
 | [故障排查](troubleshooting.md) | 容器、健康、Token、登录、进程与项目边界排查 |
 
-> **生产警告：不得在 CFserver 上执行不带 `-f` 的
-> `docker compose down`。** 正式命令必须显式指定
-> `docker/compose.cfserver.yaml`。
+> **生产警告：不得在 CFserver 上执行任何 `docker compose down`，即使显式指定
+> 正式 Compose 也不允许。** 启停必须使用生命周期脚本。
+>
+> 生产 Compose 必须为 `restart: "no"`。Bootstrap 只准备基础部署；每次生产启动
+> 必须由人工在受控 SSH TTY 运行 `start-qr-login.sh` 并扫描全新二维码。
 
 ## 验证记录
 
@@ -42,15 +49,19 @@
 | [05 V1 验证结果](05_V1验证结果.md) | 早期固定环境的能力验证结果 |
 | [Docker 实验室手册](../docker/README.md) | `docker/docker-compose.yml` 的实验室资料 |
 
-历史记录不得作为 CFserver 生产 runbook。当前事实发生冲突时，以
-[验证总览](validation.md)、对应日期的生产验证记录和
-[CFserver 正式部署](deployment/cfserver-production.md) 为准。
+历史记录不得作为 CFserver 生产 runbook。当前生命周期事实发生冲突时，只以
+[CFserver 正式部署](deployment/cfserver-production.md)和
+[验证总览](validation.md)为准。对应日期的生产验证记录仅在其明确标注的历史环境、
+Commit 和验证范围内有效，不能证明当前 forced fresh QR 生命周期已经实机通过。
 
 ## 维护规则
 
 1. 新验证结论必须记录日期、Commit、环境、动作、结果和未验证范围。
 2. 只有实机通过后，状态才能改为“已实现并实机验证”。
-3. 当前部署命令只维护在生产部署与运维文档，其他页面链接到权威入口。
+3. 当前 runbook 可以为完整操作重复必要命令，但生命周期和参数语义以
+   [CFserver 正式部署](deployment/cfserver-production.md)为权威，并必须保持一致。
 4. Gateway 只描述调用关系，不在本仓库展开其内部权限或 Hermes 实现。
 5. 文档不得包含真实账号、联系人、聊天标识、服务器 IP、二维码、Token、指纹、
    API Key、密码或本地 Windows 绝对路径。
+6. CFserver Host 使用 `Asia/Shanghai`；容器、日志、archive manifest 和原始审计
+   证据使用 UTC。
