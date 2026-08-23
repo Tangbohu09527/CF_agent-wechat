@@ -1,11 +1,276 @@
-#!/usr/bin/env bash
+#!/bin/bash -p
 set -euo pipefail
 
-SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
-# shellcheck source=common.sh
-source "${SCRIPT_DIR}/common.sh"
-# shellcheck source=qr-runtime-common.sh
-source "${SCRIPT_DIR}/qr-runtime-common.sh"
+set +x
+set +a
+unset _CF_AGENT_WECHAT_TEST_CALLER_PATH
+_CF_AGENT_WECHAT_TEST_CALLER_PATH="${PATH:-}"
+readonly _CF_AGENT_WECHAT_TEST_CALLER_PATH
+PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+LANG=C.UTF-8
+LC_ALL=C.UTF-8
+export PATH LANG LC_ALL
+if [ "${CF_AGENT_WECHAT_TESTING:-0}" != "1" ]; then
+  case "$-" in
+    *p*) ;;
+    *) printf '%s\n' 'Production management requires direct protected-mode script execution.' >&2; exit 1 ;;
+  esac
+fi
+unset BASH_ENV ENV CDPATH
+
+unset _CF_AGENT_WECHAT_EARLY_OVERRIDES
+_CF_AGENT_WECHAT_EARLY_OVERRIDES=""
+for _management_env_name in \
+    API_URL WS_URL TOKEN_FILE SESSION_ID CONTAINER_NAME PYTHON_BIN \
+    REQUIREMENTS_FILE VENV_DIR CF_AGENT_WECHAT_VENV AGENT_WECHAT_IMAGE \
+    CF_AGENT_WECHAT_CURL_BIN \
+    AGENT_WECHAT_BIND_IP AGENT_WECHAT_PORT AGENT_WECHAT_CONTAINER_NAME \
+    COMPOSE_PROJECT_NAME PROXY RUST_LOG CF_AGENT_WECHAT_STORAGE_ROOT \
+    CF_AGENT_WECHAT_RUNTIME_ROOT CF_AGENT_WECHAT_ARCHIVE_ROOT \
+    CF_AGENT_WECHAT_MIN_FREE_BYTES CF_AGENT_WECHAT_MIN_FREE_PERCENT \
+    CF_AGENT_WECHAT_MIN_FREE_INODES CF_AGENT_WECHAT_TOKEN_SCAN_MAX_FILES \
+    CF_AGENT_WECHAT_TOKEN_SCAN_MAX_BYTES \
+    CF_AGENT_WECHAT_COMPOSE_FILE CF_AGENT_WECHAT_ENV_FILE \
+    CF_AGENT_WECHAT_LOCK_FILE CF_AGENT_WECHAT_RUNTIME_UID \
+    CF_AGENT_WECHAT_RUNTIME_GID CF_AGENT_WECHAT_RUNTIME_MODE \
+    CF_AGENT_WECHAT_MANAGEMENT_GID CF_AGENT_GATEWAY_COMPOSE_FILE \
+    CF_AGENT_GATEWAY_PROJECT_DIR CF_AGENT_GATEWAY_ENV_FILE \
+    CF_AGENT_GATEWAY_HEARTBEAT_COMMAND \
+    CF_AGENT_WECHAT_DOCKER_BIN CF_AGENT_WECHAT_SYSTEMCTL_BIN \
+    CF_AGENT_WECHAT_DOCKER_SOCKET_PATH CF_AGENT_WECHAT_DF_BIN \
+    CF_AGENT_WECHAT_TEST_ROOT \
+    CF_AGENT_WECHAT_TEST_GATEWAY_VERIFIER_REPLACEMENT \
+    CF_AGENT_WECHAT_TEST_GATEWAY_CHECKER_REPLACEMENT \
+    CF_AGENT_WECHAT_TOKEN CF_AGENT_WECHAT_TOKEN_FILE AUTH_TOKEN \
+    CF_AGENT_WECHAT_TEST_PIP_INSTALL_TIMEOUT \
+    CF_AGENT_WECHAT_TEST_PIP_NETWORK_TIMEOUT \
+    CF_AGENT_WECHAT_TEST_PIP_RETRIES \
+    CF_AGENT_WECHAT_TEST_VENV_CREATE_TIMEOUT \
+    HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy \
+    NO_PROXY no_proxy TMPDIR \
+    HTTP_CONNECT_TIMEOUT HTTP_TIMEOUT DOCKER_READ_TIMEOUT LOGIN_TIMEOUT_MS \
+    LOGIN_CONFIRM_RETRIES LOGIN_CONFIRM_INTERVAL SERVER_READY_TIMEOUT \
+    WECHAT_READY_TIMEOUT WECHAT_STABLE_SECONDS POST_LOGIN_READY_TIMEOUT \
+    RUNTIME_POLL_INTERVAL DOCKER_COMMAND_TIMEOUT COMPOSE_COMMAND_TIMEOUT \
+    WORKER_READY_TIMEOUT WORKER_STABLE_SECONDS WORKER_HEARTBEAT_TIMEOUT \
+    TOKEN_SCAN_TIMEOUT ARCHIVE_TOOL_TIMEOUT \
+    CF_AGENT_WECHAT_TEST_ARCHIVE_TOOL_TIMEOUT; do
+    if [ "${CF_AGENT_WECHAT_TESTING:-0}" != "1" ] &&
+      [[ -v $_management_env_name ]]; then
+      _CF_AGENT_WECHAT_EARLY_OVERRIDES+="${_CF_AGENT_WECHAT_EARLY_OVERRIDES:+,}${_management_env_name}"
+    fi
+    if [ "${CF_AGENT_WECHAT_TESTING:-0}" != "1" ]; then
+      unset "$_management_env_name"
+    else
+      export -n "$_management_env_name" 2>/dev/null || :
+      case "$_management_env_name" in
+        AUTH_TOKEN|CF_AGENT_WECHAT_TOKEN|PROXY|HTTP_PROXY|HTTPS_PROXY|ALL_PROXY|http_proxy|https_proxy|all_proxy|NO_PROXY|no_proxy)
+          unset "$_management_env_name"
+          ;;
+      esac
+    fi
+  done
+for _management_sensitive_name in \
+  CF_GATEWAY_API_TOKEN CF_AGENT_GATEWAY_ADMIN_TOKEN HERMES_API_KEY; do
+  unset "$_management_sensitive_name"
+done
+unset _management_sensitive_name
+readonly _CF_AGENT_WECHAT_EARLY_OVERRIDES
+unset _management_env_name
+
+unset _CF_AGENT_WECHAT_INTERNAL_SCRIPTS_DIR
+_management_entry_source="${BASH_SOURCE[0]}"
+_management_entry_resolved="$_management_entry_source"
+_management_entry_via_fd=0
+if [ "${CF_AGENT_WECHAT_TESTING:-0}" != "1" ]; then
+  case "$_management_entry_source" in
+    /proc/self/fd/[0-9]*)
+      if ! _management_entry_resolved="$(
+        /usr/bin/readlink -f -- "$_management_entry_source" 2>/dev/null
+      )"; then
+        printf '%s\n' 'Production management entry descriptor is unavailable.' >&2
+        exit 1
+      fi
+      _management_entry_via_fd=1
+      ;;
+  esac
+fi
+SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname -- "$_management_entry_resolved")" && pwd -P)"
+if [ "${CF_AGENT_WECHAT_TESTING:-0}" != "1" ]; then
+  _management_uid="$(/usr/bin/id -u)"
+
+  _management_validate_node() {
+    local path="$1"
+    local expected_kind="$2"
+    local metadata owner mode links file_type _dev _inode _gid
+
+    if [ -L "$path" ]; then
+      printf '%s\n' 'Production management path is a symlink.' >&2
+      return 1
+    fi
+    if ! metadata="$(
+      /usr/bin/stat -c '%d:%i:%u:%g:%a:%h:%F' -- "$path" 2>/dev/null
+    )"; then
+      printf '%s\n' 'Production management path metadata is unavailable.' >&2
+      return 1
+    fi
+    IFS=: read -r _dev _inode owner _gid mode links file_type <<< "$metadata"
+    case "$owner" in
+      0|"$_management_uid") ;;
+      *)
+        printf '%s\n' 'Production management path owner is not approved.' >&2
+        return 1
+        ;;
+    esac
+    case "$expected_kind" in
+      directory)
+        if [ "$file_type" != directory ] || [ "$mode" != 755 ]; then
+          printf '%s\n' 'Production management directory metadata is unsafe.' >&2
+          return 1
+        fi
+        ;;
+      file)
+        if [ "$file_type" != 'regular file' ] ||
+          [ "$mode" != 755 ] || [ "$links" != 1 ]; then
+          printf '%s\n' 'Production management file metadata is unsafe.' >&2
+          return 1
+        fi
+        ;;
+      *) return 1 ;;
+    esac
+    MANAGEMENT_NODE_METADATA="$metadata"
+  }
+
+  _management_source_library() {
+    local library_path="$1"
+    local path_before path_after fd_metadata library_fd
+    local content_before content_after fd_content_before fd_content_after
+    local library_source="" source_status=0
+
+    _management_validate_node "$library_path" file || return 1
+    path_before="$MANAGEMENT_NODE_METADATA"
+    if ! exec {library_fd}<"$library_path"; then
+      printf '%s\n' 'Production management library could not be opened.' >&2
+      return 1
+    fi
+    if ! fd_metadata="$(
+      /usr/bin/stat -Lc '%d:%i:%u:%g:%a:%h:%F' -- \
+        "/proc/self/fd/${library_fd}" 2>/dev/null
+    )" ||
+      [ -L "$library_path" ] ||
+      ! path_after="$(
+        /usr/bin/stat -c '%d:%i:%u:%g:%a:%h:%F' -- \
+          "$library_path" 2>/dev/null
+      )" ||
+      [ "$path_before" != "$fd_metadata" ] ||
+      [ "$path_before" != "$path_after" ] ||
+      ! content_before="$(
+        /usr/bin/stat -c '%d:%i:%s:%y:%z' -- \
+          "$library_path" 2>/dev/null
+      )" ||
+      ! fd_content_before="$(
+        /usr/bin/stat -Lc '%d:%i:%s:%y:%z' -- \
+          "/proc/self/fd/${library_fd}" 2>/dev/null
+      )" ||
+      [ "$content_before" != "$fd_content_before" ]; then
+      exec {library_fd}<&-
+      printf '%s\n' 'Production management library changed while loading.' >&2
+      return 1
+    fi
+    if IFS= read -r -d '' library_source <&"$library_fd"; then
+      library_source=""
+      exec {library_fd}<&-
+      printf '%s\n' 'Production management library contains a NUL byte.' >&2
+      return 1
+    fi
+    if [ -L "$library_path" ] ||
+      ! content_after="$(
+        /usr/bin/stat -c '%d:%i:%s:%y:%z' -- \
+          "$library_path" 2>/dev/null
+      )" ||
+      ! fd_content_after="$(
+        /usr/bin/stat -Lc '%d:%i:%s:%y:%z' -- \
+          "/proc/self/fd/${library_fd}" 2>/dev/null
+      )" ||
+      [ "$content_after" != "$content_before" ] ||
+      [ "$fd_content_after" != "$content_before" ]; then
+      library_source=""
+      exec {library_fd}<&-
+      printf '%s\n' 'Production management library changed while loading.' >&2
+      return 1
+    fi
+    # shellcheck disable=SC1091
+    source /dev/stdin <<< "$library_source" || source_status=$?
+    if [ -L "$library_path" ] ||
+      ! content_after="$(
+        /usr/bin/stat -c '%d:%i:%s:%y:%z' -- \
+          "$library_path" 2>/dev/null
+      )" ||
+      ! fd_content_after="$(
+        /usr/bin/stat -Lc '%d:%i:%s:%y:%z' -- \
+          "/proc/self/fd/${library_fd}" 2>/dev/null
+      )" ||
+      [ "$content_after" != "$content_before" ] ||
+      [ "$fd_content_after" != "$content_before" ]; then
+      library_source=""
+      exec {library_fd}<&-
+      printf '%s\n' 'Production management library changed while loading.' >&2
+      return 1
+    fi
+    library_source=""
+    exec {library_fd}<&-
+    [ "$source_status" -eq 0 ] || return "$source_status"
+  }
+
+  if [ "${_management_entry_resolved##*/}" != start-qr-login.sh ] ||
+    ! _management_validate_node "$SCRIPT_DIR" directory ||
+    ! _management_validate_node "${SCRIPT_DIR}/start-qr-login.sh" file; then
+    exit 1
+  fi
+  _management_entry_path_metadata="$MANAGEMENT_NODE_METADATA"
+  if [ "$_management_entry_via_fd" -eq 1 ]; then
+    if ! _management_entry_fd_metadata="$(
+      /usr/bin/stat -Lc '%d:%i:%u:%g:%a:%h:%F' -- \
+        "$_management_entry_source" 2>/dev/null
+    )" ||
+      [ "$_management_entry_path_metadata" != \
+        "$_management_entry_fd_metadata" ]; then
+      printf '%s\n' 'Production management entry descriptor is unsafe.' >&2
+      exit 1
+    fi
+  elif [ -L "$_management_entry_source" ]; then
+    printf '%s\n' 'Production management entry is a symlink.' >&2
+    exit 1
+  fi
+  _CF_AGENT_WECHAT_INTERNAL_SCRIPTS_DIR="$SCRIPT_DIR"
+  readonly _CF_AGENT_WECHAT_INTERNAL_SCRIPTS_DIR
+
+  _management_source_library "${SCRIPT_DIR}/common.sh" || exit 1
+  _management_source_library "${SCRIPT_DIR}/qr-runtime-common.sh" || exit 1
+  unset -f _management_validate_node _management_source_library
+  unset _management_uid MANAGEMENT_NODE_METADATA \
+    _management_entry_fd_metadata _management_entry_path_metadata
+else
+  # shellcheck source=common.sh
+  source "${SCRIPT_DIR}/common.sh" || exit 1
+  # shellcheck source=qr-runtime-common.sh
+  source "${SCRIPT_DIR}/qr-runtime-common.sh" || exit 1
+fi
+if [ "${CF_AGENT_WECHAT_COMMON_LOADED:-0}" != 1 ] ||
+  [ "${CF_AGENT_WECHAT_RUNTIME_COMMON_LOADED:-0}" != 1 ]; then
+  printf '%s\n' 'Management libraries did not load completely.' >&2
+  exit 1
+fi
+if ! restore_testing_management_path "$_CF_AGENT_WECHAT_TEST_CALLER_PATH"; then
+  error "${LAST_ERROR:-Testing command path is not isolated.}"
+  exit 1
+fi
+if ! runtime_validate_testing_isolation; then
+  error "${LAST_ERROR:-Testing management assets are not isolated.}"
+  exit 1
+fi
+unset _management_entry_resolved _management_entry_source \
+  _management_entry_via_fd
 
 DRY_RUN=0
 FLOW_COMPLETE=0
@@ -18,9 +283,11 @@ AGENT_FAILURE_CLEANUP_REMOVE_RESULT="not_attempted"
 FLOW_PHASE="initializing"
 FLOW_STARTED_AT=""
 ARCHIVE_PATH=""
+ARCHIVE_STAGING_PATH=""
 ARCHIVE_RESULT="not_attempted"
 MANIFEST_AVAILABLE=0
 SOURCE_LAYOUT="none"
+ARCHIVE_TOKEN_SCAN_STATUS="not_applicable"
 
 RUNTIME_EXISTS=false
 RUNTIME_UID="$RUNTIME_DEFAULT_UID"
@@ -34,6 +301,12 @@ HOME_EXISTS=false
 HOME_UID="$RUNTIME_DEFAULT_UID"
 HOME_GID="$RUNTIME_DEFAULT_GID"
 HOME_MODE="$RUNTIME_DEFAULT_MODE"
+ARCHIVE_OWNER_UID=0
+ARCHIVE_OWNER_GID=0
+if [ "$CF_AGENT_WECHAT_TESTING" = "1" ] && [ "$(id -u)" -ne 0 ]; then
+  ARCHIVE_OWNER_UID="$(id -u)"
+  ARCHIVE_OWNER_GID="$(id -g)"
+fi
 
 usage() {
   cat <<'EOF'
@@ -96,13 +369,6 @@ capture_runtime_metadata() {
       return 1
     fi
     IFS=$'\t' read -r HOME_EXISTS HOME_UID HOME_GID HOME_MODE <<< "$metadata"
-    if [ "$DATA_EXISTS" = true ]; then
-      RUNTIME_UID="$DATA_UID"
-      RUNTIME_GID="$DATA_GID"
-    elif [ "$HOME_EXISTS" = true ]; then
-      RUNTIME_UID="$HOME_UID"
-      RUNTIME_GID="$HOME_GID"
-    fi
   else
     if ! metadata="$(directory_metadata "${RUNTIME_ROOT}/data" \
       "$RUNTIME_DEFAULT_UID" "$RUNTIME_DEFAULT_GID" "$RUNTIME_DEFAULT_MODE")"; then
@@ -120,15 +386,19 @@ capture_runtime_metadata() {
 write_manifest() {
   local result="$1"
   local ended_at="$2"
-  local temp_file archive_temp
+  local temp_file manifest_dir
 
   [ "$MANIFEST_AVAILABLE" -eq 1 ] || return 0
+  manifest_dir="${ARCHIVE_STAGING_PATH:-$ARCHIVE_PATH}"
+  if ! runtime_privileged test -d "$manifest_dir"; then
+    LAST_ERROR="Archive manifest directory is unavailable."
+    return 1
+  fi
   if ! temp_file="$(mktemp)"; then
     LAST_ERROR="Temporary manifest file could not be created."
     return 1
   fi
-  archive_temp="${ARCHIVE_PATH}/.manifest.json.$$"
-  if ! "$PYTHON_BIN" - \
+  if ! run_isolated_python - \
     "$temp_file" "$result" "$FLOW_PHASE" "$FLOW_STARTED_AT" "$ended_at" \
     "$ARCHIVE_RESULT" "$SOURCE_LAYOUT" "$RUNTIME_ROOT" "$LEGACY_DATA_ROOT" \
     "$LEGACY_WECHAT_HOME_ROOT" "$ARCHIVE_PATH" "$AGENT_IMAGE_DIGEST" \
@@ -137,7 +407,8 @@ write_manifest() {
     "$HOME_EXISTS" "$HOME_UID" "$HOME_GID" "$HOME_MODE" \
     "$AGENT_FAILURE_CLEANUP_ATTEMPTED" \
     "$AGENT_FAILURE_CLEANUP_STOP_RESULT" \
-    "$AGENT_FAILURE_CLEANUP_REMOVE_RESULT" <<'PY'
+    "$AGENT_FAILURE_CLEANUP_REMOVE_RESULT" \
+    "$ARCHIVE_OWNER_UID" "$ARCHIVE_OWNER_GID" "$ARCHIVE_TOKEN_SCAN_STATUS" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -154,7 +425,7 @@ from pathlib import Path
     legacy_data,
     legacy_wechat_home,
     archive_path,
-    image_digest,
+    image_reference,
     runtime_exists,
     runtime_uid,
     runtime_gid,
@@ -170,6 +441,9 @@ from pathlib import Path
     cleanup_attempted,
     cleanup_stop,
     cleanup_remove,
+    archive_owner_uid,
+    archive_owner_gid,
+    archive_token_scan_status,
 ) = sys.argv[1:]
 
 def metadata(exists, uid, gid, mode):
@@ -180,8 +454,17 @@ def metadata(exists, uid, gid, mode):
         "mode": mode,
     }
 
+if "@sha256:" not in image_reference:
+    raise SystemExit(2)
+image_digest = image_reference.rsplit("@", 1)[1]
+
+if archive_token_scan_status not in {
+    "not_applicable", "preflight_passed", "verified", "failed"
+}:
+    raise SystemExit(2)
+
 payload = {
-    "schemaVersion": 1,
+    "schemaVersion": 2,
     "runtimeMode": "forced_qr",
     "result": result,
     "archiveResult": archive_result,
@@ -202,6 +485,7 @@ payload = {
         ]
     ),
     "archivePath": archive_path,
+    "imageReference": image_reference,
     "imageDigest": image_digest,
     "originalPermissions": {
         "runtime": metadata(
@@ -210,10 +494,33 @@ payload = {
         "data": metadata(data_exists, data_uid, data_gid, data_mode),
         "wechatHome": metadata(home_exists, home_uid, home_gid, home_mode),
     },
-    "sensitiveData": {
+    "manifestData": {
         "tokenIncluded": False,
         "accountIdentifiersIncluded": False,
         "chatIdentifiersIncluded": False,
+        "messageContentIncluded": False,
+    },
+    "archivePayloadClassification": {
+        "mayContainWechatSession": True,
+        "mayContainAccountIdentifiers": True,
+        "mayContainChatIdentifiers": True,
+        "mayContainMessageMetadata": True,
+        "mayContainMessageContent": True,
+        "containsIndependentAgentApiToken": (
+            False if archive_token_scan_status == "verified" else None
+        ),
+        "independentAgentApiTokenScan": archive_token_scan_status,
+        "accessClassification": "restricted",
+        "productionSessionRecoveryAllowed": False,
+    },
+    "archiveProtection": {
+        "archiveRootOwnerUid": int(archive_owner_uid),
+        "archiveRootOwnerGid": int(archive_owner_gid),
+        "archiveRootMode": "700",
+        "archiveTopLevelMode": "700",
+        "manifestMode": "600",
+        "automaticUploadAllowed": False,
+        "automaticDeletionAllowed": False,
     },
     "failureCleanup": {
         "attempted": cleanup_attempted == "true",
@@ -232,23 +539,120 @@ PY
     return 1
   fi
 
-  if ! runtime_privileged install \
-    -o "$RUNTIME_UID" -g "$RUNTIME_GID" -m 600 \
-    "$temp_file" "$archive_temp"; then
+  if ! runtime_privileged_isolated_python "$ARCHIVE_TOOL_TIMEOUT" - \
+    "$manifest_dir" "$temp_file" "$ARCHIVE_OWNER_UID" "$ARCHIVE_OWNER_GID" <<'PY'
+import json
+import os
+import stat
+import sys
+
+archive_path, source_path, expected_uid, expected_gid = sys.argv[1:]
+expected = (int(expected_uid), int(expected_gid))
+limit = 128 * 1024
+directory_fd = -1
+source_fd = -1
+temporary_fd = -1
+temporary_name = f".manifest.json.{os.getpid()}"
+
+try:
+    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    directory_flags |= getattr(os, "O_NOFOLLOW", 0)
+    directory_fd = os.open(archive_path, directory_flags)
+    directory_metadata = os.fstat(directory_fd)
+    if (
+        not stat.S_ISDIR(directory_metadata.st_mode)
+        or (directory_metadata.st_uid, directory_metadata.st_gid) != expected
+        or stat.S_IMODE(directory_metadata.st_mode) != 0o700
+    ):
+        raise ValueError
+
+    source_before = os.lstat(source_path)
+    if (
+        not stat.S_ISREG(source_before.st_mode)
+        or source_before.st_nlink != 1
+        or source_before.st_size <= 0
+        or source_before.st_size > limit
+    ):
+        raise ValueError
+    source_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    source_flags |= getattr(os, "O_NONBLOCK", 0)
+    source_fd = os.open(source_path, source_flags)
+    source_opened = os.fstat(source_fd)
+    if (source_opened.st_dev, source_opened.st_ino, source_opened.st_size) != (
+        source_before.st_dev,
+        source_before.st_ino,
+        source_before.st_size,
+    ):
+        raise ValueError
+    chunks = []
+    size = 0
+    while True:
+        chunk = os.read(source_fd, min(65536, limit + 1 - size))
+        if not chunk:
+            break
+        size += len(chunk)
+        if size > limit:
+            raise ValueError
+        chunks.append(chunk)
+    source_after = os.fstat(source_fd)
+    if (
+        size != source_opened.st_size
+        or source_after.st_size != source_opened.st_size
+        or source_after.st_ctime_ns != source_opened.st_ctime_ns
+    ):
+        raise ValueError
+    payload = b"".join(chunks)
+    parsed = json.loads(payload.decode("utf-8"))
+    if not isinstance(parsed, dict):
+        raise ValueError
+
+    temporary_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    temporary_flags |= getattr(os, "O_NOFOLLOW", 0)
+    temporary_fd = os.open(
+        temporary_name, temporary_flags, 0o600, dir_fd=directory_fd
+    )
+    os.fchmod(temporary_fd, 0o600)
+    os.fchown(temporary_fd, expected[0], expected[1])
+    offset = 0
+    while offset < len(payload):
+        written = os.write(temporary_fd, payload[offset:])
+        if written <= 0:
+            raise OSError
+        offset += written
+    os.fsync(temporary_fd)
+    os.close(temporary_fd)
+    temporary_fd = -1
+    os.replace(
+        temporary_name, "manifest.json",
+        src_dir_fd=directory_fd, dst_dir_fd=directory_fd,
+    )
+    os.fsync(directory_fd)
+except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError):
+    if temporary_fd >= 0:
+        os.close(temporary_fd)
+    if directory_fd >= 0:
+        try:
+            os.unlink(temporary_name, dir_fd=directory_fd)
+        except OSError:
+            pass
+    raise SystemExit(1)
+finally:
+    if source_fd >= 0:
+        os.close(source_fd)
+    if directory_fd >= 0:
+        os.close(directory_fd)
+PY
+  then
     rm -f -- "$temp_file"
+    LAST_ERROR="Archive manifest could not be installed durably."
     return 1
   fi
   rm -f -- "$temp_file"
-  if ! runtime_privileged mv -fT -- \
-    "$archive_temp" "${ARCHIVE_PATH}/manifest.json"; then
-    LAST_ERROR="Archive manifest could not be installed."
-    return 1
-  fi
 }
 
 on_exit() {
   local exit_status=$?
-  local ended_at original_last_error
+  local ended_at original_last_error preserved_archive=""
   local agent_cleanup_failed=0 manifest_write_failed=0
 
   trap - EXIT
@@ -276,10 +680,16 @@ on_exit() {
     fi
   fi
   LAST_ERROR="$original_last_error"
+  if [ -n "$ARCHIVE_STAGING_PATH" ] &&
+    runtime_path_exists "$ARCHIVE_STAGING_PATH"; then
+    preserved_archive="$ARCHIVE_STAGING_PATH"
+  elif [ -n "$ARCHIVE_PATH" ] && runtime_path_exists "$ARCHIVE_PATH"; then
+    preserved_archive="$ARCHIVE_PATH"
+  fi
   if [ "$exit_status" -ne 0 ]; then
     error "Fresh QR runtime failed during phase: $FLOW_PHASE"
-    if [ -n "$ARCHIVE_PATH" ]; then
-      error "Archive preserved at: $ARCHIVE_PATH"
+    if [ -n "$preserved_archive" ]; then
+      error "Archive preserved at: $preserved_archive"
     else
       error "Archive path: not created"
     fi
@@ -352,26 +762,196 @@ choose_archive_path() {
   candidate="${ARCHIVE_ROOT}/$timestamp"
   while runtime_path_exists "$candidate"; do
     counter=$((counter + 1))
+    if [ "$counter" -gt 99 ]; then
+      LAST_ERROR="Archive timestamp collision limit was reached; retry in a new UTC second."
+      return 1
+    fi
     candidate="${ARCHIVE_ROOT}/${timestamp}-$(printf '%02d' "$counter")"
   done
   ARCHIVE_PATH="$candidate"
 }
 
+choose_archive_staging_path() {
+  local final_name
+
+  final_name="${ARCHIVE_PATH##*/}"
+  ARCHIVE_STAGING_PATH="${ARCHIVE_ROOT}/.incomplete-${final_name}-$$"
+  if runtime_path_exists "$ARCHIVE_STAGING_PATH"; then
+    LAST_ERROR="Archive staging path already exists; interrupted archive evidence must be inspected before retrying."
+    return 1
+  fi
+}
+
+fsync_archive_directory() {
+  local path="$1"
+
+  if ! runtime_privileged_isolated_python "$ARCHIVE_TOOL_TIMEOUT" - \
+    "$path" "$ARCHIVE_OWNER_UID" "$ARCHIVE_OWNER_GID" <<'PY'
+import os
+import stat
+import sys
+
+path, expected_uid, expected_gid = sys.argv[1:]
+expected = (int(expected_uid), int(expected_gid))
+descriptor = -1
+try:
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    metadata = os.fstat(descriptor)
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or (metadata.st_uid, metadata.st_gid) != expected
+        or stat.S_IMODE(metadata.st_mode) != 0o700
+    ):
+        raise OSError
+    os.fsync(descriptor)
+except OSError:
+    raise SystemExit(1)
+finally:
+    if descriptor >= 0:
+        os.close(descriptor)
+PY
+  then
+    LAST_ERROR="Archive directory metadata could not be synchronized durably."
+    return 1
+  fi
+}
+
+restrict_archive_staging() {
+  MANIFEST_AVAILABLE=1
+  if ! runtime_privileged test -d "$ARCHIVE_STAGING_PATH" ||
+    ! runtime_privileged chown \
+      "${ARCHIVE_OWNER_UID}:${ARCHIVE_OWNER_GID}" "$ARCHIVE_STAGING_PATH" ||
+    ! runtime_privileged chmod 700 "$ARCHIVE_STAGING_PATH" ||
+    ! fsync_archive_directory "$ARCHIVE_STAGING_PATH" ||
+    ! fsync_archive_directory "$ARCHIVE_ROOT"; then
+    LAST_ERROR="Archive staging directory could not be restricted and synchronized."
+    return 1
+  fi
+}
+
+remove_empty_archive_staging() {
+  if runtime_path_exists "$ARCHIVE_STAGING_PATH"; then
+    if ! runtime_privileged rmdir -- "$ARCHIVE_STAGING_PATH" ||
+      ! fsync_archive_directory "$ARCHIVE_ROOT"; then
+      LAST_ERROR="Empty Archive staging directory could not be removed durably."
+      return 1
+    fi
+  fi
+  ARCHIVE_STAGING_PATH=""
+  ARCHIVE_PATH=""
+  MANIFEST_AVAILABLE=0
+}
+
+publish_archive_staging() {
+  local staging_name final_name
+
+  staging_name="${ARCHIVE_STAGING_PATH##*/}"
+  final_name="${ARCHIVE_PATH##*/}"
+  if ! runtime_privileged_isolated_python "$ARCHIVE_TOOL_TIMEOUT" - \
+    "$ARCHIVE_ROOT" "$staging_name" "$final_name" \
+    "$ARCHIVE_OWNER_UID" "$ARCHIVE_OWNER_GID" <<'PY'
+import os
+import re
+import stat
+import sys
+
+root, staging_name, final_name, expected_uid, expected_gid = sys.argv[1:]
+expected = (int(expected_uid), int(expected_gid))
+final_pattern = re.compile(r"^[0-9]{8}T[0-9]{6}Z(?:-[0-9]{2})?$", re.ASCII)
+staging_pattern = re.compile(
+    r"^[.]incomplete-[0-9]{8}T[0-9]{6}Z(?:-[0-9]{2})?-[0-9]+$",
+    re.ASCII,
+)
+root_fd = -1
+moved = False
+try:
+    if not final_pattern.fullmatch(final_name):
+        raise OSError
+    if not staging_pattern.fullmatch(staging_name):
+        raise OSError
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    root_fd = os.open(root, flags)
+    root_metadata = os.fstat(root_fd)
+    if (
+        not stat.S_ISDIR(root_metadata.st_mode)
+        or (root_metadata.st_uid, root_metadata.st_gid) != expected
+        or stat.S_IMODE(root_metadata.st_mode) != 0o700
+    ):
+        raise OSError
+    staging = os.stat(staging_name, dir_fd=root_fd, follow_symlinks=False)
+    if (
+        not stat.S_ISDIR(staging.st_mode)
+        or (staging.st_uid, staging.st_gid) != expected
+        or stat.S_IMODE(staging.st_mode) != 0o700
+    ):
+        raise OSError
+    try:
+        os.stat(final_name, dir_fd=root_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        pass
+    else:
+        raise OSError
+    os.rename(staging_name, final_name, src_dir_fd=root_fd, dst_dir_fd=root_fd)
+    moved = True
+    os.fsync(root_fd)
+except OSError:
+    if moved and root_fd >= 0:
+        try:
+            archived = os.stat(
+                final_name, dir_fd=root_fd, follow_symlinks=False
+            )
+            if (archived.st_dev, archived.st_ino) != (
+                staging.st_dev, staging.st_ino
+            ):
+                raise OSError
+            os.rename(
+                final_name, staging_name, src_dir_fd=root_fd, dst_dir_fd=root_fd
+            )
+            os.fsync(root_fd)
+        except OSError:
+            pass
+    raise SystemExit(1)
+finally:
+    if root_fd >= 0:
+        os.close(root_fd)
+PY
+  then
+    LAST_ERROR="Archive staging directory could not be published durably."
+    return 1
+  fi
+  ARCHIVE_STAGING_PATH=""
+}
+
 archive_current_runtime() {
-  local storage_uid storage_gid archive_device source_device
-  local legacy_data_moved=0
+  local legacy_data_moved=0 published_staging_path=""
 
   if ! capture_runtime_metadata; then
     LAST_ERROR="Previous runtime metadata could not be captured."
     return 1
   fi
-  if ! storage_uid="$(runtime_privileged stat -c '%u' -- "$STORAGE_ROOT")" ||
-    ! storage_gid="$(runtime_privileged stat -c '%g' -- "$STORAGE_ROOT")"; then
-    LAST_ERROR="Storage root ownership could not be read."
-    return 1
-  fi
+  case "$SOURCE_LAYOUT" in
+    runtime)
+      runtime_validate_approved_runtime_directory \
+        "$RUNTIME_ROOT" "Runtime root" 1 || return 1
+      runtime_validate_approved_runtime_directory \
+        "${RUNTIME_ROOT}/data" "Runtime data" 1 || return 1
+      runtime_validate_approved_runtime_directory \
+        "${RUNTIME_ROOT}/wechat-home" "Runtime WeChat HOME" 1 || return 1
+      ;;
+    legacy)
+      [ "$DATA_EXISTS" != true ] ||
+        runtime_validate_approved_runtime_directory \
+          "$LEGACY_DATA_ROOT" "Legacy data" 1 || return 1
+      [ "$HOME_EXISTS" != true ] ||
+        runtime_validate_approved_runtime_directory \
+          "$LEGACY_WECHAT_HOME_ROOT" "Legacy WeChat HOME" 1 || return 1
+      ;;
+  esac
   if ! runtime_privileged install -d \
-    -o "$storage_uid" -g "$storage_gid" -m 700 "$ARCHIVE_ROOT"; then
+    -o "$ARCHIVE_OWNER_UID" -g "$ARCHIVE_OWNER_GID" -m 700 "$ARCHIVE_ROOT"; then
     LAST_ERROR="Archive root could not be created."
     return 1
   fi
@@ -382,129 +962,129 @@ archive_current_runtime() {
   fi
 
   ARCHIVE_RESULT="failed"
-  case "$SOURCE_LAYOUT" in
-    runtime)
-      runtime_assert_tree_has_no_auth_token "$RUNTIME_ROOT" "Current runtime" ||
-        return 1
-      ;;
-    legacy)
-      if [ "$DATA_EXISTS" = true ]; then
-        runtime_assert_tree_has_no_auth_token "$LEGACY_DATA_ROOT" "Legacy data" ||
-          return 1
-      fi
-      if [ "$HOME_EXISTS" = true ]; then
-        runtime_assert_tree_has_no_auth_token "$LEGACY_WECHAT_HOME_ROOT" "Legacy WeChat HOME" ||
-          return 1
-      fi
-      ;;
-  esac
-
-  if ! archive_device="$(runtime_privileged stat -c '%d' -- "$ARCHIVE_ROOT")"; then
-    LAST_ERROR="Archive filesystem could not be inspected."
+  if ! choose_archive_path || ! choose_archive_staging_path; then
     return 1
   fi
-  if [ "$SOURCE_LAYOUT" = "runtime" ]; then
-    if ! source_device="$(runtime_privileged stat -c '%d' -- "$RUNTIME_ROOT")" ||
-      [ "$source_device" != "$archive_device" ]; then
-      LAST_ERROR="Current runtime and archive must be on the same filesystem."
-      return 1
-    fi
-  else
-    if [ "$DATA_EXISTS" = true ]; then
-      if ! source_device="$(runtime_privileged stat -c '%d' -- "$LEGACY_DATA_ROOT")" ||
-        [ "$source_device" != "$archive_device" ]; then
-        LAST_ERROR="Legacy data and archive must be on the same filesystem."
-        return 1
-      fi
-    fi
-    if [ "$HOME_EXISTS" = true ]; then
-      if ! source_device="$(runtime_privileged stat -c '%d' -- "$LEGACY_WECHAT_HOME_ROOT")" ||
-        [ "$source_device" != "$archive_device" ]; then
-        LAST_ERROR="Legacy WeChat HOME and archive must be on the same filesystem."
-        return 1
-      fi
-    fi
-  fi
 
-  if ! choose_archive_path; then
-    return 1
-  fi
   if [ "$SOURCE_LAYOUT" = "runtime" ]; then
-    if ! runtime_privileged mv --no-clobber -T -- \
-      "$RUNTIME_ROOT" "$ARCHIVE_PATH"; then
-      LAST_ERROR="Current runtime could not be atomically archived."
+    if ! runtime_assert_tree_has_no_auth_token \
+      "$RUNTIME_ROOT" "Current runtime" "$ARCHIVE_STAGING_PATH" \
+      "manifest.json"; then
+      ARCHIVE_TOKEN_SCAN_STATUS="failed"
       return 1
     fi
+    ARCHIVE_TOKEN_SCAN_STATUS="preflight_passed"
     if runtime_path_exists "$RUNTIME_ROOT" ||
-      ! runtime_privileged test -d "$ARCHIVE_PATH"; then
-      LAST_ERROR="Archive destination was claimed concurrently; runtime was not moved."
+      ! runtime_privileged test -d "$ARCHIVE_STAGING_PATH"; then
+      LAST_ERROR="Attested runtime move did not reach its required staging state."
+      return 1
+    fi
+    if ! restrict_archive_staging; then
       return 1
     fi
   else
-    if ! runtime_privileged mkdir -- "$ARCHIVE_PATH"; then
-      LAST_ERROR="Legacy archive destination could not be reserved."
+    if ! runtime_privileged mkdir -- "$ARCHIVE_STAGING_PATH"; then
+      LAST_ERROR="Legacy Archive staging directory could not be reserved."
       return 1
     fi
-    MANIFEST_AVAILABLE=1
-    if ! runtime_privileged chown \
-      "${RUNTIME_UID}:${RUNTIME_GID}" "$ARCHIVE_PATH" ||
-      ! runtime_privileged chmod 700 "$ARCHIVE_PATH"; then
-      LAST_ERROR="Legacy archive permissions could not be set."
+    if ! restrict_archive_staging; then
       return 1
     fi
+
     if [ "$DATA_EXISTS" = true ]; then
-      if ! runtime_privileged mv --no-clobber -T -- \
-        "$LEGACY_DATA_ROOT" "${ARCHIVE_PATH}/data" ||
+      if ! runtime_assert_tree_has_no_auth_token \
+        "$LEGACY_DATA_ROOT" "Legacy data" \
+        "${ARCHIVE_STAGING_PATH}/data" ||
         runtime_path_exists "$LEGACY_DATA_ROOT"; then
-        LAST_ERROR="Legacy data directory could not be atomically archived."
+        ARCHIVE_TOKEN_SCAN_STATUS="failed"
+        if runtime_path_exists "$LEGACY_DATA_ROOT" &&
+          ! runtime_path_exists "${ARCHIVE_STAGING_PATH}/data"; then
+          remove_empty_archive_staging || :
+        fi
+        LAST_ERROR="Legacy data could not be safely moved into Archive staging."
         return 1
       fi
       legacy_data_moved=1
     fi
+
     if [ "$HOME_EXISTS" = true ]; then
-      if ! runtime_privileged mv --no-clobber -T -- \
-        "$LEGACY_WECHAT_HOME_ROOT" "${ARCHIVE_PATH}/wechat-home" ||
+      if ! runtime_assert_tree_has_no_auth_token \
+        "$LEGACY_WECHAT_HOME_ROOT" "Legacy WeChat HOME" \
+        "${ARCHIVE_STAGING_PATH}/wechat-home" ||
         runtime_path_exists "$LEGACY_WECHAT_HOME_ROOT"; then
+        ARCHIVE_TOKEN_SCAN_STATUS="failed"
         if [ "$legacy_data_moved" -eq 1 ]; then
-          if ! runtime_privileged mv --no-clobber -T -- \
-            "${ARCHIVE_PATH}/data" "$LEGACY_DATA_ROOT" ||
-            runtime_path_exists "${ARCHIVE_PATH}/data"; then
-            LAST_ERROR="Legacy archive failed and data rollback also failed; inspect the preserved archive before retrying."
+          if ! runtime_assert_tree_has_no_auth_token \
+            "${ARCHIVE_STAGING_PATH}/data" "Staged legacy data rollback" \
+            "$LEGACY_DATA_ROOT" ||
+            runtime_path_exists "${ARCHIVE_STAGING_PATH}/data" ||
+            ! runtime_path_exists "$LEGACY_DATA_ROOT"; then
+            LAST_ERROR="Legacy Archive staging failed and data rollback was incomplete; inspect the preserved staging directory before retrying."
             return 1
           fi
         fi
-        LAST_ERROR="Legacy WeChat HOME could not be atomically archived; legacy data was rolled back."
+        if runtime_path_exists "$LEGACY_WECHAT_HOME_ROOT" &&
+          ! runtime_path_exists "${ARCHIVE_STAGING_PATH}/wechat-home"; then
+          if ! remove_empty_archive_staging; then
+            return 1
+          fi
+        fi
+        LAST_ERROR="Legacy WeChat HOME could not be moved into Archive staging; legacy data was rolled back."
         return 1
       fi
     fi
+    ARCHIVE_TOKEN_SCAN_STATUS="preflight_passed"
   fi
+
+  if ! runtime_assert_tree_has_no_auth_token \
+    "$ARCHIVE_STAGING_PATH" "Isolated Archive staging payload"; then
+    ARCHIVE_TOKEN_SCAN_STATUS="failed"
+    return 1
+  fi
+  ARCHIVE_TOKEN_SCAN_STATUS="verified"
   ARCHIVE_RESULT="succeeded"
   MANIFEST_AVAILABLE=1
   if ! write_manifest in_progress ""; then
-    LAST_ERROR="Archive manifest could not be initialized."
+    LAST_ERROR="Archive staging manifest could not be initialized durably."
+    return 1
+  fi
+
+  published_staging_path="$ARCHIVE_STAGING_PATH"
+  if ! publish_archive_staging; then
+    return 1
+  fi
+  if ! runtime_privileged test -d "$ARCHIVE_PATH" ||
+    runtime_path_exists "$published_staging_path"; then
+    LAST_ERROR="Published Archive did not reach its required final state."
     return 1
   fi
 }
 
 create_fresh_runtime() {
   if ! runtime_privileged install -d \
-    -o "$RUNTIME_UID" -g "$RUNTIME_GID" -m "$RUNTIME_MODE" \
+    -o "$RUNTIME_DEFAULT_UID" -g "$RUNTIME_DEFAULT_GID" -m "$RUNTIME_DEFAULT_MODE" \
     "$RUNTIME_ROOT"; then
     LAST_ERROR="Fresh runtime root could not be created."
     return 1
   fi
   if ! runtime_privileged install -d \
-    -o "$DATA_UID" -g "$DATA_GID" -m "$DATA_MODE" \
+    -o "$RUNTIME_DEFAULT_UID" -g "$RUNTIME_DEFAULT_GID" -m "$RUNTIME_DEFAULT_MODE" \
     "${RUNTIME_ROOT}/data"; then
     LAST_ERROR="Fresh runtime data directory could not be created."
     return 1
   fi
   if ! runtime_privileged install -d \
-    -o "$HOME_UID" -g "$HOME_GID" -m "$HOME_MODE" \
+    -o "$RUNTIME_DEFAULT_UID" -g "$RUNTIME_DEFAULT_GID" -m "$RUNTIME_DEFAULT_MODE" \
     "${RUNTIME_ROOT}/wechat-home"; then
     LAST_ERROR="Fresh WeChat HOME directory could not be created."
     return 1
   fi
+  runtime_validate_approved_runtime_directory \
+    "$RUNTIME_ROOT" "Fresh runtime root" 1 || return 1
+  runtime_validate_approved_runtime_directory \
+    "${RUNTIME_ROOT}/data" "Fresh runtime data" 1 || return 1
+  runtime_validate_approved_runtime_directory \
+    "${RUNTIME_ROOT}/wechat-home" "Fresh Runtime WeChat HOME" 1 || return 1
 }
 
 wait_for_clean_auth() {
@@ -552,7 +1132,7 @@ wait_for_verified_runtime() {
 validate_login_start_response() {
   local response="$1"
 
-  printf '%s' "$response" | "$PYTHON_BIN" -c '
+  printf '%s' "$response" | run_isolated_python -c '
 import json
 import sys
 
@@ -589,7 +1169,7 @@ run_forced_login() {
     return 1
   fi
   unset login_response
-  if ! printf '%s' "$AUTH_TOKEN" | "$LOGIN_PYTHON" \
+  if ! printf '%s' "$AUTH_TOKEN" | run_login_python \
     "${SCRIPT_DIR}/qr_login.py" \
     --listen \
     --url "$WS_URL" \
@@ -665,20 +1245,15 @@ main() {
     error "$LAST_ERROR"
     return 1
   fi
+  if ! validate_configuration; then
+    error "$LAST_ERROR"
+    return 1
+  fi
   if [ "$DRY_RUN" -eq 1 ]; then
     print_dry_run
     return 0
   fi
   if ! runtime_acquire_lock; then
-    error "$LAST_ERROR"
-    return 1
-  fi
-  if [ ! -f "${SCRIPT_DIR}/qr_login.py" ]; then
-    error "QR login helper is missing."
-    return 1
-  fi
-  FLOW_PHASE="prepare_login_environment"
-  if ! ensure_login_environment; then
     error "$LAST_ERROR"
     return 1
   fi
@@ -691,6 +1266,51 @@ main() {
     return 1
   fi
   WORKER_STOP_CONFIRMED=1
+
+  FLOW_PHASE="verify_gateway_contract"
+  if ! runtime_verify_gateway_contract; then
+    error "$LAST_ERROR"
+    return 1
+  fi
+
+  FLOW_PHASE="archive_preflight"
+  if ! runtime_check_archive_capacity; then
+    error "$LAST_ERROR"
+    return 1
+  fi
+  if [ "$CF_AGENT_WECHAT_TESTING" = "1" ]; then
+    if ! runtime_privileged_isolated_python "$ARCHIVE_TOOL_TIMEOUT" "$ARCHIVE_RUNTIME_TOOL" \
+      --env-owner-uid "$AGENT_ENV_APPROVED_UID" \
+      --env-owner-gid "$AGENT_ENV_APPROVED_GID" \
+      --env-mode "$AGENT_ENV_APPROVED_MODE" \
+      --operator-uid "$(id -u)" \
+      --operator-gid "$(id -g)" \
+      --testing-env-file "$AGENT_ENV_FILE" inventory; then
+      LAST_ERROR="Archive inventory could not be completed safely."
+      error "$LAST_ERROR"
+      return 1
+    fi
+  elif ! runtime_privileged_isolated_python "$ARCHIVE_TOOL_TIMEOUT" "$ARCHIVE_RUNTIME_TOOL" \
+    --env-owner-uid "$AGENT_ENV_APPROVED_UID" \
+    --env-owner-gid "$AGENT_ENV_APPROVED_GID" \
+    --env-mode "$AGENT_ENV_APPROVED_MODE" \
+    --operator-uid "$(id -u)" \
+    --operator-gid "$(id -g)" \
+    inventory; then
+    LAST_ERROR="Archive inventory could not be completed safely."
+    error "$LAST_ERROR"
+    return 1
+  fi
+
+  if [ ! -f "${SCRIPT_DIR}/qr_login.py" ]; then
+    error "QR login helper is missing."
+    return 1
+  fi
+  FLOW_PHASE="prepare_login_environment"
+  if ! ensure_login_environment; then
+    error "$LAST_ERROR"
+    return 1
+  fi
 
   FLOW_PHASE="load_auth_token"
   if ! load_auth_token; then
@@ -777,6 +1397,14 @@ main() {
     return 1
   fi
 
+  # From this point, a Gateway checker failure preserves the verified fresh
+  # Agent runtime as evidence while the EXIT guard revokes the Worker.
+  AGENT_CLEANUP_GUARD=0
+  FLOW_PHASE="revalidate_gateway_contract"
+  if ! runtime_verify_gateway_contract; then
+    error "$LAST_ERROR"
+    return 1
+  fi
   FLOW_PHASE="start_gateway_worker"
   if ! start_gateway_worker; then
     error "$LAST_ERROR"

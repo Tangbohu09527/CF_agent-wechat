@@ -20,6 +20,12 @@ NO_QR_DATA = 4
 MAX_TOKEN_BYTES = 8192
 MAX_EXTERNAL_MESSAGE_LENGTH = 240
 MIN_QR_MATRIX_SIZE = 29
+PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+MAX_QR_IMAGE_BYTES = 1024 * 1024
+MAX_QR_BASE64_CHARS = ((MAX_QR_IMAGE_BYTES + 2) // 3) * 4
+MAX_QR_IMAGE_DIMENSION = 2048
+MAX_QR_IMAGE_PIXELS = 4_000_000
+
 
 
 class LoginToolError(Exception):
@@ -100,9 +106,27 @@ def _matrix_from_image(image_bytes: bytes) -> list[list[bool]]:
 
     try:
         with Image.open(io.BytesIO(image_bytes)) as image:
+            if image.format != "PNG":
+                raise LoginToolError("二维码图片必须是 PNG 格式。")
+            width, height = image.size
+            if width < 1 or height < 1:
+                raise LoginToolError("二维码图片尺寸无效。")
+            if width > MAX_QR_IMAGE_DIMENSION or height > MAX_QR_IMAGE_DIMENSION:
+                raise LoginToolError("二维码图片尺寸超过安全限制。")
+            if width * height > MAX_QR_IMAGE_PIXELS:
+                raise LoginToolError("二维码图片像素数超过安全限制。")
+            if getattr(image, "n_frames", 1) != 1:
+                raise LoginToolError("二维码图片不能包含多个图像帧。")
             image.load()
             grayscale = ImageOps.autocontrast(image.convert("L"))
-    except (UnidentifiedImageError, OSError) as exc:
+    except LoginToolError:
+        raise
+    except (
+        UnidentifiedImageError,
+        Image.DecompressionBombError,
+        OSError,
+        ValueError,
+    ) as exc:
         raise LoginToolError("输入数据不是有效的二维码图片。") from exc
 
     max_width = _terminal_qr_width()
@@ -130,16 +154,26 @@ def _decode_png_base64(value: str) -> bytes:
     payload = value.strip()
     if payload.startswith("data:"):
         header, separator, payload = payload.partition(",")
-        if not separator or ";base64" not in header.lower():
-            raise LoginToolError("二维码 data URL 不是 Base64 图片。")
+        if not separator or header.lower() != "data:image/png;base64":
+            raise LoginToolError("二维码 data URL 必须是 Base64 PNG 图片。")
 
+    if len(payload) > MAX_QR_BASE64_CHARS:
+        raise LoginToolError("二维码 Base64 数据超过编码长度限制。")
     compact = "".join(payload.split())
     if not compact:
         raise LoginToolError("二维码 Base64 数据为空。")
+    if len(compact) > MAX_QR_BASE64_CHARS:
+        raise LoginToolError("二维码 Base64 数据超过编码长度限制。")
     try:
-        return base64.b64decode(compact, validate=True)
+        decoded = base64.b64decode(compact, validate=True)
     except (binascii.Error, ValueError) as exc:
         raise LoginToolError("二维码 Base64 数据无效。") from exc
+    if len(decoded) > MAX_QR_IMAGE_BYTES:
+        raise LoginToolError("二维码 PNG 数据超过解码长度限制。")
+    if not decoded.startswith(PNG_SIGNATURE):
+        raise LoginToolError("二维码图片缺少有效的 PNG 签名。")
+    return decoded
+
 
 
 def render_png_base64(value: str, forbidden_value: str = "") -> None:
@@ -326,16 +360,20 @@ def listen_for_login(
     deadline = time.monotonic() + timeout_ms / 1000
     socket_timeout = max(0.1, timeout_ms / 1000)
 
+    connection_error = None
     try:
         connection = websocket.create_connection(
             _login_url(url, timeout_ms, new_account),
             header=headers,
             timeout=socket_timeout,
             http_no_proxy=["*"],
+            redirect_limit=0,
         )
     except Exception as exc:
         detail = _safe_external_message(exc, token) or "外部连接失败。"
-        raise LoginToolError(f"无法连接登录 WebSocket：{detail}") from exc
+        connection_error = f"无法连接登录 WebSocket：{detail}"
+    if connection_error is not None:
+        raise LoginToolError(connection_error) from None
 
     qr_rendered = False
     try:
@@ -347,22 +385,29 @@ def listen_for_login(
                 )
             set_timeout = getattr(connection, "settimeout", None)
             if callable(set_timeout):
+                set_timeout_error = None
                 try:
                     set_timeout(max(0.1, remaining))
                 except Exception as exc:
                     detail = _safe_external_message(exc, token) or "外部调用失败。"
-                    raise LoginToolError(
+                    set_timeout_error = (
                         f"无法设置登录 WebSocket 超时：{detail}"
-                    ) from exc
+                    )
+                if set_timeout_error is not None:
+                    raise LoginToolError(set_timeout_error) from None
+            recv_error = None
             try:
                 raw_event = connection.recv()
             except Exception as exc:
                 if time.monotonic() >= deadline:
-                    raise LoginToolError(
+                    recv_error = (
                         "登录超时，请重新执行 ./scripts/start-qr-login.sh。"
-                    ) from exc
-                detail = _safe_external_message(exc, token) or "外部读取失败。"
-                raise LoginToolError(f"读取登录事件失败：{detail}") from exc
+                    )
+                else:
+                    detail = _safe_external_message(exc, token) or "外部读取失败。"
+                    recv_error = f"读取登录事件失败：{detail}"
+            if recv_error is not None:
+                raise LoginToolError(recv_error) from None
             if raw_event in (None, "", b""):
                 if require_current_ws_qr and not qr_rendered:
                     raise LoginToolError(
@@ -374,15 +419,21 @@ def listen_for_login(
                     "请重新执行 ./scripts/start-qr-login.sh。"
                 )
             if isinstance(raw_event, bytes):
+                decode_error = False
                 try:
                     raw_event = raw_event.decode("utf-8")
-                except UnicodeDecodeError as exc:
-                    raise LoginToolError("登录事件不是 UTF-8 JSON。") from exc
+                except UnicodeDecodeError:
+                    decode_error = True
+                if decode_error:
+                    raise LoginToolError("登录事件不是 UTF-8 JSON。") from None
 
+            json_error = False
             try:
                 event = json.loads(raw_event)
-            except (json.JSONDecodeError, TypeError, UnicodeDecodeError) as exc:
-                raise LoginToolError("收到无法解析的登录事件。") from exc
+            except (json.JSONDecodeError, TypeError, UnicodeDecodeError):
+                json_error = True
+            if json_error:
+                raise LoginToolError("收到无法解析的登录事件。") from None
             if not isinstance(event, dict):
                 raise LoginToolError("收到格式错误的登录事件。")
 
