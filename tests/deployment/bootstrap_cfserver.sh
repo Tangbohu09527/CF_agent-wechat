@@ -406,7 +406,7 @@ expect_failure 'production environment file must be owned by root or the fixed m
 pass "unapproved docker/.env owner is rejected"
 
 prepare_fixture env-assignment
-printf '%s%s\n' 'PROXY=$' '(printf unsafe)' >> "$AGENT_ENV"
+sed -i 's|^PROXY=.*|PROXY=$(printf unsafe)|' "$AGENT_ENV"
 expect_failure 'production environment values must be unquoted, literal, and whitespace-free'
 [ ! -e "$STORAGE_ROOT" ] || fail "unsafe dotenv assignment mutated deployment state"
 pass "unsafe docker/.env assignment is rejected without evaluation"

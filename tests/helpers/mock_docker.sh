@@ -205,9 +205,12 @@ case "$command_name" in
       printf '{"services":{"agent-wechat":{'
       printf '"image":"ghcr.io/example/agent-wechat@sha256:%064d",' 0
       printf '"restart":"no",'
-      printf '"ports":[{"target":6174,"published":"6174","host_ip":"127.0.0.1"}],'
+      printf '"ports":[{"target":6174,"published":"6174","host_ip":"127.0.0.1","protocol":"tcp"}],'
       printf '"networks":{"cf-internal":{"aliases":["cf-agent-wechat"]}},'
-      printf '"healthcheck":{"test":["CMD","curl"]},'
+      printf '"environment":{"ENABLE_VNC":"0"},'
+      printf '"healthcheck":{'
+      printf '"test":["CMD","curl","--fail","--silent","--show-error","http://127.0.0.1:6174/health"],'
+      printf '"interval":"30s","timeout":"5s","retries":5,"start_period":"1m30s"},'
       printf '"security_opt":["seccomp=unconfined"],'
       printf '"cap_add":["SYS_PTRACE"],'
       printf '"logging":{"driver":"json-file","options":{"max-size":"20m","max-file":"3"}},'
@@ -218,7 +221,7 @@ case "$command_name" in
         "${CF_AGENT_WECHAT_RUNTIME_ROOT:?}"
       printf '{"type":"bind","source":"%s","target":"/data/auth-token","read_only":true}' \
         "${TOKEN_FILE:?}"
-      printf '%s\n' ']}}}'
+      printf '%s\n' ']}},"networks":{"cf-internal":{"external":true,"name":"cf-internal"}}}'
     elif printf '%s\n' "$@" | grep -qx -- '--services'; then
       printf '%s\n' 'wechat-worker'
     fi

@@ -535,6 +535,7 @@ assert_runtime_mock_requires_sudo inspect inspect "$TEST_CONTAINER"
 printf 'PASS runtime Docker mock requires the sudo fallback\n'
 
 reset_audit
+CLEANUP_ERROR="${TEST_ROOT}/cleanup.err"
 if ! CLEANUP_OUTPUT="$("$REAL_SUDO" -u "$TEST_USER" -H env \
   PATH="$AUDIT_PATH" \
   CF_AUDIT_LOG="$AUDIT_LOG" \
@@ -558,12 +559,15 @@ printf "%s:%s:%s\n" \
   "$AGENT_FAILURE_CLEANUP_ATTEMPTED" \
   "$AGENT_FAILURE_CLEANUP_STOP_RESULT" \
   "$AGENT_FAILURE_CLEANUP_REMOVE_RESULT"
-' cf-agent-wechat-test "$TEST_REPO" 2>&1)"; then
+' cf-agent-wechat-test "$TEST_REPO" 2>"$CLEANUP_ERROR")"; then
+  print_redacted_file "$CLEANUP_ERROR"
   printf '%s\n' "$CLEANUP_OUTPUT" >&2
   fail "failed-agent cleanup did not use the sudo Docker fallback"
 fi
 [ "$CLEANUP_OUTPUT" = "true:succeeded:succeeded" ] ||
   fail "failed-agent cleanup returned unexpected results"
+[ -s "$CLEANUP_ERROR" ] ||
+  fail "failed-agent cleanup did not emit the sudo authorization prompt"
 [ "$(cat "$AGENT_STATE_FILE")" = "absent" ] ||
   fail "failed-agent cleanup left a restartable container"
 [ "$(audit_count sudo docker-info)" -eq 3 ] ||
@@ -579,6 +583,7 @@ assert_no_sudo_python "failed-agent cleanup"
 CLEANUP_OUTPUT_FILE="${TEST_ROOT}/cleanup.out"
 printf '%s\n' "$CLEANUP_OUTPUT" > "$CLEANUP_OUTPUT_FILE"
 assert_file_has_no_token "$CLEANUP_OUTPUT_FILE"
+assert_file_has_no_token "$CLEANUP_ERROR"
 assert_file_has_no_token "$AUDIT_LOG"
 printf 'PASS failed-agent cleanup with sudo Docker fallback\n'
 
