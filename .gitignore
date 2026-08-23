@@ -12,4 +12,7 @@ id_ed25519
 auth-token
 
 # External upstream dependency; not redistributed by this repository.
+__pycache__/
+*.py[cod]
+
 agent-wechat/
