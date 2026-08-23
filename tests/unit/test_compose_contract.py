@@ -18,8 +18,11 @@ class ComposeContractTests(unittest.TestCase):
         cls.content = COMPOSE_FILE.read_text(encoding="utf-8")
 
     def test_manual_restart_policy_and_rotating_runtime_mounts(self) -> None:
-        self.assertIn('restart: "on-failure:3"', self.content)
-        self.assertNotRegex(self.content, r"restart:\s*(always|unless-stopped)")
+        self.assertIn('restart: "no"', self.content)
+        self.assertNotRegex(
+            self.content,
+            r"restart:\s*(always|unless-stopped|on-failure)",
+        )
         self.assertIn(
             'source: "${CF_AGENT_WECHAT_RUNTIME_ROOT:'
             '-/srv/storage/cf-agent-wechat/runtime}/data"',
@@ -53,7 +56,9 @@ class ComposeContractTests(unittest.TestCase):
             "driver: json-file",
             'max-size: "20m"',
             'max-file: "3"',
-            "- cf-internal",
+            "cf-internal:",
+            "aliases:",
+            "- cf-agent-wechat",
             "external: true",
             "name: cf-internal",
         )
