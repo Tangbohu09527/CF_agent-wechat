@@ -6,6 +6,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shlex
 import shutil
 import stat
 import subprocess
@@ -72,6 +73,7 @@ class RuntimeFixture:
         self.gateway_compose = self.gateway_dir / "compose.yaml"
         self.gateway_env = self.gateway_dir / ".env"
         self.fake_bin = self.root / "bin"
+        self.gateway_heartbeat = self.gateway_dir / "check-wechat-worker-heartbeat"
         self.docker_state = self.root / "docker-state"
         self.home = self.root / "home"
         self.auth_state = self.root / "auth-state"
@@ -106,7 +108,7 @@ class RuntimeFixture:
         )
         os.chmod(self.storage, 0o755)
         os.chmod(self.runtime, 0o751)
-        os.chmod(self.runtime / "data", 0o731)
+        os.chmod(self.runtime / "data", 0o750)
         os.chmod(self.runtime / "wechat-home", 0o711)
 
         self.secrets.mkdir()
@@ -118,7 +120,22 @@ class RuntimeFixture:
         self.gateway_dir.mkdir()
         self.agent_compose.write_text("services: {}\n", encoding="utf-8")
         self.agent_env.write_text(
-            f"AGENT_ENV_FIXTURE={self.agent_env_sentinel}\n",
+            "\n".join(
+                (
+                    "COMPOSE_PROJECT_NAME=cf-agent-wechat",
+                    "AGENT_WECHAT_IMAGE=ghcr.io/example/agent-wechat@sha256:"
+                    + ("0" * 64),
+                    "AGENT_WECHAT_CONTAINER_NAME=agent-wechat-fixture",
+                    f"CF_AGENT_WECHAT_STORAGE_ROOT={self.storage}",
+                    f"CF_AGENT_WECHAT_RUNTIME_ROOT={self.runtime}",
+                    f"CF_AGENT_WECHAT_ARCHIVE_ROOT={self.archive}",
+                    "AGENT_WECHAT_BIND_IP=127.0.0.1",
+                    "AGENT_WECHAT_PORT=6174",
+                    f"PROXY=http://{self.agent_env_sentinel}.invalid",
+                    "RUST_LOG=info",
+                    "",
+                )
+            ),
             encoding="utf-8",
         )
         os.chmod(self.agent_env, 0o600)
@@ -127,11 +144,20 @@ class RuntimeFixture:
             self.gateway_env_sentinel + "\n", encoding="utf-8"
         )
         os.chmod(self.gateway_env, 0o600)
+        self.gateway_heartbeat.write_text(
+            "#!/bin/sh\n"
+            "set -eu\n"
+            'test "$(cat "$MOCK_DOCKER_STATE_DIR/worker_heartbeat")" '
+            '= "healthy"\n',
+            encoding="utf-8",
+        )
+        os.chmod(self.gateway_heartbeat, 0o755)
         self.fake_bin.mkdir()
         self.docker_state.mkdir()
         self.home.mkdir()
         for name, value in {
             "gateway_running": "1",
+            "worker_heartbeat": "healthy",
             "agent_exists": "1",
             "agent_running": "1",
             "wechat_mode": "stable",
@@ -201,9 +227,14 @@ class RuntimeFixture:
                 "CF_AGENT_WECHAT_RUNTIME_MODE": "700",
                 "SERVER_READY_TIMEOUT": "3",
                 "WECHAT_READY_TIMEOUT": "3",
+                "CF_AGENT_GATEWAY_HEARTBEAT_COMMAND": str(self.gateway_heartbeat),
                 "WECHAT_STABLE_SECONDS": "1",
                 "POST_LOGIN_READY_TIMEOUT": "3",
                 "RUNTIME_POLL_INTERVAL": "1",
+                "DOCKER_COMMAND_TIMEOUT": "3",
+                "COMPOSE_COMMAND_TIMEOUT": "3",
+                "WORKER_READY_TIMEOUT": "3",
+                "WORKER_STABLE_SECONDS": "0",
                 "HTTP_CONNECT_TIMEOUT": "1",
                 "HTTP_TIMEOUT": "2",
                 "LOGIN_TIMEOUT_MS": "2000",
@@ -292,7 +323,7 @@ class RuntimeFixture:
 
     def simulate_docker_daemon_restart(self) -> None:
         if self.read_state("agent_exists") == "1":
-            self.write_state("agent_running", "1")
+            self.write_state("agent_running", "0")
 
     def create_legacy_layout(self, remove_runtime: bool = False) -> None:
         if remove_runtime:
@@ -307,7 +338,7 @@ class RuntimeFixture:
         (legacy_home / "legacy-home.marker").write_text(
             "legacy home\n", encoding="utf-8"
         )
-        os.chmod(legacy_data, 0o735)
+        os.chmod(legacy_data, 0o750)
         os.chmod(legacy_home, 0o715)
 
     def run(
@@ -321,6 +352,7 @@ class RuntimeFixture:
         if trace:
             command.append("-x")
         command.extend([str(SCRIPTS / script), *arguments])
+        command = ["script", "-qefc", shlex.join(command), "/dev/null"]
         return subprocess.run(
             command,
             cwd=REPO_ROOT,
@@ -333,8 +365,9 @@ class RuntimeFixture:
         )
 
     def popen(self, script: str, *arguments: str) -> subprocess.Popen[str]:
+        command = ["bash", str(SCRIPTS / script), *arguments]
         process = subprocess.Popen(
-            ["bash", str(SCRIPTS / script), *arguments],
+            ["script", "-qefc", shlex.join(command), "/dev/null"],
             cwd=REPO_ROOT,
             env=self.env,
             text=True,
@@ -481,6 +514,7 @@ class ForcedQrRuntimeTests(unittest.TestCase):
         self.assertTrue(manifest_path.is_file())
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         self.assertEqual(manifest["result"], "failed")
+        self.assertEqual(manifest["archiveResult"], "succeeded")
         self.assertEqual(manifest["phase"], expected_phase)
         self.assertTrue(manifest["endedAtUtc"])
         self.assertEqual(
@@ -561,6 +595,23 @@ class ForcedQrRuntimeTests(unittest.TestCase):
             agent_env_calls_before_stop,
         )
 
+    def test_real_start_rejects_non_tty_before_any_mutation(self) -> None:
+        before = tree_digest(self.fixture.storage)
+        result = subprocess.run(
+            ["bash", str(SCRIPTS / "start-qr-login.sh")],
+            cwd=REPO_ROOT,
+            env=self.fixture.env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=10,
+            check=False,
+        )
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("interactive controlled terminal", result.stdout)
+        self.assertEqual(tree_digest(self.fixture.storage), before)
+        self.assertEqual(self.fixture.mutation_lines(), [])
+
     def test_success_archives_atomically_preserves_permissions_and_gates_worker(
         self,
     ) -> None:
@@ -587,7 +638,7 @@ class ForcedQrRuntimeTests(unittest.TestCase):
         self.assertFalse((self.fixture.runtime / "data" / "old-state.marker").exists())
         self.assertEqual(stat.S_IMODE(self.fixture.runtime.stat().st_mode), 0o751)
         self.assertEqual(
-            stat.S_IMODE((self.fixture.runtime / "data").stat().st_mode), 0o731
+            stat.S_IMODE((self.fixture.runtime / "data").stat().st_mode), 0o750
         )
         self.assertEqual(
             stat.S_IMODE(
@@ -600,13 +651,21 @@ class ForcedQrRuntimeTests(unittest.TestCase):
             (archived / "manifest.json").read_text(encoding="utf-8")
         )
         self.assertEqual(manifest["result"], "success")
+        self.assertEqual(manifest["archiveResult"], "succeeded")
+        self.assertEqual(manifest["schemaVersion"], 1)
+        self.assertEqual(manifest["sourcePaths"], [str(self.fixture.runtime)])
+        self.assertRegex(
+            manifest["imageDigest"],
+            r"@sha256:[0-9a-f]{64}$",
+        )
+        self.assertFalse(manifest["sensitiveData"]["tokenIncluded"])
         self.assertTrue(manifest["startedAtUtc"])
         self.assertTrue(manifest["endedAtUtc"])
         self.assertEqual(
             manifest["originalPermissions"]["runtime"]["mode"], "751"
         )
         self.assertEqual(
-            manifest["originalPermissions"]["data"]["mode"], "731"
+            manifest["originalPermissions"]["data"]["mode"], "750"
         )
         self.assertEqual(
             manifest["originalPermissions"]["wechatHome"]["mode"], "711"
@@ -663,6 +722,37 @@ class ForcedQrRuntimeTests(unittest.TestCase):
         self.assertIn("WeChat Process:\n  running", traced_status.stdout)
         self.fixture.assert_no_sensitive_text(self, traced_status.stdout)
 
+    def test_existing_logged_in_state_still_runs_fresh_qr(self) -> None:
+        self.fixture.auth_state.write_text("logged_in\n", encoding="ascii")
+        result = self.fixture.run("start-qr-login.sh")
+        self.assert_succeeded(result)
+        self.assertIn("扫描二维码", result.stdout)
+        self.assertIn(
+            "QR login new-account=true",
+            self.fixture.login_log.read_text(encoding="utf-8"),
+        )
+        self.assertEqual(self.fixture.read_state("gateway_running"), "1")
+
+    def test_repeated_daemon_initialization_does_not_restore_agent(self) -> None:
+        result = self.fixture.run("start-qr-login.sh")
+        self.assert_succeeded(result)
+        self.fixture.simulate_docker_daemon_restart()
+        self.assertEqual(self.fixture.read_state("agent_exists"), "1")
+        self.assertEqual(self.fixture.read_state("agent_running"), "0")
+        self.fixture.simulate_docker_daemon_restart()
+        self.assertEqual(self.fixture.read_state("agent_running"), "0")
+
+    def test_live_restore_is_rejected_before_lifecycle_mutation(self) -> None:
+        self.fixture.write_state("live_restore", "true")
+        before = tree_digest(self.fixture.storage)
+
+        result = self.fixture.run("start-qr-login.sh")
+
+        self.assert_failed(result)
+        self.assertIn("live-restore", result.stdout)
+        self.assertEqual(tree_digest(self.fixture.storage), before)
+        self.assertEqual(self.fixture.mutation_lines(), [])
+
     def test_first_start_archives_the_complete_legacy_layout(self) -> None:
         self.fixture.create_legacy_layout(remove_runtime=True)
         token_file = self.fixture.secrets / "auth-token"
@@ -685,7 +775,7 @@ class ForcedQrRuntimeTests(unittest.TestCase):
         self.assertFalse((self.fixture.storage / "wechat-home").exists())
         self.assertEqual(
             stat.S_IMODE((self.fixture.runtime / "data").stat().st_mode),
-            0o735,
+            0o750,
         )
         self.assertEqual(
             stat.S_IMODE(
@@ -746,6 +836,7 @@ class ForcedQrRuntimeTests(unittest.TestCase):
             (failed_archive / "manifest.json").read_text(encoding="utf-8")
         )
         self.assertEqual(failed_manifest["result"], "failed")
+        self.assertEqual(failed_manifest["archiveResult"], "failed")
         failed_digest = tree_digest(failed_archive)
 
         second = self.fixture.run("start-qr-login.sh")
@@ -1120,7 +1211,7 @@ class ForcedQrRuntimeTests(unittest.TestCase):
 
         self.fixture.simulate_docker_daemon_restart()
         self.assertEqual(self.fixture.read_state("agent_exists"), "1")
-        self.assertEqual(self.fixture.read_state("agent_running"), "1")
+        self.assertEqual(self.fixture.read_state("agent_running"), "0")
 
     def test_success_manifest_failure_rolls_back_worker_and_agent(self) -> None:
         manifest_path = (
@@ -1326,26 +1417,29 @@ class ForcedQrRuntimeTests(unittest.TestCase):
             self.fixture.mutation_lines().count("gateway worker start"), 1
         )
 
-    def test_login_force_qr_rejects_dirty_runtime_and_passes_new_account(self) -> None:
-        success = self.fixture.run("login.sh", "--force-qr")
+    def test_login_wrapper_always_runs_the_fresh_lifecycle(self) -> None:
+        self.fixture.auth_state.write_text("logged_in\n", encoding="ascii")
+        success = self.fixture.run("login.sh")
         self.assert_succeeded(success)
+        self.assertIn("compatibility wrapper", success.stdout)
         self.assertIn("扫描二维码", success.stdout)
         self.assertIn(
             "QR login new-account=true", self.fixture.login_log.read_text()
         )
-        self.fixture.assert_no_sensitive_text(self, success.stdout)
-
-        self.fixture.audit_log.write_text("", encoding="utf-8")
-        self.fixture.login_log.write_text("", encoding="utf-8")
-        dirty = self.fixture.run("login.sh", "--force-qr")
-        self.assert_failed(dirty)
-        self.assertIn(
-            "runtime is not clean; use start-qr-login.sh", dirty.stdout
+        archives = self.fixture.archive_dirs()
+        self.assertEqual(len(archives), 1)
+        self.assertTrue((archives[0] / "data" / "old-state.marker").is_file())
+        self.assertEqual(
+            self.fixture.mutation_lines(),
+            [
+                "gateway worker stop",
+                "agent container stop",
+                "agent container remove",
+                "agent container start",
+                "gateway worker start",
+            ],
         )
-        audit = self.fixture.audit_log.read_text(encoding="utf-8")
-        self.assertNotIn("POST /api/status/login", audit)
-        self.assertNotIn("logout", audit.lower())
-        self.assertEqual(self.fixture.login_log.read_text(), "")
+        self.fixture.assert_no_sensitive_text(self, success.stdout)
 
     def test_status_requires_process_auth_and_readable_chats(self) -> None:
         self.fixture.auth_state.write_text("logged_in\n", encoding="ascii")
@@ -1432,6 +1526,58 @@ class ForcedQrRuntimeTests(unittest.TestCase):
         self.assertIn("Runtime:\n  preserved", repeated.stdout)
         self.assertIn("Token:\n  preserved", repeated.stdout)
         self.assertIn("Session Archives:\n  preserved", repeated.stdout)
+
+
+    def test_runtime_containing_token_is_never_archived(self) -> None:
+        leaked_file = self.fixture.runtime / "data" / "unsafe-token-copy"
+        leaked_file.write_text(self.fixture.token, encoding="utf-8")
+
+        result = self.fixture.run("start-qr-login.sh")
+
+        self.assert_failed(result)
+        self.assertIn("auth-token bytes", result.stdout)
+        self.assertEqual(self.fixture.archive_dirs(), [])
+        self.assertTrue(leaked_file.is_file())
+        self.assertEqual(self.fixture.read_state("gateway_running"), "0")
+        self.assertEqual(self.fixture.read_state("agent_exists"), "0")
+        self.assertNotIn(
+            "gateway worker start", self.fixture.mutation_lines()
+        )
+
+
+    def test_login_start_error_envelopes_block_websocket_and_worker(
+        self,
+    ) -> None:
+        for index, mode in enumerate(
+            ("http_error", "api_error", "invalid", "rejected")
+        ):
+            if index:
+                self.fixture.close()
+                self.fixture = RuntimeFixture(
+                    f"{self._testMethodName}-{mode}"
+                )
+            with self.subTest(mode=mode):
+                self.fixture.set_scenario(login_request_mode=mode)
+                result = self.fixture.run("start-qr-login.sh")
+                manifest = self.assert_failed_lifecycle_cleanup(
+                    result, "force_qr_login"
+                )
+                self.assertEqual(manifest["archiveResult"], "succeeded")
+                self.assertEqual(self.fixture.login_log.read_text(), "")
+                self.assertIn(
+                    "Fresh QR login API", result.stdout
+                )
+
+    def test_worker_heartbeat_failure_revokes_worker_release(self) -> None:
+        self.fixture.write_state("worker_heartbeat", "unhealthy")
+
+        result = self.fixture.run("start-qr-login.sh")
+
+        manifest = self.assert_failed_lifecycle_cleanup(
+            result, "start_gateway_worker", worker_started=True
+        )
+        self.assertEqual(manifest["archiveResult"], "succeeded")
+        self.assertIn("heartbeat", result.stdout.lower())
 
 
 if __name__ == "__main__":

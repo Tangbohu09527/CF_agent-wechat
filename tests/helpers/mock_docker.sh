@@ -41,6 +41,21 @@ require_process_contract_fragment() {
 case "${1:-}" in
   info)
     record "docker info"
+    if [[ " $* " == *LiveRestoreEnabled* ]]; then
+      state_get live_restore false
+      printf '\n'
+    elif printf '%s\n' "$@" | grep -q -- '--format'; then
+      printf '%s\n' '["name=seccomp,profile=default","name=cgroupns"]'
+    fi
+    exit 0
+    ;;
+  context)
+    record "docker context"
+    case "${2:-}" in
+      show) printf '%s\n' 'default' ;;
+      inspect) printf '%s\n' 'unix:///var/run/docker.sock' ;;
+      *) exit 64 ;;
+    esac
     exit 0
     ;;
   exec)
@@ -107,6 +122,14 @@ case "${1:-}" in
     ;;
   inspect)
     record "docker inspect"
+    if printf '%s\n' "$@" | grep -q '.State.Health'; then
+      if [ "$(state_get container_health healthy)" = "healthy" ]; then
+        printf '%s\n' 'healthy'
+      else
+        printf '%s\n' "$(state_get container_health unhealthy)"
+      fi
+      exit 0
+    fi
     if printf '%s\n' "$@" | grep -q '{{.State.Running}}'; then
       if [ "$(state_get agent_running 1)" = "1" ]; then
         printf '%s\n' 'true'
@@ -179,7 +202,16 @@ case "$command_name" in
     record "$compose_kind compose config"
     if [ "$compose_kind" = "agent" ] &&
       [ "$*" = "--format json" ]; then
-      printf '{"services":{"agent-wechat":{"volumes":['
+      printf '{"services":{"agent-wechat":{'
+      printf '"image":"ghcr.io/example/agent-wechat@sha256:%064d",' 0
+      printf '"restart":"no",'
+      printf '"ports":[{"target":6174,"published":"6174","host_ip":"127.0.0.1"}],'
+      printf '"networks":{"cf-internal":{"aliases":["cf-agent-wechat"]}},'
+      printf '"healthcheck":{"test":["CMD","curl"]},'
+      printf '"security_opt":["seccomp=unconfined"],'
+      printf '"cap_add":["SYS_PTRACE"],'
+      printf '"logging":{"driver":"json-file","options":{"max-size":"20m","max-file":"3"}},'
+      printf '"volumes":['
       printf '{"type":"bind","source":"%s/data","target":"/data","read_only":false},' \
         "${CF_AGENT_WECHAT_RUNTIME_ROOT:?}"
       printf '{"type":"bind","source":"%s/wechat-home","target":"/home/wechat","read_only":false},' \
@@ -261,6 +293,7 @@ case "$command_name" in
       state_set agent_running 1
       state_set agent_started_once 1
       state_set wechat_calls 0
+      printf '%s\n' 'logged_out' > "${MOCK_AUTH_STATE_FILE:?}"
       printf '%s\n' 'agent runtime evidence' > \
         "${CF_AGENT_WECHAT_RUNTIME_ROOT:?}/data/agent-runtime.log"
     fi

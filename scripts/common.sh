@@ -15,6 +15,7 @@ CONTAINER_NAME="${CONTAINER_NAME:-${AGENT_WECHAT_CONTAINER_NAME:-cf-agent-wechat
 
 HTTP_CONNECT_TIMEOUT="${HTTP_CONNECT_TIMEOUT:-5}"
 HTTP_TIMEOUT="${HTTP_TIMEOUT:-45}"
+DOCKER_READ_TIMEOUT="${DOCKER_READ_TIMEOUT:-20}"
 LOGIN_TIMEOUT_MS="${LOGIN_TIMEOUT_MS:-300000}"
 LOGIN_CONFIRM_RETRIES="${LOGIN_CONFIRM_RETRIES:-5}"
 LOGIN_CONFIRM_INTERVAL="${LOGIN_CONFIRM_INTERVAL:-2}"
@@ -43,9 +44,28 @@ export -n AUTH_TOKEN
 AUTH_STATUS=""
 LAST_ERROR=""
 LOGIN_PYTHON=""
+SUDO_AUTHORIZED=0
 
 error() {
   printf '错误：%s\n' "$*" >&2
+}
+
+authorize_management_sudo() {
+  local purpose="${1:-执行生产管理操作}"
+
+  if [ "$(id -u)" -eq 0 ] || [ "$SUDO_AUTHORIZED" -eq 1 ]; then
+    return 0
+  fi
+  if ! command -v sudo >/dev/null 2>&1; then
+    LAST_ERROR="$purpose 需要 sudo，但系统未安装 sudo。"
+    return 1
+  fi
+  printf '需要 sudo 权限以%s；请在当前终端完成授权。\n' "$purpose" >&2
+  if ! sudo -v; then
+    LAST_ERROR="$purpose 失败：当前用户没有可用的 sudo 权限。"
+    return 1
+  fi
+  SUDO_AUTHORIZED=1
 }
 
 resolve_python() {
@@ -95,11 +115,63 @@ validate_configuration() {
     LAST_ERROR="LOGIN_CONFIRM_RETRIES must be positive."
     return 1
   fi
+  if ! [[ "$LOGIN_CONFIRM_INTERVAL" =~ ^[0-9]+$ ]]; then
+    LAST_ERROR="LOGIN_CONFIRM_INTERVAL must be a non-negative integer."
+    return 1
+  fi
+  if ! [[ "$HTTP_CONNECT_TIMEOUT" =~ ^[1-9][0-9]*$ ]]; then
+    LAST_ERROR="HTTP_CONNECT_TIMEOUT must be a positive integer."
+    return 1
+  fi
+  if ! [[ "$HTTP_TIMEOUT" =~ ^[1-9][0-9]*$ ]]; then
+    LAST_ERROR="HTTP_TIMEOUT must be a positive integer."
+    return 1
+  fi
+  if ! [[ "$DOCKER_READ_TIMEOUT" =~ ^[1-9][0-9]*$ ]]; then
+    LAST_ERROR="DOCKER_READ_TIMEOUT must be a positive integer."
+    return 1
+  fi
 
 }
 
+validate_token_file_content() {
+  local token_path="$1"
+
+  /usr/bin/od -An -v -t u1 -- "$token_path" | /usr/bin/awk '
+    BEGIN { bytes = 0; ended = 0; bad = 0; long = 0; control = 0 }
+    {
+      for (field = 1; field <= NF; field++) {
+        byte = $field + 0
+        if (byte == 10) {
+          if (bytes == 0 || ended) bad = 1
+          ended = 1
+        } else {
+          if (ended) bad = 1
+          bytes++
+          if (bytes > 8192) long = 1
+          if (byte < 32 || byte == 127) control = 1
+        }
+      }
+    }
+    END {
+      if (bytes == 0 || bad) exit 48
+      if (long) exit 49
+      if (control) exit 50
+    }
+  '
+}
+
+set_token_content_error() {
+  case "$1" in
+    48) LAST_ERROR="token 文件必须只包含一行非空 token：${TOKEN_FILE}" ;;
+    49) LAST_ERROR="token 内容不能超过 8192 字节：${TOKEN_FILE}" ;;
+    50) LAST_ERROR="token 不能包含 C0 或 DEL 控制字符：${TOKEN_FILE}" ;;
+    *) LAST_ERROR="无法验证 token 文件内容：${TOKEN_FILE}" ;;
+  esac
+}
+
 load_auth_token() {
-  local token_value token_status
+  local token_value token_status metadata token_dir current_uid
 
   AUTH_TOKEN=""
   export -n AUTH_TOKEN
@@ -112,6 +184,44 @@ load_auth_token() {
       LAST_ERROR="token 路径不是普通文件：${TOKEN_FILE}"
       return 1
     fi
+    token_dir="$(dirname -- "$TOKEN_FILE")"
+    if [ -L "$token_dir" ] || [ ! -d "$token_dir" ]; then
+      LAST_ERROR="secrets 路径必须是非符号链接目录：${token_dir}"
+      return 1
+    fi
+    if [ "$TOKEN_FILE" = "$DEFAULT_TOKEN_FILE" ]; then
+      if ! metadata="$(stat -Lc '%u:%g:%a' -- "$token_dir")" ||
+        [ "$metadata" != "0:0:700" ]; then
+        LAST_ERROR="secrets 目录必须保持 root:root 700：${token_dir}"
+        return 1
+      fi
+      if ! metadata="$(stat -Lc '%u:%g:%a:%h' -- "$TOKEN_FILE")" ||
+        [ "$metadata" != "0:0:600:1" ]; then
+        LAST_ERROR="auth-token 必须保持 root:root 600 且无额外硬链接：${TOKEN_FILE}"
+        return 1
+      fi
+    elif [ "$(uname -s)" = "Linux" ]; then
+      current_uid="$(id -u)"
+      if ! metadata="$(stat -Lc '%u:%a' -- "$token_dir")" ||
+        [ "$metadata" != "$current_uid:700" ]; then
+        LAST_ERROR="自定义 secrets 目录必须由当前用户持有且 mode 700：${token_dir}"
+        return 1
+      fi
+      if ! metadata="$(stat -Lc '%u:%a:%h' -- "$TOKEN_FILE")" ||
+        [ "$metadata" != "$current_uid:600:1" ]; then
+        LAST_ERROR="自定义 auth-token 必须由当前用户持有、mode 600 且无额外硬链接：${TOKEN_FILE}"
+        return 1
+      fi
+    fi
+    if validate_token_file_content "$TOKEN_FILE"; then
+      token_status=0
+    else
+      token_status=$?
+    fi
+    if [ "$token_status" -ne 0 ]; then
+      set_token_content_error "$token_status"
+      return 1
+    fi
     if ! token_value="$(/bin/cat -- "$TOKEN_FILE")"; then
       LAST_ERROR="无法读取 token 文件：${TOKEN_FILE}"
       return 1
@@ -121,13 +231,12 @@ load_auth_token() {
       LAST_ERROR="当前用户无法读取自定义 token 路径；sudo 读取仅允许默认路径：${DEFAULT_TOKEN_FILE}"
       return 1
     fi
-    if ! command -v sudo >/dev/null 2>&1; then
-      LAST_ERROR="当前用户无法读取 token，且未安装 sudo：${TOKEN_FILE}"
+    if ! authorize_management_sudo "读取受保护的生产 auth-token"; then
       return 1
     fi
 
     if token_value="$(
-      sudo -- /bin/sh -c '
+      sudo -n -- /bin/sh -c '
 token_file=/srv/storage/cf-agent-wechat/secrets/auth-token
 secrets_dir=/srv/storage/cf-agent-wechat/secrets
 if [ ! -e "$secrets_dir" ]; then
@@ -151,8 +260,34 @@ fi
 if [ "$(/usr/bin/stat -c "%u:%g:%a" "$secrets_dir")" != "0:0:700" ]; then
   exit 45
 fi
-if [ "$(/usr/bin/stat -c "%u:%g:%a" "$token_file")" != "0:0:600" ]; then
+if [ "$(/usr/bin/stat -Lc "%u:%g:%a:%h" "$token_file")" != "0:0:600:1" ]; then
   exit 46
+fi
+/usr/bin/od -An -v -t u1 -- "$token_file" | /usr/bin/awk "
+  BEGIN { bytes = 0; ended = 0; bad = 0; long = 0; control = 0 }
+  {
+    for (field = 1; field <= NF; field++) {
+      byte = \$field + 0
+      if (byte == 10) {
+        if (bytes == 0 || ended) bad = 1
+        ended = 1
+      } else {
+        if (ended) bad = 1
+        bytes++
+        if (bytes > 8192) long = 1
+        if (byte < 32 || byte == 127) control = 1
+      }
+    }
+  }
+  END {
+    if (bytes == 0 || bad) exit 48
+    if (long) exit 49
+    if (control) exit 50
+  }
+"
+token_status=$?
+if [ "$token_status" -ne 0 ]; then
+  exit "$token_status"
 fi
 exec /bin/cat -- "$token_file"
 ' cf-agent-wechat-token-reader
@@ -168,8 +303,11 @@ exec /bin/cat -- "$token_file"
       43) LAST_ERROR="token 路径不是普通文件：${TOKEN_FILE}" ;;
       44) LAST_ERROR="sudo 无法读取 token 文件：${TOKEN_FILE}" ;;
       45) LAST_ERROR="secrets 目录必须保持 root:root 700：/srv/storage/cf-agent-wechat/secrets" ;;
-      46) LAST_ERROR="auth-token 必须保持 root:root 600：${TOKEN_FILE}" ;;
+      46) LAST_ERROR="auth-token 必须保持 root:root 600 且无额外硬链接：${TOKEN_FILE}" ;;
       47) LAST_ERROR="secrets 路径必须是非符号链接目录：/srv/storage/cf-agent-wechat/secrets" ;;
+      48) LAST_ERROR="token 文件必须只包含一行非空 token：${TOKEN_FILE}" ;;
+      49) LAST_ERROR="token 内容不能超过 8192 字节：${TOKEN_FILE}" ;;
+      50) LAST_ERROR="token 不能包含 C0 或 DEL 控制字符：${TOKEN_FILE}" ;;
       *) LAST_ERROR="当前用户无法读取 token，且没有可用的 sudo 权限：${TOKEN_FILE}" ;;
     esac
     if [ "$token_status" -ne 0 ]; then
@@ -233,7 +371,7 @@ if not isinstance(status, str) or not status:
     print("认证状态响应缺少 status 字段。", file=sys.stderr)
     raise SystemExit(2)
 
-if any(character in status for character in ("\n", "\r", "\t")):
+if any(ord(character) < 0x20 or ord(character) == 0x7F for character in status):
     print("status contains an invalid control character.", file=sys.stderr)
     raise SystemExit(2)
 
@@ -394,7 +532,8 @@ if message_list(payload) is None:
 docker_readonly_capture() {
   local output status output_lower
 
-  if output="$(LC_ALL=C docker "$@" 2>&1)"; then
+  if output="$(LC_ALL=C timeout --signal=TERM --kill-after=2s \
+    "${DOCKER_READ_TIMEOUT}s" docker "$@" 2>&1)"; then
     printf '%s' "$output"
     return 0
   else
@@ -411,7 +550,11 @@ docker_readonly_capture() {
     *) return "$status" ;;
   esac
   command -v sudo >/dev/null 2>&1 || return "$status"
-  sudo -- docker "$@"
+  if ! authorize_management_sudo "查询本机 Docker"; then
+    return "$status"
+  fi
+  timeout --signal=TERM --kill-after=2s "${DOCKER_READ_TIMEOUT}s" \
+    sudo -n -- docker "$@"
 }
 
 get_wechat_process_identity() {
@@ -451,7 +594,9 @@ detect_container_status() {
   fi
 
   if inspect_output="$(
-    LC_ALL=C docker inspect --format '{{.State.Running}}' "$CONTAINER_NAME" 2>&1
+    LC_ALL=C timeout --signal=TERM --kill-after=2s \
+      "${DOCKER_READ_TIMEOUT}s" docker inspect \
+      --format '{{.State.Running}}' "$CONTAINER_NAME" 2>&1
   )"; then
     inspect_status=0
   else
@@ -471,8 +616,13 @@ detect_container_status() {
     if ! command -v sudo >/dev/null 2>&1; then
       return 1
     fi
+    if ! authorize_management_sudo "查询本机 Docker"; then
+      return 1
+    fi
     if ! inspect_output="$(
-      sudo -- docker inspect --format '{{.State.Running}}' "$CONTAINER_NAME" 2>/dev/null
+      timeout --signal=TERM --kill-after=2s "${DOCKER_READ_TIMEOUT}s" \
+        sudo -n -- docker inspect --format '{{.State.Running}}' \
+        "$CONTAINER_NAME" 2>/dev/null
     )"; then
       return 1
     fi

@@ -39,37 +39,32 @@ class AgentRuntimeContractTests(unittest.TestCase):
         )
 
     def test_agent_compose_uses_env_file_for_direct_and_sudo_docker(self) -> None:
-        continuation = chr(92)
-        compose_arguments = (
-            f'      --env-file "$AGENT_ENV_FILE" {continuation}',
-            f'      --project-directory "$RUNTIME_REPO_ROOT" {continuation}',
-            '      -f "$AGENT_COMPOSE_FILE" "$@"',
+        self.assertIn(
+            'sudo -n -- env "CF_AGENT_WECHAT_RUNTIME_ROOT=$RUNTIME_ROOT" '
+            "docker compose",
+            self.content,
         )
-        sudo_invocation = "\n".join(
-            (
-                '    sudo -- env '
-                '"CF_AGENT_WECHAT_RUNTIME_ROOT=$RUNTIME_ROOT" '
-                f"docker compose {continuation}",
-                *compose_arguments,
-            )
+        self.assertIn(
+            'env "CF_AGENT_WECHAT_RUNTIME_ROOT=$RUNTIME_ROOT" docker compose',
+            self.content,
         )
-        direct_invocation = "\n".join(
-            (
-                '    env "CF_AGENT_WECHAT_RUNTIME_ROOT=$RUNTIME_ROOT" '
-                f"docker compose {continuation}",
-                *compose_arguments,
-            )
+        self.assertEqual(self.content.count('--env-file "$AGENT_ENV_FILE"'), 2)
+        self.assertEqual(
+            self.content.count('--project-directory "$RUNTIME_REPO_ROOT"'),
+            2,
         )
-        self.assertIn(sudo_invocation, self.content)
-        self.assertIn(direct_invocation, self.content)
+        self.assertGreaterEqual(
+            self.content.count('runtime_with_timeout "$COMPOSE_COMMAND_TIMEOUT"'),
+            4,
+        )
 
     def test_start_and_stop_validate_agent_env_before_compose(self) -> None:
         absolute_error = (
             "agent-wechat environment file path must be absolute:"
         )
         file_condition = (
-            'if [ -L "$AGENT_ENV_FILE" ] || '
-            '[ ! -f "$AGENT_ENV_FILE" ]; then'
+            'if runtime_privileged test -L "$AGENT_ENV_FILE" ||\n'
+            '    ! runtime_privileged test -f "$AGENT_ENV_FILE"; then'
         )
         file_error = (
             "agent-wechat environment file must be an existing non-symlink "
@@ -80,6 +75,34 @@ class AgentRuntimeContractTests(unittest.TestCase):
         self.assertEqual(self.content.count(file_condition), 2)
         self.assertEqual(self.content.count(file_error), 2)
 
+
+class ArchiveSafetyContractTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.content = START_SCRIPT.read_text(encoding="utf-8")
+        cls.archive_body = function_body(cls.content, "archive_current_runtime")
+
+    def test_token_scan_precedes_every_archive_destination_mutation(self) -> None:
+        runtime_scan = self.archive_body.index(
+            'runtime_assert_tree_has_no_auth_token "$RUNTIME_ROOT"'
+        )
+        legacy_scan = self.archive_body.index(
+            'runtime_assert_tree_has_no_auth_token "$LEGACY_DATA_ROOT"'
+        )
+        choose_destination = self.archive_body.index("choose_archive_path")
+        self.assertLess(runtime_scan, choose_destination)
+        self.assertLess(legacy_scan, choose_destination)
+        self.assertLess(
+            self.archive_body.index('ARCHIVE_RESULT="failed"'),
+            runtime_scan,
+        )
+        self.assertGreater(
+            self.archive_body.index('ARCHIVE_RESULT="succeeded"'),
+            self.archive_body.index('mv --no-clobber -T'),
+        )
+
+    def test_script_ends_at_the_single_production_entrypoint(self) -> None:
+        self.assertTrue(self.content.rstrip().endswith('main "$@"'))
 
 class FailedFlowCleanupContractTests(unittest.TestCase):
     @classmethod

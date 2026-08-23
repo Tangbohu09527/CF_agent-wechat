@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO_ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd -P)"
+REPO_ROOT="$(CDPATH='' cd -- "$(dirname -- "$0")/../.." && pwd -P)"
 TEST_ROOT=""
 DEPLOYMENT_DIR="/srv/storage/cf-agent-wechat"
 TEST_USER="cfwtest$$"
@@ -95,6 +95,7 @@ GATEWAY_PROJECT_DIR="${TEST_ROOT}/gateway"
 GATEWAY_COMPOSE_FILE="${GATEWAY_PROJECT_DIR}/compose.yaml"
 GATEWAY_ENV_FILE="${GATEWAY_PROJECT_DIR}/.env"
 GATEWAY_ENV_SENTINEL="gateway-env-fixture-sensitive-permissions-$$"
+GATEWAY_HEARTBEAT_COMMAND="${GATEWAY_PROJECT_DIR}/check-wechat-worker-heartbeat"
 AGENT_STATE_FILE="${TEST_ROOT}/agent-state"
 
 install -d -o root -g root -m 755 "${TEST_REPO}/scripts"
@@ -103,6 +104,7 @@ install -o root -g root -m 755 \
   "${REPO_ROOT}/scripts/qr-runtime-common.sh" \
   "${REPO_ROOT}/scripts/status.sh" \
   "${REPO_ROOT}/scripts/login.sh" \
+  "${REPO_ROOT}/scripts/start-qr-login.sh" \
   "${REPO_ROOT}/scripts/qr_login.py" \
   "${TEST_REPO}/scripts/"
 install -o root -g root -m 644 \
@@ -115,12 +117,25 @@ install -o root -g root -m 755 \
   "${REPO_ROOT}/tests/helpers/audit_sudo.sh" "${AUDIT_BIN}/sudo"
 install -d -o root -g root -m 755 "$GATEWAY_PROJECT_DIR"
 printf '%s\n' 'services:' '  agent-wechat: {}' > "$AGENT_COMPOSE_FILE"
-printf 'AGENT_ENV_FIXTURE=%s\n' "$AGENT_ENV_SENTINEL" > "$AGENT_ENV_FILE"
+printf '%s\n' \
+  'COMPOSE_PROJECT_NAME=cf-agent-wechat' \
+  "AGENT_WECHAT_IMAGE=ghcr.io/example/agent-wechat@sha256:$(printf '%064d' 0)" \
+  "AGENT_WECHAT_CONTAINER_NAME=$TEST_CONTAINER" \
+  'CF_AGENT_WECHAT_STORAGE_ROOT=/srv/storage/cf-agent-wechat' \
+  'CF_AGENT_WECHAT_RUNTIME_ROOT=/srv/storage/cf-agent-wechat/runtime' \
+  'CF_AGENT_WECHAT_ARCHIVE_ROOT=/srv/storage/cf-agent-wechat/session-archive' \
+  'AGENT_WECHAT_BIND_IP=127.0.0.1' \
+  'AGENT_WECHAT_PORT=6174' \
+  "PROXY=http://${AGENT_ENV_SENTINEL}.invalid" \
+  'RUST_LOG=info' > "$AGENT_ENV_FILE"
 printf '%s\n' 'services:' '  wechat-worker: {}' > "$GATEWAY_COMPOSE_FILE"
-chmod 644 "$AGENT_COMPOSE_FILE" "$GATEWAY_COMPOSE_FILE"
+chmod 600 "$AGENT_COMPOSE_FILE" "$GATEWAY_COMPOSE_FILE"
 printf '%s\n' "$GATEWAY_ENV_SENTINEL" > "$GATEWAY_ENV_FILE"
 chown root:root "$AGENT_ENV_FILE" "$GATEWAY_ENV_FILE"
 chmod 600 "$AGENT_ENV_FILE" "$GATEWAY_ENV_FILE"
+printf '%s\n' '#!/bin/sh' 'exit 0' > "$GATEWAY_HEARTBEAT_COMMAND"
+chown root:root "$GATEWAY_HEARTBEAT_COMMAND"
+chmod 755 "$GATEWAY_HEARTBEAT_COMMAND"
 printf '%s\n' 'running' > "$AGENT_STATE_FILE"
 
 useradd --create-home --home-dir "$TEST_HOME" --shell /bin/bash "$TEST_USER"
@@ -169,11 +184,22 @@ assert_token_read_once() {
     fail "$1 did not use exactly one sudo token read"
 }
 
-assert_only_token_sudo() {
-  local sudo_count
-  sudo_count="$(awk -F '\t' '$1 == "sudo" { count++ } END { print count + 0 }' \
+assert_sudo_contract() {
+  local label="$1" first_sudo
+
+  [ "$(audit_count sudo validate)" -eq 1 ] || \
+    fail "$label did not perform exactly one sudo -v authorization"
+  first_sudo="$(awk -F '\t' '$1 == "sudo" { print $2 "\t" $3; exit }' \
     "$AUDIT_LOG")"
-  [ "$sudo_count" -eq 1 ] || fail "$1 used sudo for more than the token read"
+  [ "$first_sudo" = $'validate\tinteractive' ] || \
+    fail "$label did not authorize with sudo -v before operational sudo"
+  if awk -F '\t' \
+    '$1 == "sudo" && $2 != "validate" && $3 != "noninteractive" { exit 1 }' \
+    "$AUDIT_LOG"; then
+    :
+  else
+    fail "$label used operational sudo without -n"
+  fi
 }
 
 assert_no_sudo_calls() {
@@ -221,22 +247,18 @@ assert_runtime_mock_requires_sudo() {
 }
 
 assert_status_sudo_paths() {
-  local expected="${TEST_ROOT}/status-sudo-expected.log"
-  local actual="${TEST_ROOT}/status-sudo-actual.log"
-
-  printf '%s\n' \
-    $'sudo\tdocker-info' \
-    $'sudo\tdocker-compose' \
-    $'sudo\tdocker-compose' \
-    $'sudo\tdocker-compose' \
-    $'sudo\tdocker-exec' \
-    $'sudo\tdocker-inspect' \
-    $'sudo\ttoken-reader' \
-    $'sudo\tdocker-exec' > "$expected"
-  awk -F '\t' '$1 == "sudo" { print $1 "\t" $2 }' "$AUDIT_LOG" > "$actual"
-  if ! diff -u "$expected" "$actual"; then
-    fail "status.sh sudo path sequence differed from the expected fallback"
-  fi
+  [ "$(audit_count sudo docker-info)" -eq 3 ] || \
+    fail "status.sh did not inspect Docker availability, security, and live-restore"
+  [ "$(audit_count sudo docker-context)" -eq 2 ] || \
+    fail "status.sh did not inspect the Docker context and socket"
+  [ "$(audit_count sudo docker-compose)" -eq 4 ] || \
+    fail "status.sh used an unexpected Compose query sequence"
+  [ "$(audit_count sudo docker-exec)" -eq 2 ] || \
+    fail "status.sh did not attest a stable WeChat process"
+  [ "$(audit_count sudo docker-inspect)" -eq 3 ] || \
+    fail "status.sh did not inspect Agent/Worker health and runtime mounts"
+  assert_token_read_once "status.sh"
+  assert_sudo_contract "status.sh"
 }
 
 : > "$LOG_FILE"
@@ -249,8 +271,14 @@ assert_secret_permissions() {
     fail "auth-token permissions changed"
   [ "$(stat -c '%U:%G %a' "$AGENT_ENV_FILE")" = "root:root 600" ] || \
     fail "agent-wechat environment file permissions changed"
+  [ "$(stat -c '%U:%G %a' "$AGENT_COMPOSE_FILE")" = "root:root 600" ] || \
+    fail "agent-wechat Compose permissions changed"
+  [ "$(stat -c '%U:%G %a' "$GATEWAY_COMPOSE_FILE")" = "root:root 600" ] || \
+    fail "Gateway Compose permissions changed"
   [ "$(stat -c '%U:%G %a' "$GATEWAY_ENV_FILE")" = "root:root 600" ] || \
     fail "Gateway environment file permissions changed"
+  [ "$(stat -c '%U:%G %a' "$GATEWAY_HEARTBEAT_COMMAND")" = "root:root 755" ] || \
+    fail "Gateway heartbeat checker permissions changed"
 }
 
 assert_file_has_no_token() {
@@ -397,12 +425,10 @@ run_script_as() {
     CF_AGENT_GATEWAY_COMPOSE_FILE="$GATEWAY_COMPOSE_FILE" \
     CF_AGENT_GATEWAY_PROJECT_DIR="$GATEWAY_PROJECT_DIR" \
     CF_AGENT_GATEWAY_ENV_FILE="$GATEWAY_ENV_FILE" \
+    CF_AGENT_GATEWAY_HEARTBEAT_COMMAND="$GATEWAY_HEARTBEAT_COMMAND" \
     "$@" \
     /bin/bash -c '
 cd "$1"
-if [ "${CF_TEST_FORCE_QR:-0}" = "1" ]; then
-  exec "./scripts/$2" --force-qr
-fi
 exec "./scripts/$2"
 ' \
     cf-agent-wechat-test "$TEST_REPO" "$script_name"
@@ -488,6 +514,9 @@ if NONPERMISSION_OUTPUT="$("$REAL_SUDO" -u "$TEST_USER" -H env \
   cf-agent-wechat-test "$TEST_REPO" 2>&1)"; then
   fail "non-permission Docker error unexpectedly produced a status"
 fi
+NONPERMISSION_FILE="${TEST_ROOT}/nonpermission.out"
+printf '%s\n' "$NONPERMISSION_OUTPUT" > "$NONPERMISSION_FILE"
+assert_file_has_no_token "$NONPERMISSION_FILE"
 [ "$(audit_count docker inspect)" -eq 1 ] || \
   fail "non-permission Docker error did not use one ordinary inspect"
 [ "$(audit_count sudo docker-inspect)" -eq 0 ] || \
@@ -537,8 +566,11 @@ fi
   fail "failed-agent cleanup returned unexpected results"
 [ "$(cat "$AGENT_STATE_FILE")" = "absent" ] ||
   fail "failed-agent cleanup left a restartable container"
-[ "$(audit_count sudo docker-info)" -eq 1 ] ||
-  fail "failed-agent cleanup did not select sudo Docker"
+[ "$(audit_count sudo docker-info)" -eq 3 ] ||
+  fail "failed-agent cleanup did not inspect Docker security and live-restore"
+[ "$(audit_count sudo docker-context)" -eq 2 ] ||
+  fail "failed-agent cleanup did not attest the local Docker endpoint"
+assert_sudo_contract "failed-agent cleanup"
 [ "$(audit_count docker compose-agent-stop)" -eq 1 ] ||
   fail "failed-agent cleanup did not stop the agent container"
 [ "$(audit_count docker compose-agent-remove)" -eq 1 ] ||
@@ -589,6 +621,8 @@ printf 'PASS root-only token with ordinary-user status.sh\n'
 printf '%s\n' '--verbose' > "${TEST_HOME}/.curlrc"
 chown "$TEST_USER:$TEST_USER" "${TEST_HOME}/.curlrc"
 TRACE_OUTPUT="${TEST_ROOT}/trace.out"
+# The redirect intentionally belongs to the root test harness, not sudo.
+# shellcheck disable=SC2024
 if sudo -u "$TEST_USER" -H env \
   API_URL="http://127.0.0.1:${HTTP_PORT}" \
   WS_URL="ws://127.0.0.1:${WS_PORT}/api/ws/login" \
@@ -608,6 +642,7 @@ if sudo -u "$TEST_USER" -H env \
   CF_AGENT_GATEWAY_COMPOSE_FILE="$GATEWAY_COMPOSE_FILE" \
   CF_AGENT_GATEWAY_PROJECT_DIR="$GATEWAY_PROJECT_DIR" \
   CF_AGENT_GATEWAY_ENV_FILE="$GATEWAY_ENV_FILE" \
+  CF_AGENT_GATEWAY_HEARTBEAT_COMMAND="$GATEWAY_HEARTBEAT_COMMAND" \
   NO_PROXY=127.0.0.1,localhost \
   /bin/bash -x "${TEST_REPO}/scripts/status.sh" > "$TRACE_OUTPUT" 2>&1; then
   :
@@ -625,19 +660,76 @@ printf 'PASS shell trace and curlrc token protection\n'
 : > "$LOG_FILE"
 reset_audit
 LOGIN_SHORT_OUTPUT="${TEST_ROOT}/login-short.out"
-run_script_as "$TEST_USER" login.sh > "$LOGIN_SHORT_OUTPUT" 2>&1
-grep -q '微信已经登录。' "$LOGIN_SHORT_OUTPUT" || fail "logged_in did not short-circuit"
-assert_only_token_sudo "successful management script"
-assert_token_read_once "logged-in login.sh"
-assert_no_sudo_python "logged-in login.sh"
-if grep -Eq '^(POST|WS|EVENT) ' "$LOG_FILE"; then
-  fail "logged_in short-circuit called POST or WebSocket"
+if run_script_as "$TEST_USER" login.sh > "$LOGIN_SHORT_OUTPUT" 2>&1; then
+  fail "login.sh unexpectedly bypassed the controlled-terminal fresh QR gate"
 fi
-[ ! -e "${TEST_HOME}/.local/share/cf-agent-wechat/venv" ] || \
-  fail "logged_in short-circuit unexpectedly created the venv"
+grep -q 'compatibility wrapper' "$LOGIN_SHORT_OUTPUT" || \
+  fail "login.sh did not identify itself as the compatibility wrapper"
+grep -q 'interactive controlled terminal' "$LOGIN_SHORT_OUTPUT" || \
+  fail "login.sh did not enter the forced fresh QR terminal gate"
+if grep -Eq '^(POST|WS|EVENT) ' "$LOG_FILE"; then
+  fail "non-TTY fresh lifecycle unexpectedly reached the Agent login API"
+fi
+assert_no_sudo_calls "non-TTY compatibility wrapper"
 assert_file_has_no_token "$LOGIN_SHORT_OUTPUT"
 assert_secret_permissions
-printf 'PASS ordinary-user login.sh logged_in short-circuit\n'
+printf 'PASS existing logged_in state cannot bypass the fresh QR entrypoint\n'
+
+reset_audit
+TOKEN_PROCESS_OUTPUT="${TEST_ROOT}/token-process.out"
+TOKEN_PROCESS_READY="${TEST_HOME}/token-process.ready"
+"$REAL_SUDO" -u "$TEST_USER" -H env \
+  PATH="$AUDIT_PATH" \
+  CF_AUDIT_LOG="$AUDIT_LOG" \
+  CF_AUDIT_REAL_SUDO="$REAL_SUDO" \
+  TOKEN_FILE="$TOKEN_FILE" \
+  /bin/bash -c '
+cd "$1"
+source scripts/common.sh
+if ! load_auth_token; then
+  error "$LAST_ERROR"
+  exit 1
+fi
+: > "$2"
+sleep 30
+' cf-agent-wechat-test "$TEST_REPO" "$TOKEN_PROCESS_READY" \
+  > "$TOKEN_PROCESS_OUTPUT" 2>&1 &
+LOGIN_PID=$!
+for _attempt in $(seq 1 100); do
+  [ -e "$TOKEN_PROCESS_READY" ] && break
+  kill -0 "$LOGIN_PID" 2>/dev/null || {
+    print_redacted_file "$TOKEN_PROCESS_OUTPUT"
+    fail "ordinary-user root-only Token load exited early"
+  }
+  sleep 0.1
+done
+[ -e "$TOKEN_PROCESS_READY" ] || fail "ordinary-user Token load did not become ready"
+assert_user_processes_have_no_token
+kill "$LOGIN_PID"
+wait "$LOGIN_PID" 2>/dev/null || true
+LOGIN_PID=""
+assert_token_read_once "ordinary-user Token load"
+assert_sudo_contract "ordinary-user Token load"
+assert_no_sudo_python "ordinary-user Token load"
+assert_file_has_no_token "$TOKEN_PROCESS_OUTPUT"
+printf 'PASS sudo -v then sudo -n root-only Token load without process leakage\n'
+
+reset_audit
+ROOT_TOKEN_OUTPUT="${TEST_ROOT}/root-token.out"
+if ! env TOKEN_FILE="$TOKEN_FILE" /bin/bash -c '
+cd "$1"
+source scripts/common.sh
+load_auth_token
+printf "%s\n" token-loaded
+' cf-agent-wechat-test "$TEST_REPO" > "$ROOT_TOKEN_OUTPUT" 2>&1; then
+  print_redacted_file "$ROOT_TOKEN_OUTPUT"
+  fail "root could not load the root-only Token"
+fi
+grep -qx 'token-loaded' "$ROOT_TOKEN_OUTPUT" || \
+  fail "root Token test returned unexpected output"
+assert_no_sudo_calls "root Token load"
+assert_file_has_no_token "$ROOT_TOKEN_OUTPUT"
+printf 'PASS root reads the protected Token without sudo or disclosure\n'
 
 reset_audit
 "$REAL_SUDO" -u "$TEST_USER" -H env \
@@ -657,117 +749,34 @@ if find "$VENV_DIR" ! -user "$TEST_USER" -print -quit | grep -q .; then
   fail "venv contains files not owned by the ordinary user"
 fi
 printf 'PASS default venv setup as ordinary user\n'
-
-printf 'logged_out\n' > "$STATE_FILE"
-: > "$LOG_FILE"
-reset_audit
-rm -f "$PAUSE_FILE" "$CONTINUE_FILE"
-LOGIN_OUTPUT="${TEST_ROOT}/login.out"
-run_script_as "$TEST_USER" login.sh > "$LOGIN_OUTPUT" 2>&1 &
-LOGIN_PID=$!
-for _attempt in $(seq 1 900); do
-  [ -e "$PAUSE_FILE" ] && break
-  kill -0 "$LOGIN_PID" 2>/dev/null || {
-    print_redacted_file "$LOGIN_OUTPUT"
-    fail "login.sh exited before WebSocket pause"
-  }
-  sleep 0.1
-done
-[ -e "$PAUSE_FILE" ] || fail "login.sh did not reach WebSocket login"
-assert_user_processes_have_no_token
-touch "$CONTINUE_FILE"
-if ! wait "$LOGIN_PID"; then
-  print_redacted_file "$LOGIN_OUTPUT"
-  fail "ordinary-user login.sh failed"
-fi
-LOGIN_PID=""
-grep -q '请在手机微信确认登录' "$LOGIN_OUTPUT" || fail "phone_confirm was not shown"
-grep -q '登录成功。' "$LOGIN_OUTPUT" || fail "login_success was not shown"
-assert_only_token_sudo "successful management script"
-grep -q '登录状态已确认' "$LOGIN_OUTPUT" || fail "final logged_in state was not confirmed"
-assert_token_read_once "logged-out login.sh"
-assert_no_sudo_python "logged-out login.sh"
-EXPECTED_LOG="${TEST_ROOT}/expected.log"
-printf '%s\n' \
-  'GET /api/status/auth' \
-  'POST /api/status/login' \
-  'WS /api/ws/login' \
-  'EVENT phone_confirm' \
-  'EVENT login_success' \
-  'GET /api/status/auth' > "$EXPECTED_LOG"
-diff -u "$EXPECTED_LOG" "$LOG_FILE" || fail "login request/event order differs"
-assert_file_has_no_token "$LOGIN_OUTPUT"
 assert_home_has_no_token
 assert_tmp_has_no_token
 assert_secret_permissions
-printf 'PASS ordinary-user login.sh phone confirmation flow and user-owned venv\n'
-
-printf '%s\n' 'logged_out' > "$STATE_FILE"
-printf '%s\n' \
-  '{"emit_qr":true,"require_new_account":true,"record_ws_query":true}' \
-  > "$SCENARIO_FILE"
-: > "$LOG_FILE"
-reset_audit
-rm -f "$PAUSE_FILE" "$CONTINUE_FILE"
-FORCE_OUTPUT="${TEST_ROOT}/force-qr.out"
-run_script_as "$TEST_USER" login.sh CF_TEST_FORCE_QR=1 \
-  > "$FORCE_OUTPUT" 2>&1 &
-LOGIN_PID=$!
-for _attempt in $(seq 1 900); do
-  [ -e "$PAUSE_FILE" ] && break
-  kill -0 "$LOGIN_PID" 2>/dev/null || {
-    print_redacted_file "$FORCE_OUTPUT"
-    fail "login.sh --force-qr exited before WebSocket pause"
-  }
-  sleep 0.1
-done
-[ -e "$PAUSE_FILE" ] || fail "force-QR login did not reach WebSocket"
-touch "$CONTINUE_FILE"
-if ! wait "$LOGIN_PID"; then
-  print_redacted_file "$FORCE_OUTPUT"
-  fail "ordinary-user login.sh --force-qr failed"
-fi
-LOGIN_PID=""
-grep -q '请使用手机微信扫描二维码' "$FORCE_OUTPUT" || \
-  fail "force-QR flow did not render a terminal QR code"
-grep -q '登录成功。' "$FORCE_OUTPUT" || \
-  fail "force-QR flow did not report login success"
-grep -q '^WS /api/ws/login newAccount=true$' "$LOG_FILE" || \
-  fail "force-QR WebSocket did not use newAccount=true"
-if grep -qi 'logout' "$LOG_FILE"; then
-  fail "force-QR flow unexpectedly called logout"
-fi
-FORCE_EXPECTED_LOG="${TEST_ROOT}/force-expected.log"
-printf '%s\n' \
-  'GET /api/status/auth' \
-  'POST /api/status/login' \
-  'WS /api/ws/login newAccount=true' \
-  'EVENT qr' \
-  'EVENT phone_confirm' \
-  'EVENT login_success' \
-  'GET /api/status/auth' > "$FORCE_EXPECTED_LOG"
-diff -u "$FORCE_EXPECTED_LOG" "$LOG_FILE" || \
-  fail "force-QR request/event order differs"
-assert_token_read_once "force-QR login.sh"
-assert_only_token_sudo "force-QR login.sh"
-assert_no_sudo_python "force-QR login.sh"
-assert_file_has_no_token "$FORCE_OUTPUT"
-if grep -q 'account-fixture-not-for-output' "$FORCE_OUTPUT"; then
-  fail "force-QR output exposed the account identifier"
-fi
-printf '%s\n' '{}' > "$SCENARIO_FILE"
-printf 'PASS forced new-device QR rendering and newAccount WebSocket flow\n'
+printf 'PASS ordinary-user venv and writable locations contain no Token\n'
 
 reset_audit
 mv "$TOKEN_FILE" "${TOKEN_FILE}.saved"
 MISSING_OUTPUT="${TEST_ROOT}/missing.out"
-if run_script_as "$TEST_USER" login.sh > "$MISSING_OUTPUT" 2>&1; then
-  fail "login.sh unexpectedly accepted a missing token"
+if "$REAL_SUDO" -u "$TEST_USER" -H env \
+  PATH="$AUDIT_PATH" \
+  CF_AUDIT_LOG="$AUDIT_LOG" \
+  CF_AUDIT_REAL_SUDO="$REAL_SUDO" \
+  TOKEN_FILE="$TOKEN_FILE" \
+  /bin/bash -c '
+cd "$1"
+source scripts/common.sh
+if ! load_auth_token; then
+  error "$LAST_ERROR"
+  exit 1
+fi
+' cf-agent-wechat-test "$TEST_REPO" > "$MISSING_OUTPUT" 2>&1; then
+  fail "Token loader unexpectedly accepted a missing root-only Token"
 fi
 grep -q 'token 文件不存在' "$MISSING_OUTPUT" || \
   fail "missing token was not distinguished from a permission failure"
-assert_token_read_once "missing-token login.sh"
-assert_no_sudo_python "missing-token login.sh"
+assert_token_read_once "missing-token load"
+assert_sudo_contract "missing-token load"
+assert_no_sudo_python "missing-token load"
 mv "${TOKEN_FILE}.saved" "$TOKEN_FILE"
 assert_file_has_no_token "$MISSING_OUTPUT"
 assert_secret_permissions
@@ -782,10 +791,17 @@ if timeout 15s sudo -u "$NO_SUDO_USER" -H env \
   NO_COLOR=1 \
   NO_PROXY=127.0.0.1,localhost \
   no_proxy=127.0.0.1,localhost \
-  /bin/bash -c 'cd "$1" && exec ./scripts/login.sh' \
+  /bin/bash -c '
+cd "$1"
+source scripts/common.sh
+if ! load_auth_token; then
+  error "$LAST_ERROR"
+  exit 1
+fi
+' \
   cf-agent-wechat-test "$TEST_REPO" \
   > "$NO_SUDO_OUTPUT" 2>&1 </dev/null; then
-  fail "login.sh unexpectedly read root-only token without sudo permission"
+  fail "Token loader unexpectedly read the root-only Token without sudo permission"
 fi
 grep -q '没有可用的 sudo 权限' "$NO_SUDO_OUTPUT" || \
   fail "missing sudo authorization did not produce a clear error"
@@ -797,5 +813,42 @@ assert_file_has_no_token "$AUDIT_LOG"
 assert_file_has_no_token "$LOG_FILE"
 assert_secret_permissions
 printf 'PASS explicit no-sudo permission error\n'
+
+reset_audit
+ROOT_CONFIG_OUTPUT="${TEST_ROOT}/root-config.out"
+ROOT_CONFIG_ERROR="${TEST_ROOT}/root-config.error"
+if ! "$REAL_SUDO" -u "$TEST_USER" -H env \
+  PATH="$AUDIT_PATH" \
+  CF_AUDIT_LOG="$AUDIT_LOG" \
+  CF_AUDIT_REAL_SUDO="$REAL_SUDO" \
+  CF_AGENT_WECHAT_COMPOSE_FILE="$AGENT_COMPOSE_FILE" \
+  CF_AGENT_WECHAT_ENV_FILE="$AGENT_ENV_FILE" \
+  CF_AGENT_GATEWAY_COMPOSE_FILE="$GATEWAY_COMPOSE_FILE" \
+  CF_AGENT_GATEWAY_PROJECT_DIR="$GATEWAY_PROJECT_DIR" \
+  CF_AGENT_GATEWAY_ENV_FILE="$GATEWAY_ENV_FILE" \
+  /bin/bash -c '
+cd "$1"
+source scripts/common.sh
+source scripts/qr-runtime-common.sh
+runtime_authorize_sudo
+runtime_validate_management_file "$AGENT_COMPOSE_FILE" "agent Compose" "600"
+runtime_validate_management_file "$AGENT_ENV_FILE" "agent env" "600"
+runtime_load_management_environment
+runtime_validate_management_file "$GATEWAY_COMPOSE_FILE" "Gateway Compose" "600"
+runtime_validate_management_file "$GATEWAY_ENV_FILE" "Gateway env" "600"
+printf "%s\n" "$CONTAINER_NAME"
+' cf-agent-wechat-test "$TEST_REPO" > "$ROOT_CONFIG_OUTPUT" 2> "$ROOT_CONFIG_ERROR"; then
+  print_redacted_file "$ROOT_CONFIG_ERROR"
+  fail "ordinary user could not validate and load root-only management files"
+fi
+grep -qx "$TEST_CONTAINER" "$ROOT_CONFIG_OUTPUT" ||
+  fail "root-only docker/.env was not authoritative for the ordinary user"
+assert_sudo_contract "root-only management files"
+assert_no_sudo_python "root-only management files"
+assert_file_has_no_token "$ROOT_CONFIG_OUTPUT"
+assert_file_has_no_token "$ROOT_CONFIG_ERROR"
+assert_file_has_no_token "$AUDIT_LOG"
+assert_secret_permissions
+printf 'PASS ordinary user validates and loads root-only Compose/env files\n'
 
 printf 'All login management permission tests passed.\n'

@@ -18,6 +18,7 @@ AGENT_FAILURE_CLEANUP_REMOVE_RESULT="not_attempted"
 FLOW_PHASE="initializing"
 FLOW_STARTED_AT=""
 ARCHIVE_PATH=""
+ARCHIVE_RESULT="not_attempted"
 MANIFEST_AVAILABLE=0
 SOURCE_LAYOUT="none"
 
@@ -129,8 +130,8 @@ write_manifest() {
   archive_temp="${ARCHIVE_PATH}/.manifest.json.$$"
   if ! "$PYTHON_BIN" - \
     "$temp_file" "$result" "$FLOW_PHASE" "$FLOW_STARTED_AT" "$ended_at" \
-    "$SOURCE_LAYOUT" "$RUNTIME_ROOT" "$LEGACY_DATA_ROOT" \
-    "$LEGACY_WECHAT_HOME_ROOT" "$ARCHIVE_PATH" \
+    "$ARCHIVE_RESULT" "$SOURCE_LAYOUT" "$RUNTIME_ROOT" "$LEGACY_DATA_ROOT" \
+    "$LEGACY_WECHAT_HOME_ROOT" "$ARCHIVE_PATH" "$AGENT_IMAGE_DIGEST" \
     "$RUNTIME_EXISTS" "$RUNTIME_UID" "$RUNTIME_GID" "$RUNTIME_MODE" \
     "$DATA_EXISTS" "$DATA_UID" "$DATA_GID" "$DATA_MODE" \
     "$HOME_EXISTS" "$HOME_UID" "$HOME_GID" "$HOME_MODE" \
@@ -147,11 +148,13 @@ from pathlib import Path
     phase,
     started,
     ended,
+    archive_result,
     source_layout,
     source_runtime,
     legacy_data,
     legacy_wechat_home,
     archive_path,
+    image_digest,
     runtime_exists,
     runtime_uid,
     runtime_gid,
@@ -181,6 +184,7 @@ payload = {
     "schemaVersion": 1,
     "runtimeMode": "forced_qr",
     "result": result,
+    "archiveResult": archive_result,
     "phase": phase,
     "startedAtUtc": started,
     "endedAtUtc": ended or None,
@@ -198,6 +202,7 @@ payload = {
         ]
     ),
     "archivePath": archive_path,
+    "imageDigest": image_digest,
     "originalPermissions": {
         "runtime": metadata(
             runtime_exists, runtime_uid, runtime_gid, runtime_mode
@@ -319,6 +324,24 @@ parse_args() {
   done
 }
 
+validate_operator_terminal() {
+  local operator_uid operator_gid
+
+  if ! operator_uid="$(id -u)" || ! [[ "$operator_uid" =~ ^[0-9]+$ ]] ||
+    ! operator_gid="$(id -g)" || ! [[ "$operator_gid" =~ ^[0-9]+$ ]]; then
+    LAST_ERROR="The current production operator identity could not be verified."
+    return 1
+  fi
+  if [ "$DRY_RUN" -eq 0 ] && { [ ! -t 0 ] || [ ! -t 1 ]; }; then
+    LAST_ERROR="Fresh QR login requires an interactive controlled terminal on stdin and stdout."
+    return 1
+  fi
+  if [ "$operator_uid" -eq 0 ]; then
+    printf '%s\n' \
+      'Warning: running as root; prefer the fixed management user with sudo.' >&2
+  fi
+}
+
 choose_archive_path() {
   local timestamp candidate counter=0
 
@@ -354,8 +377,27 @@ archive_current_runtime() {
   fi
 
   if [ "$SOURCE_LAYOUT" = "none" ]; then
+    ARCHIVE_RESULT="not_required"
     return 0
   fi
+
+  ARCHIVE_RESULT="failed"
+  case "$SOURCE_LAYOUT" in
+    runtime)
+      runtime_assert_tree_has_no_auth_token "$RUNTIME_ROOT" "Current runtime" ||
+        return 1
+      ;;
+    legacy)
+      if [ "$DATA_EXISTS" = true ]; then
+        runtime_assert_tree_has_no_auth_token "$LEGACY_DATA_ROOT" "Legacy data" ||
+          return 1
+      fi
+      if [ "$HOME_EXISTS" = true ]; then
+        runtime_assert_tree_has_no_auth_token "$LEGACY_WECHAT_HOME_ROOT" "Legacy WeChat HOME" ||
+          return 1
+      fi
+      ;;
+  esac
 
   if ! archive_device="$(runtime_privileged stat -c '%d' -- "$ARCHIVE_ROOT")"; then
     LAST_ERROR="Archive filesystem could not be inspected."
@@ -436,6 +478,7 @@ archive_current_runtime() {
       fi
     fi
   fi
+  ARCHIVE_RESULT="succeeded"
   MANIFEST_AVAILABLE=1
   if ! write_manifest in_progress ""; then
     LAST_ERROR="Archive manifest could not be initialized."
@@ -506,18 +549,70 @@ wait_for_verified_runtime() {
   return 1
 }
 
+validate_login_start_response() {
+  local response="$1"
+
+  printf '%s' "$response" | "$PYTHON_BIN" -c '
+import json
+import sys
+
+try:
+    payload = json.load(sys.stdin)
+except (json.JSONDecodeError, UnicodeDecodeError):
+    raise SystemExit(2)
+if not isinstance(payload, dict):
+    raise SystemExit(2)
+for key in ("error", "errors"):
+    if payload.get(key) not in (None, False, "", [], {}):
+        raise SystemExit(2)
+success = payload.get("success")
+state = payload.get("state")
+status = state.get("status") if isinstance(state, dict) else payload.get("status")
+pending = {"logged_out", "qr_pending", "waiting_for_qr", "waiting_for_scan"}
+if success is True or status in pending:
+    raise SystemExit(0)
+raise SystemExit(2)
+'
+}
+
+
 run_forced_login() {
-  env \
-    API_URL="$API_URL" \
-    WS_URL="$WS_URL" \
-    TOKEN_FILE="$TOKEN_FILE" \
-    SESSION_ID="$SESSION_ID" \
-    CONTAINER_NAME="$CONTAINER_NAME" \
-    PYTHON_BIN="$PYTHON_BIN" \
-    LOGIN_TIMEOUT_MS="$LOGIN_TIMEOUT_MS" \
-    LOGIN_CONFIRM_RETRIES="$LOGIN_CONFIRM_RETRIES" \
-    LOGIN_CONFIRM_INTERVAL="$LOGIN_CONFIRM_INTERVAL" \
-    "${SCRIPT_DIR}/login.sh" --force-qr
+  local attempt login_response
+
+  if ! login_response="$(api_request POST '/api/status/login?newAccount=true' 2>/dev/null)"; then
+    LAST_ERROR="Fresh QR login API request failed."
+    return 1
+  fi
+  if ! validate_login_start_response "$login_response"; then
+    unset login_response
+    LAST_ERROR="Fresh QR login API returned an invalid or explicit error response."
+    return 1
+  fi
+  unset login_response
+  if ! printf '%s' "$AUTH_TOKEN" | "$LOGIN_PYTHON" \
+    "${SCRIPT_DIR}/qr_login.py" \
+    --listen \
+    --url "$WS_URL" \
+    --session-id "$SESSION_ID" \
+    --timeout-ms "$LOGIN_TIMEOUT_MS" \
+    --new-account \
+    --require-qr; then
+    LAST_ERROR="Fresh QR WebSocket login did not complete."
+    return 1
+  fi
+
+  printf '%s\n' 'Confirming authenticated state...'
+  for ((attempt = 1; attempt <= LOGIN_CONFIRM_RETRIES; attempt++)); do
+    if fetch_auth_status && [ "$AUTH_STATUS" = "logged_in" ]; then
+      printf '%s\n' 'Authenticated state confirmed.'
+      return 0
+    fi
+    if [ "$attempt" -lt "$LOGIN_CONFIRM_RETRIES" ]; then
+      sleep "$LOGIN_CONFIRM_INTERVAL"
+    fi
+  done
+  LAST_ERROR="login_success was received but auth did not become logged_in."
+  return 1
 }
 
 print_dry_run() {
@@ -540,7 +635,7 @@ print_final_status() {
   printf 'Auth:\n  logged_in\n'
   printf 'QR Runtime Mode:\n  fresh\n'
   printf 'Message API:\n  chats and messages readable\n'
-  printf 'Gateway WeChat Worker:\n  running\n'
+  printf 'Gateway WeChat Worker:\n  running, healthy, heartbeat verified\n'
   if [ -n "$ARCHIVE_PATH" ]; then
     printf 'Archive:\n  %s\n' "$ARCHIVE_PATH"
   else
@@ -553,6 +648,10 @@ main() {
   local ended_at verified_wechat_identity current_wechat_identity
 
   parse_args "$@"
+  if ! validate_operator_terminal; then
+    error "$LAST_ERROR"
+    return 1
+  fi
   FLOW_PHASE="validation"
   if ! validate_configuration; then
     error "$LAST_ERROR"
@@ -624,6 +723,12 @@ main() {
 
   FLOW_PHASE="start_agent_container"
   if ! start_agent_container; then
+    error "$LAST_ERROR"
+    return 1
+  fi
+
+  FLOW_PHASE="wait_docker_health"
+  if ! wait_for_agent_health; then
     error "$LAST_ERROR"
     return 1
   fi
