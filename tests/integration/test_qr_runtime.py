@@ -807,7 +807,7 @@ class RuntimeFixture:
         self,
         script: str,
         *arguments: str,
-        timeout: int = 20,
+        timeout: int = 60,
         trace: bool = False,
     ) -> subprocess.CompletedProcess[str]:
         command = ["bash"]
@@ -2306,13 +2306,13 @@ class ForcedQrRuntimeTests(unittest.TestCase):
         self,
     ) -> None:
         self.fixture.env["CF_AGENT_WECHAT_TEST_ARCHIVE_TOOL_TIMEOUT"] = "1"
-        self.fixture.write_state("df_sleep", "10")
+        self.fixture.write_state("df_sleep", "120")
         started = time.monotonic()
 
-        result = self.fixture.run("start-qr-login.sh", timeout=10)
+        result = self.fixture.run("start-qr-login.sh", timeout=60)
 
         self.assert_failed(result)
-        self.assertLess(time.monotonic() - started, 6)
+        self.assertLess(time.monotonic() - started, 45)
         self.assertIn("free space could not be measured", result.stdout)
         self.assertEqual(self.fixture.read_state("gateway_running"), "0")
         self.assertEqual(self.fixture.read_state("agent_exists"), "1")

@@ -387,6 +387,7 @@ LEXICAL_CANONICAL="$(/usr/bin/env -i \
   HOME="$TEST_ROOT" \
   PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
   LANG=C.UTF-8 LC_ALL=C.UTF-8 \
+  CF_AGENT_WECHAT_TESTING=1 \
   /bin/bash -c '
     source "$1/scripts/common.sh"
     testing_canonical_path "$2/unreadable/../auth-token"

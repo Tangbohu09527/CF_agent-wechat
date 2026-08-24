@@ -400,6 +400,7 @@ expect_production_override_failure() {
 
 expect_production_override_failure CF_BOOTSTRAP_DOCKER_TIMEOUT 424242
 expect_production_override_failure CF_BOOTSTRAP_COMPOSE_TIMEOUT 424243
+expect_production_override_failure DOCKER_HOST tcp://remote.invalid:2376
 expect_production_override_failure TOKEN_FILE /attacker/secret-sentinel
 expect_production_override_failure \
   CF_AGENT_WECHAT_TEST_GATEWAY_GATE_REPLACEMENT \
@@ -667,10 +668,18 @@ grep -Fq $'via_sudo=0\tinfo' "$MOCK_STATE/docker.log" ||
 assert_no_privileged_mock_docker
 pass "root-only testing Compose fixtures cannot trigger privileged mock execution"
 
-prepare_fixture docker-host
-expect_failure 'DOCKER_HOST cannot override the production local Docker daemon' \
-  DOCKER_HOST=tcp://remote.invalid:2376
-pass "DOCKER_HOST override is rejected before deployment mutation"
+prepare_fixture docker-host-clean-env
+touch "$MOCK_STATE/assert-gateway-clean-env"
+run_bootstrap "$OUTPUT" DOCKER_HOST=tcp://remote.invalid:2376 || {
+  sed -n '1,200p' "$OUTPUT" >&2
+  fail "testing DOCKER_HOST override was not safely scrubbed"
+}
+[ -e "$MOCK_STATE/gateway-env-clean" ] ||
+  fail "testing DOCKER_HOST clean-environment assertion did not run"
+[ ! -e "$MOCK_STATE/gateway-env-not-clean" ] ||
+  fail "testing DOCKER_HOST reached a Docker Compose child"
+assert_not_contains "$OUTPUT" tcp://remote.invalid:2376
+pass "testing DOCKER_HOST override is scrubbed before Docker execution"
 prepare_fixture socket-regular-file
 rm -f -- "$DOCKER_SOCKET"
 touch "$DOCKER_SOCKET"

@@ -332,7 +332,7 @@ install -d -o root -g root -m 700 -- "${NO_SUDO_HOME}/secrets"
 install -o root -g root -m 600 -- "$TOKEN_FILE" "$NO_SUDO_TOKEN_FILE"
 python3 - "${REPO_ROOT}/scripts/verify_gateway_contract.py" \
   "$GATEWAY_CONTRACT_FILE" "$GATEWAY_HEARTBEAT_COMMAND" \
-  "$GATEWAY_RELEASE_GATE_COMMAND" "$TOKEN_FILE" <<'PY'
+  "$GATEWAY_RELEASE_GATE_COMMAND" "$TOKEN_FILE" "$TEST_AGENT_PORT" <<'PY'
 import argparse
 import hashlib
 import importlib.util
@@ -341,8 +341,9 @@ import sys
 from pathlib import Path
 
 verifier_path, contract_path, checker_path, gate_path, token_path = map(
-    Path, sys.argv[1:]
+    Path, sys.argv[1:6]
 )
+agent_port = int(sys.argv[6])
 spec = importlib.util.spec_from_file_location(
     "permission_fixture_gateway_contract", verifier_path
 )
@@ -353,7 +354,7 @@ spec.loader.exec_module(verifier)
 contract = verifier.expected_contract(
     argparse.Namespace(
         alias="cf-agent-wechat",
-        port=6174,
+        port=agent_port,
         token_file=str(token_path),
         checker=str(checker_path),
         gate=str(gate_path),
