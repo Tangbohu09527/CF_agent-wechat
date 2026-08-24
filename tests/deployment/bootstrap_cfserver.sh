@@ -633,7 +633,7 @@ pass "caller PATH cannot replace Docker, OpenSSL, systemctl, or timeout"
 
 prepare_fixture unsafe-docker-tool
 chmod 777 "$MOCK_BIN/docker"
-expect_failure 'Docker CLI must not be group/other writable'
+expect_failure 'testing Docker mock has unsafe owner, mode, or link count'
 pass "unsafe Docker CLI metadata is rejected before privileged execution"
 
 prepare_fixture docker-fallback

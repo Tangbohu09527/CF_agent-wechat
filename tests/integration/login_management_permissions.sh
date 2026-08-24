@@ -2,6 +2,7 @@
 set -euo pipefail
 
 REPO_ROOT="$(CDPATH='' cd -- "$(dirname -- "$0")/../.." && pwd -P)"
+TEST_HARNESS_ROOT=""
 TEST_ROOT=""
 DEPLOYMENT_DIR=""
 TEST_USER="cfwtest$$"
@@ -52,8 +53,8 @@ cleanup() {
   rm -f "$SUDOERS_FILE"
   userdel --force --remove "$TEST_USER" >/dev/null 2>&1
   userdel --force --remove "$NO_SUDO_USER" >/dev/null 2>&1
-  if [ -n "$TEST_ROOT" ]; then
-    rm -rf "$TEST_ROOT"
+  if [ -n "$TEST_HARNESS_ROOT" ]; then
+    rm -rf "$TEST_HARNESS_ROOT"
   fi
   if [ "$SECRETS_CREATED" -eq 1 ]; then
     rm -f "$TOKEN_FILE" "${TOKEN_FILE}.saved"
@@ -83,8 +84,10 @@ done
 REAL_DOCKER="$(command -v docker)"
 REAL_SUDO="$(command -v sudo)"
 
-TEST_ROOT="$(mktemp -d /tmp/cf-agent-wechat-permissions.XXXXXX)"
-chmod 755 "$TEST_ROOT"
+TEST_HARNESS_ROOT="$(mktemp -d /tmp/cf-agent-wechat-permissions.XXXXXX)"
+chmod 755 "$TEST_HARNESS_ROOT"
+TEST_ROOT="${TEST_HARNESS_ROOT}/status-fixture"
+install -d -m 755 "$TEST_ROOT"
 DEPLOYMENT_DIR="${TEST_ROOT}/deployment"
 STORAGE_ROOT="$DEPLOYMENT_DIR"
 RUNTIME_ROOT="${STORAGE_ROOT}/runtime"
@@ -119,6 +122,7 @@ GATEWAY_ENV_FILE="${GATEWAY_PROJECT_DIR}/.env"
 GATEWAY_ENV_SENTINEL="gateway-env-fixture-sensitive-permissions-$$"
 GATEWAY_DEPLOY_DIR="${GATEWAY_PROJECT_DIR}/deploy"
 GATEWAY_HEARTBEAT_COMMAND="${GATEWAY_DEPLOY_DIR}/check-wechat-worker-heartbeat"
+GATEWAY_RELEASE_GATE_COMMAND="${GATEWAY_DEPLOY_DIR}/wechat-runtime-release-gate"
 GATEWAY_CONTRACT_FILE="${GATEWAY_DEPLOY_DIR}/wechat-runtime-contract.json"
 MOCK_DOCKER_BACKEND="${AUDIT_BIN}/docker-backend"
 MOCK_DOCKER_STATE_DIR="${TEST_ROOT}/docker-state"
@@ -132,10 +136,24 @@ TEST_RUNTIME_UID="$(id -u "$TEST_USER")"
 TEST_RUNTIME_GID="$(id -g "$TEST_USER")"
 install -d -o "$TEST_USER" -g "$TEST_USER" -m 700 "$TEST_TMPDIR"
 install -d -o "$NO_SUDO_USER" -g "$NO_SUDO_USER" -m 700 "$NO_SUDO_TMPDIR"
+if [ -L "$TEST_TMPDIR" ] ||
+  [ "$(stat -Lc '%u:%g:%a' -- "$TEST_TMPDIR")" != \
+    "${TEST_RUNTIME_UID}:${TEST_RUNTIME_GID}:700" ]; then
+  fail "status fixture temporary directory metadata is unsafe"
+fi
+for isolated_asset in "$TEST_TMPDIR" "$TOKEN_FILE" "$DOCKER_SOCKET" \
+  "$MOCK_DOCKER_STATE_DIR" "$RUNTIME_LOCK_FILE"; do
+  case "${isolated_asset}/" in
+    "${TEST_ROOT}/"?*) ;;
+    *) fail "status fixture asset escaped its isolated testing root" ;;
+  esac
+done
+unset isolated_asset
 
 TEST_DOCKER_ENV=(
   "CF_AGENT_WECHAT_TEST_ROOT=${TEST_ROOT}"
   "TMPDIR=${TEST_TMPDIR}"
+  "MOCK_TMPDIR=${TEST_TMPDIR}"
   "CF_AGENT_WECHAT_DOCKER_BIN=${AUDIT_BIN}/docker"
   "CF_AGENT_WECHAT_SYSTEMCTL_BIN=${AUDIT_BIN}/systemctl"
   "CF_AGENT_WECHAT_DF_BIN=${AUDIT_BIN}/df"
@@ -208,6 +226,17 @@ install -o root -g root -m 755 \
   "${REPO_ROOT}/tests/helpers/mock_df.sh" "${AUDIT_BIN}/df"
 install -o root -g root -m 755 \
   "${REPO_ROOT}/tests/helpers/mock_docker.sh" "$MOCK_DOCKER_BACKEND"
+printf '%s\n' \
+  '#!/bin/sh' \
+  'set -eu' \
+  ': "${MOCK_TMPDIR:?}"' \
+  ': "${CF_AUDIT_LOG:?}"' \
+  'printf "mktemp\tconfined\tlocal\n" >> "$CF_AUDIT_LOG"' \
+  'TMPDIR="$MOCK_TMPDIR"' \
+  'export TMPDIR' \
+  'exec /usr/bin/mktemp "$@"' > "${AUDIT_BIN}/mktemp"
+chown root:root "${AUDIT_BIN}/mktemp"
+chmod 755 "${AUDIT_BIN}/mktemp"
 python3 - "$DOCKER_SOCKET" <<'PY'
 import socket
 import sys
@@ -258,8 +287,9 @@ printf '%s\n' \
 chown root:root "$AGENT_ENV_FILE" "$GATEWAY_ENV_FILE"
 chmod 600 "$AGENT_ENV_FILE" "$GATEWAY_ENV_FILE"
 printf '%s\n' '#!/bin/sh' 'exit 0' > "$GATEWAY_HEARTBEAT_COMMAND"
-chown root:root "$GATEWAY_HEARTBEAT_COMMAND"
-chmod 755 "$GATEWAY_HEARTBEAT_COMMAND"
+printf '%s\n' '#!/bin/sh' 'exit 0' > "$GATEWAY_RELEASE_GATE_COMMAND"
+chown root:root "$GATEWAY_HEARTBEAT_COMMAND" "$GATEWAY_RELEASE_GATE_COMMAND"
+chmod 755 "$GATEWAY_HEARTBEAT_COMMAND" "$GATEWAY_RELEASE_GATE_COMMAND"
 : > "$AUDIT_LOG"
 chown "$TEST_USER:$TEST_USER" "$AUDIT_LOG"
 chmod 600 "$AUDIT_LOG"
@@ -280,50 +310,41 @@ chmod 600 "$TOKEN_FILE"
 NO_SUDO_TOKEN_FILE="${NO_SUDO_HOME}/secrets/auth-token"
 install -d -o root -g root -m 700 -- "${NO_SUDO_HOME}/secrets"
 install -o root -g root -m 600 -- "$TOKEN_FILE" "$NO_SUDO_TOKEN_FILE"
-python3 - "$GATEWAY_CONTRACT_FILE" "$GATEWAY_HEARTBEAT_COMMAND" \
-  "$TOKEN_FILE" <<'PY'
+python3 - "${REPO_ROOT}/scripts/verify_gateway_contract.py" \
+  "$GATEWAY_CONTRACT_FILE" "$GATEWAY_HEARTBEAT_COMMAND" \
+  "$GATEWAY_RELEASE_GATE_COMMAND" "$TOKEN_FILE" <<'PY'
+import argparse
 import hashlib
+import importlib.util
 import json
 import sys
 from pathlib import Path
 
-contract_path = Path(sys.argv[1])
-checker_path = Path(sys.argv[2])
-token_path = Path(sys.argv[3])
-contract = {
-    "contractVersion": "1",
-    "producer": {
-        "repository": "Tangbohu09527/CF_agent-gateway",
-        "checkerSha256": hashlib.sha256(checker_path.read_bytes()).hexdigest(),
-    },
-    "agent": {
-        "networkAlias": "cf-agent-wechat",
-        "port": 6174,
-        "tokenAuthority": {
-            "hostPath": str(token_path),
-            "ownership": "root:root",
-            "mode": "0600",
-        },
-    },
-    "gateway": {
-        "service": "worker",
-        "composeProject": "cf-agent-gateway",
-        "checker": str(checker_path),
-        "checkerInterfaceVersion": 1,
-        "heartbeatMaxAgeSeconds": 30,
-        "requiresDockerHealth": True,
-        "requiresSuccessfulPoll": True,
-        "requiresLoggedIn": True,
-        "silentOutput": True,
-        "credential": {
-            "type": "file",
-            "environmentVariable": "CF_AGENT_WECHAT_TOKEN_FILE",
-            "workerPath": "/run/secrets/cf-agent-wechat-auth-token",
-            "readOnly": True,
-            "forbiddenEnvironmentVariable": "CF_AGENT_WECHAT_TOKEN",
-        },
-    },
-}
+verifier_path, contract_path, checker_path, gate_path, token_path = map(
+    Path, sys.argv[1:]
+)
+spec = importlib.util.spec_from_file_location(
+    "permission_fixture_gateway_contract", verifier_path
+)
+if spec is None or spec.loader is None:
+    raise SystemExit("Gateway contract fixture builder is unavailable")
+verifier = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(verifier)
+contract = verifier.expected_contract(
+    argparse.Namespace(
+        alias="cf-agent-wechat",
+        port=6174,
+        token_file=str(token_path),
+        checker=str(checker_path),
+        gate=str(gate_path),
+        checker_sha256=hashlib.sha256(checker_path.read_bytes()).hexdigest(),
+        gate_sha256=hashlib.sha256(gate_path.read_bytes()).hexdigest(),
+        producer_repository="Tangbohu09527/CF_agent-gateway",
+        service="worker",
+        project="cf-agent-gateway",
+        max_age=30,
+    )
+)
 contract_path.write_text(json.dumps(contract) + "\n", encoding="utf-8")
 PY
 chown root:root "$GATEWAY_CONTRACT_FILE"
@@ -420,6 +441,8 @@ assert_runtime_mock_runs_directly() {
 }
 
 assert_status_docker_paths() {
+  [ "$(audit_count mktemp confined)" -ge 1 ] || \
+    fail "status.sh did not create temporary snapshots in its confined fixture"
   [ "$(audit_count docker info)" -eq 3 ] || \
     fail "status.sh did not inspect Docker availability, security, and live-restore"
   [ "$(audit_count docker context)" -eq 2 ] || \
@@ -457,6 +480,8 @@ assert_secret_permissions() {
     fail "Gateway environment file permissions changed"
   [ "$(stat -c '%U:%G %a' "$GATEWAY_HEARTBEAT_COMMAND")" = "root:root 755" ] || \
     fail "Gateway heartbeat checker permissions changed"
+  [ "$(stat -c '%U:%G %a' "$GATEWAY_RELEASE_GATE_COMMAND")" = "root:root 755" ] || \
+    fail "Gateway runtime release gate permissions changed"
   [ "$(stat -c '%U:%G %a' "$GATEWAY_CONTRACT_FILE")" = "root:root 600" ] || \
     fail "Gateway runtime contract permissions changed"
 }

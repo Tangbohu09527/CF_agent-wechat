@@ -252,7 +252,7 @@ class RuntimeFixture:
                     raise SystemExit(0)
                 if mode == "replace-instance":
                     (root / "gateway_compose_id").write_text(
-                        "d" * 64 + "\n", encoding="ascii"
+                        "d" * 64 + "\\n", encoding="ascii"
                     )
                     raise SystemExit(0)
                 raise SystemExit(0 if mode == "healthy" else 1)
@@ -280,7 +280,7 @@ class RuntimeFixture:
                     return path.read_text(encoding="ascii").strip() if path.exists() else default
 
                 def write_state(name, value):
-                    (root / name).write_text(value + "\n", encoding="ascii")
+                    (root / name).write_text(value + "\\n", encoding="ascii")
 
                 def remove_state(name):
                     (root / name).unlink(missing_ok=True)
@@ -306,11 +306,11 @@ class RuntimeFixture:
                 ):
                     raise SystemExit(1)
                 with log_path.open("a", encoding="ascii") as stream:
-                    stream.write(operation + "\n")
+                    stream.write(operation + "\\n")
                 with Path(os.environ["MOCK_DOCKER_LOG"]).open(
                     "a", encoding="ascii"
                 ) as stream:
-                    stream.write("gateway gate " + operation + "\n")
+                    stream.write("gateway gate " + operation + "\\n")
                 mode = read_state("gateway_gate_mode", "healthy")
                 if mode == "timeout-" + operation:
                     time.sleep(30)
@@ -2863,10 +2863,19 @@ class ForcedQrRuntimeTests(unittest.TestCase):
                 result = self.fixture.run(script_name)
                 self.assert_failed(result)
 
-                self.assertIn(
-                    "agent-wechat environment file",
-                    result.stdout.lower(),
-                )
+                if mode == "relative":
+                    self.assertRegex(
+                        result.stdout.lower(),
+                        (
+                            r"testing asset paths must be absolute"
+                            r"|testing management assets are not isolated"
+                        ),
+                    )
+                else:
+                    self.assertIn(
+                        "agent-wechat environment file",
+                        result.stdout.lower(),
+                    )
                 self.assertEqual(
                     tree_digest(self.fixture.storage),
                     storage_before,
