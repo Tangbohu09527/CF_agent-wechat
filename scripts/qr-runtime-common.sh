@@ -1815,13 +1815,13 @@ runtime_gateway_verifier_snapshot() {
     runtime_with_timeout "$DOCKER_COMMAND_TIMEOUT" \
       /usr/bin/env "${clean_env[@]}" \
       "$PYTHON_BIN" -I -c "$GATEWAY_VERIFIER_SNAPSHOT_LOADER" \
-      gateway-verifier-snapshot "$mode" "$GATEWAY_CONTRACT_VERIFIER" \
+      "$mode" "$GATEWAY_CONTRACT_VERIFIER" \
       "$expected_digest" "$approved_uid" "$@"
   else
     runtime_privileged "$TIMEOUT_BIN" --signal=TERM --kill-after=2s \
       "${DOCKER_COMMAND_TIMEOUT}s" /usr/bin/env "${clean_env[@]}" \
       /usr/bin/python3 -I -c "$GATEWAY_VERIFIER_SNAPSHOT_LOADER" \
-      gateway-verifier-snapshot "$mode" "$GATEWAY_CONTRACT_VERIFIER" \
+      "$mode" "$GATEWAY_CONTRACT_VERIFIER" \
       "$expected_digest" "$approved_uid" "$@"
   fi
 }
@@ -1894,7 +1894,7 @@ runtime_gateway_executable_snapshot() {
       "CF_AGENT_WECHAT_TEST_GATEWAY_CHECKER_REPLACEMENT=${CF_AGENT_WECHAT_TEST_GATEWAY_CHECKER_REPLACEMENT:-}" \
       "CF_AGENT_WECHAT_TEST_GATEWAY_GATE_REPLACEMENT=${CF_AGENT_WECHAT_TEST_GATEWAY_GATE_REPLACEMENT:-}" \
       "$PYTHON_BIN" -I -c "$GATEWAY_CHECKER_SNAPSHOT_LOADER" \
-      gateway-executable-snapshot "$mode" "$executable_path" \
+      "$mode" "$executable_path" \
       "$GATEWAY_PROJECT_DIR" "$expected_digest" "$approved_uid" \
       "$timeout_seconds" "$executable_kind" "$input_transport" "$@"
   else
@@ -1904,7 +1904,7 @@ runtime_gateway_executable_snapshot() {
       PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
       LANG=C.UTF-8 LC_ALL=C.UTF-8 \
       "$PYTHON_BIN" -I -c "$GATEWAY_CHECKER_SNAPSHOT_LOADER" \
-      gateway-executable-snapshot "$mode" "$executable_path" \
+      "$mode" "$executable_path" \
       "$GATEWAY_PROJECT_DIR" "$expected_digest" "$approved_uid" \
       "$timeout_seconds" "$executable_kind" "$input_transport" "$@"
   fi

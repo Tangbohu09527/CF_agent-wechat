@@ -2200,13 +2200,13 @@ bootstrap_gateway_verifier_snapshot() {
     run_with_hard_timeout "$DOCKER_TIMEOUT" \
       /usr/bin/env "${clean_env[@]}" \
       /usr/bin/python3 -I -c "$GATEWAY_VERIFIER_SNAPSHOT_LOADER" \
-      gateway-verifier-snapshot "$mode" "$GATEWAY_CONTRACT_VERIFIER" \
+      "$mode" "$GATEWAY_CONTRACT_VERIFIER" \
       "$expected_digest" "$MANAGEMENT_UID" "$@"
   else
     run_privileged_with_hard_timeout "$DOCKER_TIMEOUT" \
       /usr/bin/env "${clean_env[@]}" \
       /usr/bin/python3 -I -c "$GATEWAY_VERIFIER_SNAPSHOT_LOADER" \
-      gateway-verifier-snapshot "$mode" "$GATEWAY_CONTRACT_VERIFIER" \
+      "$mode" "$GATEWAY_CONTRACT_VERIFIER" \
       "$expected_digest" "$MANAGEMENT_UID" "$@"
   fi
 }
@@ -2236,7 +2236,7 @@ bootstrap_capture_gateway_executable_digest() {
     run_with_hard_timeout "$DOCKER_TIMEOUT" \
       /usr/bin/env "${clean_env[@]}" \
       /usr/bin/python3 -I -c "$GATEWAY_VERIFIER_SNAPSHOT_LOADER" \
-      gateway-artifact-snapshot digest "$path" - "$MANAGEMENT_UID" \
+      digest "$path" - "$MANAGEMENT_UID" \
       2>/dev/null
   )" || ! [[ "$digest" =~ ^[0-9a-f]{64}$ ]]; then
     return 1

@@ -38,7 +38,7 @@ done
 if [ "$python_or_pip" -eq 1 ]; then
   for argument in "${sudo_arguments[@]}"; do
     case "$argument" in
-      */parse_management_env.py|*/verify_management_source_secrets.py|gateway-verifier-snapshot|*'base64.b64encode(b"".join(chunks))'*)
+      */parse_management_env.py|*/verify_management_source_secrets.py|*'Gateway verifier snapshot validation failed.'*|*'base64.b64encode(b"".join(chunks))'*)
         approved_management_python=1
         ;;
     esac

@@ -798,13 +798,33 @@ printf 'PASS non-permission Docker error does not use sudo\n'
 
 TEST_STAGE="runtime Docker mock privilege boundary"
 reset_audit
+WECHAT_IDENTITY_PROBE='
+launcher_real="$(readlink -f /usr/bin/wechat 2>/dev/null || true)"
+case "$launcher_real" in
+  /*) ;;
+  *) exit 1 ;;
+esac
+
+for process_dir in /proc/[0-9]*; do
+  proc_exe="$(readlink "$process_dir/exe" 2>/dev/null || true)"
+  [ "$proc_exe" = "$launcher_real" ] || continue
+  process_id="${process_dir##*/}"
+  start_time="$(awk "{ print \$22 }" "$process_dir/stat" 2>/dev/null || true)"
+  [ -n "$start_time" ] || continue
+  printf "%s:%s\n" "$process_id" "$start_time"
+  exit 0
+done
+exit 1
+'
 assert_runtime_mock_runs_directly info info
 assert_runtime_mock_runs_directly compose \
   compose --env-file "$AGENT_ENV_FILE" \
   --project-directory "$TEST_REPO" -f "$AGENT_COMPOSE_FILE" \
   ps --all --quiet agent-wechat
-assert_runtime_mock_runs_directly exec exec "$TEST_CONTAINER" true
+assert_runtime_mock_runs_directly exec \
+  exec "$TEST_CONTAINER" sh -c "$WECHAT_IDENTITY_PROBE"
 assert_runtime_mock_runs_directly inspect inspect "$TEST_CONTAINER"
+unset WECHAT_IDENTITY_PROBE
 printf 'PASS runtime Docker mock rejects every sudo execution path\n'
 
 TEST_STAGE="failed-agent cleanup privilege boundary"

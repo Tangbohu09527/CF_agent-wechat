@@ -1044,6 +1044,23 @@ exit 1
             text=True,
             timeout=10,
         )
+        subprocess.run(
+            [
+                sudo,
+                "-n",
+                shutil.which("git") or "git",
+                "-c",
+                f"safe.directory={self.project}",
+                "-C",
+                str(self.project),
+                "update-index",
+                "--refresh",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
         try:
             plain_environment = {
                 "HOME": "/nonexistent",
@@ -1141,12 +1158,14 @@ class GatewayVerifierSnapshotTests(unittest.TestCase):
     ) -> subprocess.CompletedProcess[str]:
         environment = os.environ.copy()
         environment["CF_AGENT_WECHAT_TESTING"] = "1"
+        environment["CF_AGENT_WECHAT_TEST_ROOT"] = str(self.root)
         if replacement is not None:
             environment[
                 "CF_AGENT_WECHAT_TEST_GATEWAY_VERIFIER_REPLACEMENT"
             ] = str(replacement)
         script = r"""
 set -uo pipefail
+source "$1/scripts/common.sh"
 source "$1/scripts/qr-runtime-common.sh"
 runtime_privileged() {
   "$@"
@@ -1297,6 +1316,7 @@ class GatewayCheckerSnapshotTests(unittest.TestCase):
     ) -> subprocess.CompletedProcess[str]:
         environment = os.environ.copy()
         environment["CF_AGENT_WECHAT_TESTING"] = "1"
+        environment["CF_AGENT_WECHAT_TEST_ROOT"] = str(self.root)
         environment["CHECKER_MARKER"] = str(self.marker)
         if replacement is not None:
             environment[
@@ -1304,6 +1324,7 @@ class GatewayCheckerSnapshotTests(unittest.TestCase):
             ] = str(replacement)
         script = r"""
 set -uo pipefail
+source "$1/scripts/common.sh"
 source "$1/scripts/qr-runtime-common.sh"
 GATEWAY_HEARTBEAT_COMMAND="$2"
 GATEWAY_PROJECT_DIR="$3"
@@ -1315,7 +1336,7 @@ case "$5" in
     ;;
   execute)
     digest="$(runtime_capture_gateway_checker_digest)" || exit 1
-    runtime_gateway_checker_snapshot 5 execute "$digest"
+    runtime_gateway_checker_snapshot 5 execute "$digest" none
     ;;
   *)
     exit 2
