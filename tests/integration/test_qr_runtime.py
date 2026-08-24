@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import os
@@ -3702,5 +3703,93 @@ class ForcedQrRuntimeTests(unittest.TestCase):
         self.assertEqual(self.fixture.read_state("gateway_running"), "0")
 
 
+def _flatten_test_suite(suite: unittest.TestSuite) -> list[unittest.TestCase]:
+    tests: list[unittest.TestCase] = []
+    for item in suite:
+        if isinstance(item, unittest.TestSuite):
+            tests.extend(_flatten_test_suite(item))
+        elif isinstance(item, unittest.TestCase):
+            tests.append(item)
+        else:
+            raise TypeError(f"Unsupported unittest item: {type(item).__name__}")
+    return tests
+
+
+def _run_lifecycle_shard(shard_index: int, shard_count: int) -> int:
+    if shard_count < 1:
+        raise ValueError("--shard-count must be greater than zero")
+    if shard_index < 0 or shard_index >= shard_count:
+        raise ValueError("--shard-index must be within the shard count")
+
+    loaded = unittest.defaultTestLoader.loadTestsFromTestCase(
+        ForcedQrRuntimeTests
+    )
+    all_tests = _flatten_test_suite(loaded)
+    all_ids = [test.id() for test in all_tests]
+    if len(all_ids) != len(set(all_ids)):
+        raise RuntimeError("Lifecycle test discovery produced duplicate IDs")
+
+    partitions: list[list[unittest.TestCase]] = [
+        [] for _ in range(shard_count)
+    ]
+    for test in all_tests:
+        test_id = test.id()
+        target = int(hashlib.sha256(test_id.encode("utf-8")).hexdigest(), 16)
+        partitions[target % shard_count].append(test)
+
+    partition_ids = [
+        test.id() for partition in partitions for test in partition
+    ]
+    if (
+        len(partition_ids) != len(all_ids)
+        or len(partition_ids) != len(set(partition_ids))
+        or set(partition_ids) != set(all_ids)
+    ):
+        raise RuntimeError(
+            "Lifecycle shard partition is not a complete disjoint test set"
+        )
+
+    selected = partitions[shard_index]
+    selected_ids = [test.id() for test in selected]
+    partition_sizes = ",".join(str(len(partition)) for partition in partitions)
+    print(
+        "Lifecycle shard inventory: "
+        f"index={shard_index} count={shard_count} total={len(all_tests)} "
+        f"selected={len(selected)} partition_sizes={partition_sizes}",
+        flush=True,
+    )
+    print(
+        "Lifecycle shard partition validation: complete, disjoint, no omissions",
+        flush=True,
+    )
+    print("Lifecycle shard test IDs:", flush=True)
+    for test_id in selected_ids:
+        print(test_id, flush=True)
+
+    result = unittest.TextTestRunner(verbosity=2, failfast=True).run(
+        unittest.TestSuite(selected)
+    )
+    return 0 if result.wasSuccessful() else 1
+
+
 if __name__ == "__main__":
+    shard_options = {"--shard-index", "--shard-count"}
+    has_shard_option = any(
+        argument.split("=", 1)[0] in shard_options
+        for argument in sys.argv[1:]
+    )
+    if has_shard_option:
+        parser = argparse.ArgumentParser(
+            description="Run one deterministic forced-QR lifecycle test shard."
+        )
+        parser.add_argument("--shard-index", type=int, required=True)
+        parser.add_argument("--shard-count", type=int, required=True)
+        arguments = parser.parse_args()
+        try:
+            exit_code = _run_lifecycle_shard(
+                arguments.shard_index, arguments.shard_count
+            )
+        except (RuntimeError, ValueError) as error:
+            parser.error(str(error))
+        raise SystemExit(exit_code)
     unittest.main(verbosity=2)

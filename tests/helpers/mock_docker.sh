@@ -706,11 +706,14 @@ case "$command_name" in
       record 'forbidden gateway compose up'
       exit 66
     else
-      [ "${*: -1}" = agent-wechat ] || exit 65
-      case " $* " in
-        *' --no-start '*' --force-recreate '*' --no-deps '*) ;;
-        *) record 'agent candidate create flags invalid'; exit 65 ;;
-      esac
+      if [ "$#" -ne 4 ] ||
+        [ "$1" != --no-start ] ||
+        [ "$2" != --force-recreate ] ||
+        [ "$3" != --no-deps ] ||
+        [ "$4" != agent-wechat ]; then
+        record 'agent candidate create flags invalid'
+        exit 65
+      fi
       mutate 'agent container create stopped'
       state_set agent_exists 1
       state_set agent_running 0

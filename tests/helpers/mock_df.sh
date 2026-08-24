@@ -20,7 +20,7 @@ fi
 
 df_sleep="$(state_get df_sleep 0)"
 if [ "$df_sleep" != 0 ]; then
-  sleep "$df_sleep"
+  exec sleep "$df_sleep"
 fi
 
 case "${1:-}" in

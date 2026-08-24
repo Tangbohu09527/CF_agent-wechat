@@ -67,6 +67,13 @@ assert_no_lifecycle_commands() {
     fi
   }
 }
+assert_no_privileged_mock_docker() {
+  local log_file="$MOCK_STATE/docker.log"
+  if [ -f "$log_file" ] && grep -Fq $'docker\tvia_sudo=1' "$log_file"; then
+    fail "Bootstrap attempted to execute a testing Docker mock through sudo"
+  fi
+}
+
 
 replace_agent_env_value() {
   local key="$1" value="$2"
@@ -634,33 +641,31 @@ pass "caller PATH cannot replace Docker, OpenSSL, systemctl, or timeout"
 prepare_fixture unsafe-docker-tool
 chmod 777 "$MOCK_BIN/docker"
 expect_failure 'testing Docker mock has unsafe owner, mode, or link count'
+[ ! -s "$MOCK_STATE/docker.log" ] ||
+  fail "Bootstrap executed an unsafe Docker mock"
+[ ! -s "$MOCK_STATE/systemctl.log" ] ||
+  fail "Bootstrap performed a systemd probe after rejecting an unsafe Docker mock"
+assert_no_privileged_mock_docker
 pass "unsafe Docker CLI metadata is rejected before privileged execution"
 
-prepare_fixture docker-fallback
+prepare_fixture testing-docker-permission-denied
 touch "$MOCK_STATE/deny-direct"
-run_bootstrap "$OUTPUT" || {
-  sed -n '1,200p' "$OUTPUT" >&2
-  fail "Docker socket permission fallback did not succeed"
-}
+expect_failure 'testing Docker mock failed without privilege; sudo fallback is forbidden'
 grep -Fq $'via_sudo=0\tinfo' "$MOCK_STATE/docker.log" ||
   fail "ordinary Docker access was not attempted first"
-grep -Fq $'via_sudo=1\tinfo' "$MOCK_STATE/docker.log" ||
-  fail "Docker access did not fall back to sudo -n"
+assert_no_privileged_mock_docker
 [ "$(sudo -n -- stat -c '%u:%g:%a' "$TOKEN_FILE")" = '0:0:600' ] ||
   fail "ordinary-user flow did not retain a root-only Token"
-pass "ordinary user authorizes once and uses Docker socket sudo fallback"
+# The fixed /usr/bin/docker sudo fallback is exercised in the permissions suite.
+pass "testing Docker permission failures cannot cross the sudo boundary"
 
 prepare_fixture root-protected-config
 sudo -n -- chown 0:0 "$AGENT_ENV" "$GATEWAY_ENV"
-run_bootstrap "$OUTPUT" || {
-  sed -n '1,200p' "$OUTPUT" >&2
-  fail "root-protected Compose configuration did not use sudo -n"
-}
+expect_failure 'testing Compose fixtures must be readable without sudo'
 grep -Fq $'via_sudo=0\tinfo' "$MOCK_STATE/docker.log" ||
   fail "root-protected config scenario did not probe Docker directly first"
-grep -Fq $'via_sudo=1\tcompose' "$MOCK_STATE/docker.log" ||
-  fail "root-protected Compose configuration was not rendered through sudo -n"
-pass "root-only Compose environment uses the authorized sudo -n path"
+assert_no_privileged_mock_docker
+pass "root-only testing Compose fixtures cannot trigger privileged mock execution"
 
 prepare_fixture docker-host
 expect_failure 'DOCKER_HOST cannot override the production local Docker daemon' \
@@ -887,14 +892,13 @@ pass "docker.service is included in enabled-unit definition inspection"
 prepare_fixture docker-timeout
 touch "$MOCK_STATE/hang-info-once"
 STARTED=$SECONDS
-run_bootstrap "$OUTPUT" CF_BOOTSTRAP_DOCKER_TIMEOUT=1 || {
-  sed -n '1,200p' "$OUTPUT" >&2
-  fail "Docker timeout did not continue through the authorized fallback"
-}
+expect_failure 'testing Docker mock failed without privilege; sudo fallback is forbidden' \
+  CF_BOOTSTRAP_DOCKER_TIMEOUT=1
 ELAPSED=$((SECONDS - STARTED))
 [ "$ELAPSED" -le 6 ] || fail "Docker hard timeout exceeded six seconds"
 assert_process_reaped "$MOCK_STATE/hang.pid" "Docker hard timeout"
-pass "Docker commands have a hard timeout and timed-out children are reaped"
+assert_no_privileged_mock_docker
+pass "Docker commands have a hard timeout, reap children, and do not sudo after failure"
 
 prepare_fixture compose-timeout
 touch "$MOCK_STATE/hang-compose"

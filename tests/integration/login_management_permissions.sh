@@ -113,12 +113,17 @@ AUDIT_LOG="${TEST_ROOT}/audit.log"
 AUDIT_PATH="${AUDIT_BIN}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 AGENT_COMPOSE_FILE="${TEST_ROOT}/agent-compose.yaml"
 AGENT_ENV_FILE="${TEST_ROOT}/agent.env"
+ROOT_CONFIG_DIR="${TEST_ROOT}/root-only-config"
+ROOT_AGENT_COMPOSE_FILE="${ROOT_CONFIG_DIR}/agent-compose.yaml"
+ROOT_AGENT_ENV_FILE="${ROOT_CONFIG_DIR}/agent.env"
 AGENT_ENV_SENTINEL="agent-env-fixture-sensitive-permissions-$$"
 APPROVED_AGENT_IMAGE="ghcr.io/example/agent-wechat@sha256:$(printf '%064d' 0)"
 APPROVED_PROXY="http://${AGENT_ENV_SENTINEL}.invalid:8080"
 GATEWAY_PROJECT_DIR="${TEST_ROOT}/gateway"
 GATEWAY_COMPOSE_FILE="${GATEWAY_PROJECT_DIR}/compose.yaml"
 GATEWAY_ENV_FILE="${GATEWAY_PROJECT_DIR}/.env"
+ROOT_GATEWAY_COMPOSE_FILE="${ROOT_CONFIG_DIR}/gateway-compose.yaml"
+ROOT_GATEWAY_ENV_FILE="${ROOT_CONFIG_DIR}/gateway.env"
 GATEWAY_ENV_SENTINEL="gateway-env-fixture-sensitive-permissions-$$"
 GATEWAY_DEPLOY_DIR="${GATEWAY_PROJECT_DIR}/deploy"
 GATEWAY_HEARTBEAT_COMMAND="${GATEWAY_DEPLOY_DIR}/check-wechat-worker-heartbeat"
@@ -153,7 +158,6 @@ unset isolated_asset
 TEST_DOCKER_ENV=(
   "CF_AGENT_WECHAT_TEST_ROOT=${TEST_ROOT}"
   "TMPDIR=${TEST_TMPDIR}"
-  "MOCK_TMPDIR=${TEST_TMPDIR}"
   "CF_AGENT_WECHAT_DOCKER_BIN=${AUDIT_BIN}/docker"
   "CF_AGENT_WECHAT_SYSTEMCTL_BIN=${AUDIT_BIN}/systemctl"
   "CF_AGENT_WECHAT_DF_BIN=${AUDIT_BIN}/df"
@@ -185,6 +189,7 @@ TEST_DOCKER_ENV=(
 TEST_MANAGEMENT_ENV=(
   "CF_AGENT_WECHAT_TEST_ROOT=${TEST_ROOT}"
   "TMPDIR=${TEST_TMPDIR}"
+  "MOCK_TMPDIR=${TEST_TMPDIR}"
   "TOKEN_FILE=${TOKEN_FILE}"
   "CF_AGENT_WECHAT_STORAGE_ROOT=${STORAGE_ROOT}"
   "CF_AGENT_WECHAT_RUNTIME_ROOT=${RUNTIME_ROOT}"
@@ -286,6 +291,21 @@ printf '%s\n' \
   "FIXTURE_SENTINEL=$GATEWAY_ENV_SENTINEL" > "$GATEWAY_ENV_FILE"
 chown root:root "$AGENT_ENV_FILE" "$GATEWAY_ENV_FILE"
 chmod 600 "$AGENT_ENV_FILE" "$GATEWAY_ENV_FILE"
+install -d -o root -g root -m 755 "$ROOT_CONFIG_DIR"
+install -o root -g root -m 600 \
+  "$AGENT_COMPOSE_FILE" "$ROOT_AGENT_COMPOSE_FILE"
+install -o root -g root -m 600 \
+  "$AGENT_ENV_FILE" "$ROOT_AGENT_ENV_FILE"
+install -o root -g root -m 600 \
+  "$GATEWAY_COMPOSE_FILE" "$ROOT_GATEWAY_COMPOSE_FILE"
+install -o root -g root -m 600 \
+  "$GATEWAY_ENV_FILE" "$ROOT_GATEWAY_ENV_FILE"
+chown "$TEST_USER:$TEST_USER" \
+  "$AGENT_COMPOSE_FILE" "$AGENT_ENV_FILE" \
+  "$GATEWAY_COMPOSE_FILE" "$GATEWAY_ENV_FILE"
+chmod 600 \
+  "$AGENT_COMPOSE_FILE" "$AGENT_ENV_FILE" \
+  "$GATEWAY_COMPOSE_FILE" "$GATEWAY_ENV_FILE"
 printf '%s\n' '#!/bin/sh' 'exit 0' > "$GATEWAY_HEARTBEAT_COMMAND"
 printf '%s\n' '#!/bin/sh' 'exit 0' > "$GATEWAY_RELEASE_GATE_COMMAND"
 chown root:root "$GATEWAY_HEARTBEAT_COMMAND" "$GATEWAY_RELEASE_GATE_COMMAND"
@@ -443,6 +463,8 @@ assert_runtime_mock_runs_directly() {
 assert_status_docker_paths() {
   [ "$(audit_count mktemp confined)" -ge 1 ] || \
     fail "status.sh did not create temporary snapshots in its confined fixture"
+  [ "$(audit_count docker-sudo compose)" -eq 0 ] || \
+    fail "status.sh sent the confined testing Compose mock through sudo"
   [ "$(audit_count docker info)" -eq 3 ] || \
     fail "status.sh did not inspect Docker availability, security, and live-restore"
   [ "$(audit_count docker context)" -eq 2 ] || \
@@ -470,13 +492,17 @@ assert_secret_permissions() {
     fail "secrets directory permissions changed"
   [ "$(stat -c '%U:%G %a' "$TOKEN_FILE")" = "root:root 600" ] || \
     fail "auth-token permissions changed"
-  [ "$(stat -c '%U:%G %a' "$AGENT_ENV_FILE")" = "root:root 600" ] || \
+  [ "$(stat -c '%u:%g:%a' "$AGENT_ENV_FILE")" = \
+    "${TEST_RUNTIME_UID}:${TEST_RUNTIME_GID}:600" ] || \
     fail "agent-wechat environment file permissions changed"
-  [ "$(stat -c '%U:%G %a' "$AGENT_COMPOSE_FILE")" = "root:root 600" ] || \
+  [ "$(stat -c '%u:%g:%a' "$AGENT_COMPOSE_FILE")" = \
+    "${TEST_RUNTIME_UID}:${TEST_RUNTIME_GID}:600" ] || \
     fail "agent-wechat Compose permissions changed"
-  [ "$(stat -c '%U:%G %a' "$GATEWAY_COMPOSE_FILE")" = "root:root 600" ] || \
+  [ "$(stat -c '%u:%g:%a' "$GATEWAY_COMPOSE_FILE")" = \
+    "${TEST_RUNTIME_UID}:${TEST_RUNTIME_GID}:600" ] || \
     fail "Gateway Compose permissions changed"
-  [ "$(stat -c '%U:%G %a' "$GATEWAY_ENV_FILE")" = "root:root 600" ] || \
+  [ "$(stat -c '%u:%g:%a' "$GATEWAY_ENV_FILE")" = \
+    "${TEST_RUNTIME_UID}:${TEST_RUNTIME_GID}:600" ] || \
     fail "Gateway environment file permissions changed"
   [ "$(stat -c '%U:%G %a' "$GATEWAY_HEARTBEAT_COMMAND")" = "root:root 755" ] || \
     fail "Gateway heartbeat checker permissions changed"
@@ -1240,17 +1266,24 @@ TEST_STAGE="root-only management file loading"
 reset_audit
 ROOT_CONFIG_OUTPUT="${TEST_ROOT}/root-config.out"
 ROOT_CONFIG_ERROR="${TEST_ROOT}/root-config.error"
+for root_config_file in \
+  "$ROOT_AGENT_COMPOSE_FILE" "$ROOT_AGENT_ENV_FILE" \
+  "$ROOT_GATEWAY_COMPOSE_FILE" "$ROOT_GATEWAY_ENV_FILE"; do
+  [ "$(stat -c '%u:%g:%a' -- "$root_config_file")" = "0:0:600" ] || \
+    fail "root-only management fixture metadata changed"
+done
+unset root_config_file
 if ! "$REAL_SUDO" -u "$TEST_USER" -H env \
   CF_AGENT_WECHAT_TESTING=1 \
   "${TEST_MANAGEMENT_ENV[@]}" \
   PATH="$AUDIT_PATH" \
   CF_AUDIT_LOG="$AUDIT_LOG" \
   CF_AUDIT_REAL_SUDO="$REAL_SUDO" \
-  CF_AGENT_WECHAT_COMPOSE_FILE="$AGENT_COMPOSE_FILE" \
-  CF_AGENT_WECHAT_ENV_FILE="$AGENT_ENV_FILE" \
-  CF_AGENT_GATEWAY_COMPOSE_FILE="$GATEWAY_COMPOSE_FILE" \
+  CF_AGENT_WECHAT_COMPOSE_FILE="$ROOT_AGENT_COMPOSE_FILE" \
+  CF_AGENT_WECHAT_ENV_FILE="$ROOT_AGENT_ENV_FILE" \
+  CF_AGENT_GATEWAY_COMPOSE_FILE="$ROOT_GATEWAY_COMPOSE_FILE" \
   CF_AGENT_GATEWAY_PROJECT_DIR="$GATEWAY_PROJECT_DIR" \
-  CF_AGENT_GATEWAY_ENV_FILE="$GATEWAY_ENV_FILE" \
+  CF_AGENT_GATEWAY_ENV_FILE="$ROOT_GATEWAY_ENV_FILE" \
   /bin/bash -c '
 cd "$1"
 _management_test_caller_path="$PATH"

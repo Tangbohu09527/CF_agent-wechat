@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   static-unit-lifecycle:
-    name: Static, unit, and forced QR lifecycle
+    name: Static and Unit
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -47,9 +47,6 @@ jobs:
       - name: Run dependency-free unit and QR tests
         run: python3 -m unittest discover -s tests/unit -p "test_*.py" -v
 
-      - name: Run isolated forced fresh QR lifecycle tests
-        run: python3 tests/integration/test_qr_runtime.py
-
       - name: Run safe management environment tests
         run: bash tests/integration/management_environment.sh
 
@@ -77,6 +74,25 @@ jobs:
           fi
           git diff --check "$BASE_SHA" HEAD
           git log --check --format='%H' "${BASE_SHA}..HEAD"
+
+  forced-qr-lifecycle:
+    name: Forced QR lifecycle (shard ${{ matrix.shard-index }}/4)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        shard-index: [0, 1, 2, 3]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install lifecycle test prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y acl python3-venv
+      - name: Run deterministic forced fresh QR lifecycle shard
+        run: >-
+          python3 tests/integration/test_qr_runtime.py
+          --shard-index ${{ matrix.shard-index }} --shard-count 4
 
   bootstrap:
     name: Staged Bootstrap and Fake Docker
