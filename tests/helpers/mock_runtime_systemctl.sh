@@ -16,18 +16,62 @@ state_get() {
 
 case "${1:-}" in
   is-system-running)
+    if [ "$(state_get systemd_partial_timeout 0)" = 1 ]; then
+      printf '%s\n' running
+      sleep 30
+    fi
     value="$(state_get systemd_state running)"
     printf '%s\n' "$value"
-    [ "$value" = running ] || [ "$value" = degraded ]
+    case "$value" in
+      running) exit 0 ;;
+      degraded) exit 1 ;;
+      *) exit 2 ;;
+    esac
     ;;
   is-active)
-    [ "${2:-}" = docker.service ] || exit 2
-    value="$(state_get docker_service_state active)"
-    printf '%s\n' "$value"
-    [ "$value" = active ]
+    case "${2:-}" in
+      docker.service)
+        value="$(state_get docker_service_state active)"
+        printf '%s\n' "$value"
+        [ "$value" = active ]
+        ;;
+      cf-agent-wechat.service)
+        if [ "$(state_get agent_activity_partial_timeout 0)" = 1 ]; then
+          printf '%s\n' inactive
+          sleep 30
+        fi
+        value="$(state_get agent_unit_activity inactive)"
+        printf '%s\n' "$value"
+        case "$value" in
+          active|activating|reloading|deactivating) exit 0 ;;
+          inactive|failed) exit 3 ;;
+          *) exit 4 ;;
+        esac
+        ;;
+      *) exit 2 ;;
+    esac
+    ;;
+  list-units)
+    printf '%s\n' 'docker.service loaded active running Docker'
+    [ "$(state_get agent_unit_active 0)" != 1 ] ||
+      printf '%s\n' 'cf-agent-wechat.service loaded active running Agent'
+    [ "$(state_get indirect_agent_unit_active 0)" != 1 ] ||
+      printf '%s\n' 'custom-maintenance.service loaded active running Maintenance'
+    [ "$(state_get generic_timer_active 0)" != 1 ] ||
+      printf '%s\n' 'nightly.timer loaded active waiting Timer'
+    [ "$(state_get explicit_path_active 0)" != 1 ] ||
+      printf '%s\n' 'watched.path loaded active waiting Path'
+    [ "$(state_get explicit_socket_active 0)" != 1 ] ||
+      printf '%s\n' 'wakeup.socket loaded active listening Socket'
+    [ "$(state_get target_wants_active 0)" != 1 ] ||
+      printf '%s\n' 'boot-maintenance.target loaded active active Target'
     ;;
   is-enabled)
     [ "${2:-}" = cf-agent-wechat.service ] || exit 2
+    if [ "$(state_get agent_enablement_partial_timeout 0)" = 1 ]; then
+      printf '%s\n' disabled
+      sleep 30
+    fi
     if [ "$(state_get agent_unit_enablement_error 0)" = 1 ]; then
       exit 2
     fi

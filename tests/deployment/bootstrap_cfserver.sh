@@ -68,6 +68,12 @@ assert_no_lifecycle_commands() {
   }
 }
 
+replace_agent_env_value() {
+  local key="$1" value="$2"
+
+  sed -i "s|^${key}=.*|${key}=${value}|" "$AGENT_ENV"
+}
+
 assert_process_reaped() {
   local pid_file="$1" label="$2" pid
   [ -s "$pid_file" ] || fail "$label did not record its PID"
@@ -97,7 +103,7 @@ command -v sudo >/dev/null 2>&1 ||
   skip "Bootstrap deployment test requires sudo"
 sudo -n -- true >/dev/null 2>&1 ||
   skip "Bootstrap deployment test requires passwordless sudo"
-for command_name in bash install openssl python3 realpath stat timeout; do
+for command_name in bash install openssl python3 realpath setfacl stat timeout; do
   command -v "$command_name" >/dev/null 2>&1 ||
     fail "missing test prerequisite: $command_name"
 done
@@ -112,6 +118,7 @@ prepare_fixture() {
   RUNTIME_ROOT="$STORAGE_ROOT/runtime"
   ARCHIVE_ROOT="$STORAGE_ROOT/session-archive"
   GATEWAY_HEARTBEAT="$GATEWAY_DEPLOY/check-wechat-worker-heartbeat"
+  GATEWAY_GATE="$GATEWAY_DEPLOY/wechat-runtime-release-gate"
   GATEWAY_CONTRACT="$GATEWAY_DEPLOY/wechat-runtime-contract.json"
   TOKEN_FILE="$STORAGE_ROOT/secrets/auth-token"
   AGENT_ENV="$APP_ROOT/docker/.env"
@@ -173,20 +180,25 @@ PY
     'GATEWAY_ENV=production' \
     'CF_AGENT_WECHAT_TOKEN_FILE=/run/secrets/cf-agent-wechat-auth-token' > "$GATEWAY_ENV"
   printf '%s\n' '#!/bin/sh' 'exit 0' > "$GATEWAY_HEARTBEAT"
-  python3 - "$GATEWAY_CONTRACT" "$TOKEN_FILE" "$GATEWAY_HEARTBEAT" <<'PY'
+  printf '%s\n' '#!/bin/sh' 'exit 0' > "$GATEWAY_GATE"
+  python3 - "$GATEWAY_CONTRACT" "$TOKEN_FILE" "$GATEWAY_HEARTBEAT" \
+    "$GATEWAY_GATE" <<'PY'
 import hashlib
 import json
 import sys
 
-contract_file, token_file, checker = sys.argv[1:]
+contract_file, token_file, checker, gate = sys.argv[1:]
 with open(checker, "rb") as stream:
     checker_sha256 = hashlib.sha256(stream.read()).hexdigest()
+with open(gate, "rb") as stream:
+    gate_sha256 = hashlib.sha256(stream.read()).hexdigest()
 with open(contract_file, "w", encoding="utf-8") as stream:
     json.dump({
         "contractVersion": "1",
         "producer": {
             "repository": "Tangbohu09527/CF_agent-gateway",
             "checkerSha256": checker_sha256,
+            "releaseGateSha256": gate_sha256,
         },
         "agent": {
             "networkAlias": "cf-agent-wechat",
@@ -202,17 +214,108 @@ with open(contract_file, "w", encoding="utf-8") as stream:
             "composeProject": "cf-agent-gateway",
             "checker": checker,
             "checkerInterfaceVersion": 1,
+            "checkerRequest": {
+                "inputTransport": "stdin-json",
+                "inputSchemaVersion": 1,
+                "maxInputBytes": 4096,
+                "hardTimeoutSeconds": 10,
+                "requestFields": [
+                    "schemaVersion",
+                    "generationId",
+                    "agentContainerId",
+                    "workerContainerId",
+                ],
+                "binding": {
+                    "generationId": "lowercase-hex-64",
+                    "agentContainerId": "lowercase-hex-64",
+                    "workerContainerId": "lowercase-hex-64",
+                },
+            },
             "heartbeatMaxAgeSeconds": 30,
             "requiresDockerHealth": True,
             "requiresSuccessfulPoll": True,
             "requiresLoggedIn": True,
             "silentOutput": True,
+            "checkerExecution": {
+                "caller": "management-user",
+                "sudo": False,
+                "dockerSocketAccess": False,
+                "producerLinuxProof": "required",
+            },
+            "releaseGate": {
+                "command": gate,
+                "interfaceVersion": 1,
+                "inputTransport": "stdin-json",
+                "inputSchemaVersion": 1,
+                "maxInputBytes": 4096,
+                "hardTimeoutSeconds": 10,
+                "silentOutput": True,
+                "execution": {
+                    "caller": "management-user",
+                    "sudo": False,
+                    "dockerSocketAccess": False,
+                    "producerLinuxProof": "required",
+                },
+                "identifierFormats": {
+                    "generationId": "lowercase-hex-64",
+                    "agentContainerId": "lowercase-hex-64",
+                    "workerContainerId": "lowercase-hex-64",
+                },
+                "operations": {
+                    "begin": {
+                        "requestFields": [
+                            "schemaVersion",
+                            "operation",
+                            "generationId",
+                        ],
+                        "invalidatesPreviousReleases": True,
+                    },
+                    "assert-pending": {
+                        "requestFields": [
+                            "schemaVersion",
+                            "operation",
+                            "generationId",
+                        ],
+                        "requiresCurrentUnreleasedGeneration": True,
+                    },
+                    "release": {
+                        "requestFields": [
+                            "schemaVersion",
+                            "operation",
+                            "generationId",
+                            "agentContainerId",
+                            "workerContainerId",
+                        ],
+                        "requiresCurrentUnreleasedGeneration": True,
+                        "agentContainerBinding": "exact",
+                        "workerContainerBinding": "exact-stopped-candidate",
+                    },
+                    "abort": {
+                        "requestFields": [
+                            "schemaVersion",
+                            "operation",
+                            "generationId",
+                        ],
+                        "revokesGeneration": True,
+                    },
+                },
+                "workerAuthorization": {
+                    "default": "deny",
+                    "requiresExactCurrentRelease": True,
+                },
+            },
+            "lifecycle": {
+                "restartPolicy": "no",
+                "bootPolicy": "manual-after-fresh-qr",
+                "producerLinuxProof": "required",
+            },
             "credential": {
                 "type": "file",
                 "environmentVariable": "CF_AGENT_WECHAT_TOKEN_FILE",
                 "workerPath": "/run/secrets/cf-agent-wechat-auth-token",
                 "readOnly": True,
                 "forbiddenEnvironmentVariable": "CF_AGENT_WECHAT_TOKEN",
+                "workerReadabilityProof": "producer-linux-integration",
             },
         },
     }, stream)
@@ -221,6 +324,7 @@ PY
   chmod 644 "$GATEWAY_CONTRACT"
   chmod 600 "$GATEWAY_ENV"
   chmod 755 "$GATEWAY_HEARTBEAT"
+  chmod 755 "$GATEWAY_GATE"
   chmod 660 "$DOCKER_SOCKET"
   sudo -n -- install -d -o 0 -g 0 -m 700 -- "$STORAGE_ROOT/secrets"
   printf '%s\n' "$FIXTURE_TOKEN" |
@@ -290,6 +394,9 @@ expect_production_override_failure() {
 expect_production_override_failure CF_BOOTSTRAP_DOCKER_TIMEOUT 424242
 expect_production_override_failure CF_BOOTSTRAP_COMPOSE_TIMEOUT 424243
 expect_production_override_failure TOKEN_FILE /attacker/secret-sentinel
+expect_production_override_failure \
+  CF_AGENT_WECHAT_TEST_GATEWAY_GATE_REPLACEMENT \
+  /attacker/release-gate-sentinel
 pass "production Bootstrap rejects inherited overrides without echoing their values"
 
 PRODUCTION_IDENTITY_OUTPUT="$TEST_ROOT/production-identity.out"
@@ -302,8 +409,39 @@ if /usr/bin/env -i \
 fi
 assert_contains "$PRODUCTION_IDENTITY_OUTPUT" \
   'CF_BOOTSTRAP_TESTING must be 0 or 1'
+assert_not_contains "$PRODUCTION_IDENTITY_OUTPUT" 'invalid'
 assert_not_contains "$PRODUCTION_IDENTITY_OUTPUT" \
   'TOKEN_FILE is forbidden as a production Bootstrap environment override'
+pass "invalid Bootstrap test mode is rejected without echoing its value"
+
+PRODUCTION_TEST_MODE_OUTPUT="$TEST_ROOT/production-test-mode.out"
+if /usr/bin/env -i \
+  PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+  CF_BOOTSTRAP_TESTING=1 \
+  AUTH_TOKEN=bootstrap-test-mode-secret-never-print \
+  /bin/bash -p "$BOOTSTRAP" >"$PRODUCTION_TEST_MODE_OUTPUT" 2>&1; then
+  fail "production Bootstrap accepted isolated test mode without CI gates"
+fi
+assert_contains "$PRODUCTION_TEST_MODE_OUTPUT" \
+  'CF_BOOTSTRAP_TESTING=1 requires the isolated GitHub Actions deployment test gate'
+assert_not_contains "$PRODUCTION_TEST_MODE_OUTPUT" \
+  'bootstrap-test-mode-secret-never-print'
+pass "Bootstrap test mode 1 is rejected outside the isolated CI gate"
+
+PRODUCTION_ZERO_OUTPUT="$TEST_ROOT/production-test-mode-zero.out"
+if /usr/bin/env -i \
+  PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+  CF_BOOTSTRAP_TESTING=0 \
+  TOKEN_FILE=/attacker/bootstrap-zero-secret-never-print \
+  /bin/bash -p "$BOOTSTRAP" >"$PRODUCTION_ZERO_OUTPUT" 2>&1; then
+  fail "Bootstrap test mode 0 bypassed production override rejection"
+fi
+assert_contains "$PRODUCTION_ZERO_OUTPUT" \
+  'TOKEN_FILE is forbidden as a production Bootstrap environment override'
+assert_not_contains "$PRODUCTION_ZERO_OUTPUT" \
+  'bootstrap-zero-secret-never-print'
+pass "Bootstrap test mode 0 follows the production contract"
+
 pass "internal management variables do not self-trigger and sudo metadata is not an authority"
 
 prepare_fixture sudo-identity-spoof
@@ -332,6 +470,83 @@ expect_failure \
   "CF_BOOTSTRAP_DOCKER_TIMEOUT=$OVERSIZED_TIMEOUT"
 assert_not_contains "$OUTPUT" "$OVERSIZED_TIMEOUT"
 pass "oversized timeout values fail closed without entering error output"
+
+INT64_MAX=9223372036854775807
+INT64_OVERFLOW=9223372036854775808
+OVERSIZED_DECIMAL="$(printf '9%.0s' {1..128})"
+prepare_fixture numeric-boundary
+replace_agent_env_value CF_AGENT_WECHAT_MIN_FREE_BYTES "$INT64_MAX"
+replace_agent_env_value CF_AGENT_WECHAT_MIN_FREE_PERCENT 100
+replace_agent_env_value CF_AGENT_WECHAT_MIN_FREE_INODES "$INT64_MAX"
+replace_agent_env_value CF_AGENT_WECHAT_TOKEN_SCAN_MAX_FILES 200000
+replace_agent_env_value CF_AGENT_WECHAT_TOKEN_SCAN_MAX_BYTES "$INT64_MAX"
+run_bootstrap "$OUTPUT" || {
+  sed -n '1,200p' "$OUTPUT" >&2
+  fail "Bootstrap rejected exact signed 64-bit numeric boundaries"
+}
+assert_no_lifecycle_commands
+pass "Bootstrap accepts exact approved numeric boundaries without lifecycle changes"
+pass "Bootstrap test mode 1 is accepted only by the isolated CI fixture gate"
+
+for numeric_contract in \
+  'AGENT_WECHAT_PORT|65536' \
+  'CF_AGENT_WECHAT_RUNTIME_UID|4294967295' \
+  'CF_AGENT_WECHAT_RUNTIME_GID|4294967295' \
+  'CF_AGENT_WECHAT_MANAGEMENT_GID|4294967295'; do
+  IFS='|' read -r numeric_key numeric_value <<< "$numeric_contract"
+  prepare_fixture "numeric-contract-${numeric_key,,}"
+  replace_agent_env_value "$numeric_key" "$numeric_value"
+  expect_failure 'docker/.env failed byte-safe validation'
+  assert_no_lifecycle_commands
+done
+pass "Bootstrap rejects out-of-range ports and IDs without lifecycle changes"
+
+for numeric_key in \
+  CF_AGENT_WECHAT_MIN_FREE_BYTES \
+  CF_AGENT_WECHAT_MIN_FREE_INODES \
+  CF_AGENT_WECHAT_TOKEN_SCAN_MAX_BYTES; do
+  prepare_fixture "numeric-overflow-${numeric_key,,}"
+  replace_agent_env_value "$numeric_key" "$INT64_OVERFLOW"
+  expect_failure 'docker/.env failed byte-safe validation'
+  assert_not_contains "$OUTPUT" "$INT64_OVERFLOW"
+  assert_no_lifecycle_commands
+
+  prepare_fixture "numeric-oversized-${numeric_key,,}"
+  replace_agent_env_value "$numeric_key" "$OVERSIZED_DECIMAL"
+  expect_failure 'docker/.env failed byte-safe validation'
+  assert_not_contains "$OUTPUT" "$OVERSIZED_DECIMAL"
+  assert_no_lifecycle_commands
+done
+prepare_fixture numeric-scanner-files
+replace_agent_env_value CF_AGENT_WECHAT_TOKEN_SCAN_MAX_FILES 200001
+expect_failure 'CF_AGENT_WECHAT_TOKEN_SCAN_MAX_FILES must not exceed the compiled scanner limit'
+assert_no_lifecycle_commands
+prepare_fixture numeric-percent
+replace_agent_env_value CF_AGENT_WECHAT_MIN_FREE_PERCENT 000
+expect_failure 'docker/.env failed byte-safe validation'
+assert_no_lifecycle_commands
+pass "Bootstrap rejects overflow, overlong, scanner-limit, and non-canonical percent values"
+
+prepare_fixture inherited-storage-default-acl
+sudo -n -- rm -rf -- "$STORAGE_ROOT"
+setfacl -m d:u:65534:rwx "$SCENARIO_ROOT"
+expect_failure +  'storage root must be a stable no-follow directory without extended attributes or ACLs'
+sudo -n -- test -d "$STORAGE_ROOT" ||
+  fail "default-ACL fixture did not reach managed storage creation"
+sudo -n -- test ! -e "$TOKEN_FILE" ||
+  fail "Bootstrap created a Token after inherited storage ACL rejection"
+pass "Bootstrap rejects a default ACL inherited during managed storage creation"
+
+prepare_fixture archive-default-acl
+sudo -n -- install -d -o 0 -g 0 -m 700 -- "$ARCHIVE_ROOT"
+sudo -n -- setfacl -m d:u:65534:rwx "$ARCHIVE_ROOT"
+expect_failure +  'archive root must be a stable no-follow directory without extended attributes or ACLs'
+pass "Bootstrap rejects default ACLs on the Archive root"
+
+prepare_fixture secrets-default-acl
+sudo -n -- setfacl -m d:u:65534:rwx "$STORAGE_ROOT/secrets"
+expect_failure +  'secrets directory must be a stable no-follow directory without extended attributes or ACLs'
+pass "Bootstrap rejects default ACLs on the secrets directory"
 
 prepare_fixture retry
 sudo -n -- rm -rf -- "$STORAGE_ROOT"
@@ -467,8 +682,62 @@ pass "Docker live-restore is rejected"
 
 prepare_fixture systemd
 touch "$MOCK_STATE/systemd-offline"
-expect_failure 'systemd must be running or degraded'
+expect_failure 'systemd state probe failed or systemd is not running or degraded'
 pass "unavailable systemd fails closed"
+
+prepare_fixture systemd-partial-timeout
+touch "$MOCK_STATE/systemd-partial-timeout"
+expect_failure 'systemd state probe failed' CF_BOOTSTRAP_DOCKER_TIMEOUT=1
+[ ! -e "$ARCHIVE_ROOT" ] || fail "timed-out systemd state probe mutated deployment state"
+pass "partial systemd state output followed by a hard timeout fails closed"
+
+prepare_fixture agent-activity-partial-timeout
+touch "$MOCK_STATE/agent-activity-partial-timeout"
+expect_failure 'activity probe failed' CF_BOOTSTRAP_DOCKER_TIMEOUT=1
+[ ! -e "$ARCHIVE_ROOT" ] || fail "timed-out agent activity probe mutated deployment state"
+pass "partial inactive output followed by a hard timeout fails closed"
+
+prepare_fixture agent-enablement-partial-timeout
+touch "$MOCK_STATE/agent-enablement-partial-timeout"
+expect_failure 'enablement probe failed' CF_BOOTSTRAP_DOCKER_TIMEOUT=1
+[ ! -e "$ARCHIVE_ROOT" ] || fail "timed-out enablement probe mutated deployment state"
+pass "partial not-found output followed by a hard timeout fails closed"
+
+prepare_fixture agent-unit-active
+touch "$MOCK_STATE/agent-unit-active"
+expect_failure 'cf-agent-wechat.service must be inactive'
+[ ! -e "$ARCHIVE_ROOT" ] || fail "active Agent unit rejection mutated deployment state"
+pass "active but boot-disabled cf-agent-wechat.service is rejected"
+
+prepare_fixture hidden-agent-unit-active
+touch "$MOCK_STATE/hidden-agent-unit-active"
+expect_failure 'an active systemd unit could supervise agent-wechat'
+[ ! -e "$ARCHIVE_ROOT" ] || fail "hidden active unit rejection mutated deployment state"
+pass "active generic service content cannot hide Agent startup"
+
+prepare_fixture generic-agent-timer-active
+touch "$MOCK_STATE/generic-agent-timer-active"
+expect_failure 'systemd timer could automatically start agent-wechat'
+[ ! -e "$ARCHIVE_ROOT" ] || fail "active timer rejection mutated deployment state"
+pass "active timer activation target is inspected"
+
+prepare_fixture generic-agent-path-active
+touch "$MOCK_STATE/generic-agent-path-active"
+expect_failure 'systemd path unit could automatically start agent-wechat'
+[ ! -e "$ARCHIVE_ROOT" ] || fail "active path rejection mutated deployment state"
+pass "active path activation target is inspected"
+
+prepare_fixture generic-agent-socket-active
+touch "$MOCK_STATE/generic-agent-socket-active"
+expect_failure 'systemd socket could automatically start agent-wechat'
+[ ! -e "$ARCHIVE_ROOT" ] || fail "active socket rejection mutated deployment state"
+pass "active socket activation target is inspected"
+
+prepare_fixture generic-agent-target-active
+touch "$MOCK_STATE/generic-agent-target-active"
+expect_failure 'systemd target could automatically start agent-wechat'
+[ ! -e "$ARCHIVE_ROOT" ] || fail "active target rejection mutated deployment state"
+pass "active target dependency is inspected"
 
 prepare_fixture agent-unit-enabled
 touch "$MOCK_STATE/agent-unit-enabled"
@@ -850,6 +1119,33 @@ chmod 644 "$GATEWAY_HEARTBEAT"
 expect_failure 'Gateway heartbeat checker must be executable by the management user'
 pass "non-executable Gateway heartbeat checker is rejected"
 
+prepare_fixture release-gate-missing
+rm -f -- "$GATEWAY_GATE"
+expect_failure 'Gateway runtime release gate must be an existing non-symlink regular file'
+[ ! -e "$ARCHIVE_ROOT" ] || fail "missing release gate mutated deployment state"
+pass "missing Gateway runtime release gate fails closed"
+
+prepare_fixture release-gate-symlink
+mv -- "$GATEWAY_GATE" "${GATEWAY_GATE}.real"
+ln -s -- "$(basename -- "${GATEWAY_GATE}.real")" "$GATEWAY_GATE"
+expect_failure 'Gateway runtime release gate must be an existing non-symlink regular file'
+pass "Gateway runtime release gate symlink is rejected"
+
+prepare_fixture release-gate-hardlink
+ln -- "$GATEWAY_GATE" "${GATEWAY_GATE}.copy"
+expect_failure 'Gateway runtime release gate must not have additional hard links'
+pass "Gateway runtime release gate hardlinks are rejected"
+
+prepare_fixture release-gate-mode
+chmod 777 "$GATEWAY_GATE"
+expect_failure 'Gateway runtime release gate must not be group/other writable'
+pass "group/other-writable Gateway runtime release gate is rejected"
+
+prepare_fixture release-gate-not-executable
+chmod 644 "$GATEWAY_GATE"
+expect_failure 'Gateway runtime release gate must be executable by the management user'
+pass "non-executable Gateway runtime release gate is rejected"
+
 prepare_fixture contract-missing
 rm -f -- "$GATEWAY_CONTRACT"
 expect_failure 'Gateway runtime contract must be an existing non-symlink regular file'
@@ -882,6 +1178,20 @@ with open(sys.argv[1], "w", encoding="utf-8") as stream:
 PY
 expect_failure 'Gateway runtime contract or Agent Token agreement could not be verified'
 pass "Gateway contract with a different checker path fails closed"
+
+prepare_fixture contract-release-gate
+python3 - "$GATEWAY_CONTRACT" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as stream:
+    payload = json.load(stream)
+payload["gateway"]["releaseGate"]["command"] = "/tmp/unapproved-release-gate"
+with open(sys.argv[1], "w", encoding="utf-8") as stream:
+    json.dump(payload, stream)
+PY
+expect_failure 'Gateway runtime contract or Agent Token agreement could not be verified'
+pass "Gateway contract with a different release gate path fails closed"
 
 prepare_fixture gateway-token-missing
 printf '%s\n' 'GATEWAY_ENV=production' > "$GATEWAY_ENV"

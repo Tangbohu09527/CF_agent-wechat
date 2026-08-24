@@ -40,8 +40,10 @@ Debian 启动
 `live-restore=false`；容器 crash、Docker daemon 重启和 Debian 重启均不得自动恢复
 `agent-wechat`。
 
-本仓库未修改 Gateway，不能保证 Debian 启动至人工执行脚本前 `wechat-worker` 已停止；
-该 boot/restart stop gate 必须在 CFserver 实机单独验证。
+本仓库在 Archive、Agent start、QR、验证和 release 边界重复证明 Worker stopped，并在
+QR 等待期间轮询和撤销外部启动。该机制是消费者侧检测，不是跨仓原子禁止；Gateway 仍须
+发布绑定 fresh runtime generation 的 deny-by-default release gate，并在 CFserver 证明
+Debian boot/restart 和整个扫码窗口都不能绕过它。
 
 ## 本次实现验证
 
@@ -55,6 +57,7 @@ Debian 启动
 | Runtime 权限/树 | 已实现并纳入自动化门禁 | 精确非 root UID/GID/mode；no-follow/no-cross-filesystem 有界扫描 |
 | QR Python 依赖 | 已实现并纳入自动化门禁，待 CFserver 实机验证 | GIL-enabled CPython 3.10-3.14、stamp schema v3、Pillow 12.3.0、Hash-locked binary-only requirements、hard timeout；只自动重建结构安全的漂移 venv |
 | Gateway contract consumer | 机制已实现，pins/producer 阻断 | v1 file credential、Compose/inspect attestation 与 Agent-side commit/tracked blob/checker SHA-256 证明已实现；兼容 pins 未发布，Gateway PR #4 尚不兼容 |
+| QR 窗口 Worker guard | 消费者检测/撤销已实现，producer 原子门禁阻断 | 各边界精确 stopped 证明和 QR 等待轮询会停止并拒绝中途启动；跨仓 generation/release gate 尚未发布 |
 | 唯一启动入口 | 已实现并自动化验证 | `start-qr-login.sh` 编排 preflight、归档、登录、验证和 worker 放行 |
 | 停止入口 | 已实现并自动化验证 | `stop-qr-runtime.sh` 停止 worker 与容器，不删除数据 |
 | 强制二维码 | 已实现并自动化验证 | `newAccount=true`；未渲染 QR 或收到 PNG-only `qrDataUrl` 时拒绝成功 |
@@ -134,15 +137,21 @@ Workflow 名称或绿色结果不得表述为实际 Agent Runtime E2E。
 34. Archive bytes/percent/inode 充足/不足、inventory、schema v2、路径逃逸、symlink 和
     retention dry-run/当前 Runtime 保护均覆盖。
 35. PROXY userinfo、query、fragment、path、控制字符拒绝，无凭证 host:port 通过。
-36. GIL-enabled CPython 3.10-3.14 的 schema v3 依赖合同固定 Pillow 12.3.0，并覆盖
-    free-threaded/Python venv/ensurepip 拒绝、pip hard timeout、Hash mismatch、正确 venv
-    快速复用、结构安全的错误 venv 事务重建，以及结构不安全的 venv 原位保留；安装只接受
-    Hash-locked binary wheels。
+36. GIL-enabled CPython 3.10-3.14 矩阵验证 schema v3 lock/runtime，并对 x86_64、
+    aarch64 做 target-only Hash-locked wheel 解析，不把它描述成跨架构执行。完整 venv、
+    ensurepip、pip hard timeout、Hash mismatch、正确 venv 快速复用和事务重建/回滚集成在
+    Ubuntu 默认 CPython Job 运行；路径祖先快照在 venv/pip/验证/stamp/cleanup/rollback
+    各阶段重验，漂移后不再执行路径操作。
 37. Runtime scanner 覆盖树外 symlink/loop、FIFO/socket/device、大文件/timeout、二进制
-    数据库、Token hit/miss，不跟随链接或跨文件系统。
+    数据库、文件/目录名 Token hit、xattr/POSIX ACL 拒绝和内容 Token hit/miss，不跟随链接
+    或跨文件系统；CI 安装 `acl` 并用真实 `setfacl` 生成 `system.posix_acl_access` 证据。
+    `.env` 最大 entry 值与编译上限均为 200,000，attestation 累计编码相对路径上限为
+    64 MiB；最终重验仍要求 stopped writer 与 trusted deployment principal。
 38. 管理锁精确 owner/management GID/0640/单 link，普通非管理用户不能持锁。
 39. Bootstrap 后 systemd unit、Compose restart、实际 RestartPolicy 或 image 漂移会在
     QR 前 fail closed，并清理本次不合规容器。
+40. systemd 测试覆盖 active/enable service、timer、path、socket、target 和直接 activation；
+    任意深度依赖及非 systemd 编排不在自动证明范围，保留为 CFserver inventory pending。
 
 ### 静态质量检查
 

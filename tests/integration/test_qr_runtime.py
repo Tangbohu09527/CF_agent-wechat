@@ -13,6 +13,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import textwrap
 import time
 import unittest
 from pathlib import Path
@@ -79,6 +80,9 @@ class RuntimeFixture:
         self.gateway_heartbeat = (
             self.gateway_deploy / "check-wechat-worker-heartbeat"
         )
+        self.gateway_release_gate = (
+            self.gateway_deploy / "wechat-runtime-release-gate"
+        )
         self.gateway_contract = (
             self.gateway_deploy / "wechat-runtime-contract.json"
         )
@@ -95,6 +99,7 @@ class RuntimeFixture:
         self.login_continue_file = self.root / "login.continue"
         self.audit_log = self.root / "audit.log"
         self.mutation_log = self.root / "mutations.log"
+        self.gateway_gate_log = self.root / "gateway-gate.log"
         self.login_log = self.root / "login.log"
         self.server: subprocess.Popen[bytes] | None = None
         self.background: list[subprocess.Popen[str]] = []
@@ -181,19 +186,189 @@ class RuntimeFixture:
         )
         os.chmod(self.gateway_env, 0o600)
         self.gateway_heartbeat.write_text(
-            "#!/bin/sh\n"
-            "set -eu\n"
-            'case "$(cat "$MOCK_DOCKER_STATE_DIR/worker_heartbeat")" in\n'
-            "  healthy) exit 0 ;;\n"
-            '  sensitive) cat "$MOCK_AGENT_TOKEN_FILE"; exit 0 ;;\n'
-            "  timeout) sleep 30; exit 1 ;;\n"
-            "  *) exit 1 ;;\n"
-            "esac\n",
+            textwrap.dedent(
+                """
+                #!/usr/bin/python3
+                import json
+                import os
+                import re
+                import sys
+                import time
+                from pathlib import Path
+
+                root = Path(os.environ["MOCK_DOCKER_STATE_DIR"])
+
+                def read_state(name, default=""):
+                    path = root / name
+                    return path.read_text(encoding="ascii").strip() if path.exists() else default
+
+                try:
+                    request = json.load(sys.stdin)
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    raise SystemExit(1)
+                if set(request) != {
+                    "schemaVersion",
+                    "generationId",
+                    "agentContainerId",
+                    "workerContainerId",
+                } or request.get("schemaVersion") != 1:
+                    raise SystemExit(1)
+                identifiers = (
+                    request.get("generationId"),
+                    request.get("agentContainerId"),
+                    request.get("workerContainerId"),
+                )
+                if any(
+                    not isinstance(value, str)
+                    or re.fullmatch(r"[0-9a-f]{64}", value) is None
+                    for value in identifiers
+                ):
+                    raise SystemExit(1)
+                if (
+                    read_state("gateway_gate_state") != "released"
+                    or identifiers[0] != read_state("gateway_gate_generation")
+                    or identifiers[1] != read_state("gateway_gate_agent_id")
+                    or identifiers[2] != read_state("gateway_gate_worker_id")
+                    or identifiers[2] != read_state("gateway_compose_id", "c" * 64)
+                    or read_state("gateway_running") != "1"
+                ):
+                    raise SystemExit(1)
+                mode = read_state("worker_heartbeat", "healthy")
+                if mode == "timeout":
+                    time.sleep(30)
+                    raise SystemExit(1)
+                if mode == "sensitive":
+                    sys.stdout.write(
+                        Path(os.environ["MOCK_AGENT_TOKEN_FILE"]).read_text(
+                            encoding="utf-8"
+                        )
+                    )
+                    raise SystemExit(0)
+                if mode == "replace-instance":
+                    (root / "gateway_compose_id").write_text(
+                        "d" * 64 + "\n", encoding="ascii"
+                    )
+                    raise SystemExit(0)
+                raise SystemExit(0 if mode == "healthy" else 1)
+                """
+            ).lstrip(),
             encoding="utf-8",
         )
         os.chmod(self.gateway_heartbeat, 0o755)
+        self.gateway_release_gate.write_text(
+            textwrap.dedent(
+                """
+                #!/usr/bin/python3
+                import json
+                import os
+                import re
+                import sys
+                import time
+                from pathlib import Path
+
+                root = Path(os.environ["MOCK_DOCKER_STATE_DIR"])
+                log_path = Path(os.environ["MOCK_GATEWAY_GATE_LOG"])
+
+                def read_state(name, default=""):
+                    path = root / name
+                    return path.read_text(encoding="ascii").strip() if path.exists() else default
+
+                def write_state(name, value):
+                    (root / name).write_text(value + "\n", encoding="ascii")
+
+                def remove_state(name):
+                    (root / name).unlink(missing_ok=True)
+
+                try:
+                    request = json.load(sys.stdin)
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    raise SystemExit(1)
+                operation = request.get("operation")
+                generation = request.get("generationId")
+                short_fields = {"schemaVersion", "operation", "generationId"}
+                release_fields = short_fields | {
+                    "agentContainerId",
+                    "workerContainerId",
+                }
+                expected_fields = release_fields if operation == "release" else short_fields
+                if (
+                    operation not in {"begin", "assert-pending", "release", "abort"}
+                    or set(request) != expected_fields
+                    or request.get("schemaVersion") != 1
+                    or not isinstance(generation, str)
+                    or re.fullmatch(r"[0-9a-f]{64}", generation) is None
+                ):
+                    raise SystemExit(1)
+                with log_path.open("a", encoding="ascii") as stream:
+                    stream.write(operation + "\n")
+                with Path(os.environ["MOCK_DOCKER_LOG"]).open(
+                    "a", encoding="ascii"
+                ) as stream:
+                    stream.write("gateway gate " + operation + "\n")
+                mode = read_state("gateway_gate_mode", "healthy")
+                if mode == "timeout-" + operation:
+                    time.sleep(30)
+                    raise SystemExit(1)
+                if mode == "sensitive-" + operation:
+                    sys.stdout.write(
+                        Path(os.environ["MOCK_AGENT_TOKEN_FILE"]).read_text(
+                            encoding="utf-8"
+                        )
+                    )
+                    raise SystemExit(0)
+                if mode == "fail-" + operation:
+                    raise SystemExit(1)
+                if operation == "begin":
+                    write_state("gateway_gate_generation", generation)
+                    write_state("gateway_gate_state", "pending")
+                    remove_state("gateway_gate_agent_id")
+                    remove_state("gateway_gate_worker_id")
+                    raise SystemExit(0)
+                if generation != read_state("gateway_gate_generation"):
+                    raise SystemExit(1)
+                if operation == "assert-pending":
+                    raise SystemExit(
+                        0 if read_state("gateway_gate_state") == "pending" else 1
+                    )
+                if operation == "abort":
+                    write_state("gateway_gate_state", "aborted")
+                    remove_state("gateway_gate_agent_id")
+                    remove_state("gateway_gate_worker_id")
+                    raise SystemExit(0)
+                agent_id = request.get("agentContainerId")
+                worker_id = request.get("workerContainerId")
+                if (
+                    read_state("gateway_gate_state") != "pending"
+                    or not isinstance(agent_id, str)
+                    or not isinstance(worker_id, str)
+                    or re.fullmatch(r"[0-9a-f]{64}", agent_id) is None
+                    or re.fullmatch(r"[0-9a-f]{64}", worker_id) is None
+                    or (
+                        read_state("gateway_gate_expected_agent")
+                        and agent_id != read_state("gateway_gate_expected_agent")
+                    )
+                    or (
+                        read_state("gateway_gate_expected_worker")
+                        and worker_id != read_state("gateway_gate_expected_worker")
+                    )
+                ):
+                    raise SystemExit(1)
+                if mode == "no-authorize-release":
+                    raise SystemExit(0)
+                write_state("gateway_gate_agent_id", agent_id)
+                write_state("gateway_gate_worker_id", worker_id)
+                write_state("gateway_gate_state", "released")
+                raise SystemExit(0)
+                """
+            ).lstrip(),
+            encoding="utf-8",
+        )
+        os.chmod(self.gateway_release_gate, 0o755)
         checker_sha256 = hashlib.sha256(
             self.gateway_heartbeat.read_bytes()
+        ).hexdigest()
+        gate_sha256 = hashlib.sha256(
+            self.gateway_release_gate.read_bytes()
         ).hexdigest()
         self.gateway_contract.write_text(
             json.dumps(
@@ -202,6 +377,7 @@ class RuntimeFixture:
                     "producer": {
                         "repository": "Tangbohu09527/CF_agent-gateway",
                         "checkerSha256": checker_sha256,
+                        "releaseGateSha256": gate_sha256,
                     },
                     "agent": {
                         "networkAlias": "cf-agent-wechat",
@@ -217,11 +393,103 @@ class RuntimeFixture:
                         "composeProject": "cf-agent-gateway",
                         "checker": str(self.gateway_heartbeat),
                         "checkerInterfaceVersion": 1,
+                        "checkerRequest": {
+                            "inputTransport": "stdin-json",
+                            "inputSchemaVersion": 1,
+                            "maxInputBytes": 4096,
+                            "hardTimeoutSeconds": 10,
+                            "requestFields": [
+                                "schemaVersion",
+                                "generationId",
+                                "agentContainerId",
+                                "workerContainerId",
+                            ],
+                            "binding": {
+                                "generationId": "lowercase-hex-64",
+                                "agentContainerId": "lowercase-hex-64",
+                                "workerContainerId": "lowercase-hex-64",
+                            },
+                        },
                         "heartbeatMaxAgeSeconds": 30,
                         "requiresDockerHealth": True,
                         "requiresSuccessfulPoll": True,
                         "requiresLoggedIn": True,
                         "silentOutput": True,
+                        "checkerExecution": {
+                            "caller": "management-user",
+                            "sudo": False,
+                            "dockerSocketAccess": False,
+                            "producerLinuxProof": "required",
+                        },
+                        "releaseGate": {
+                            "command": str(self.gateway_release_gate),
+                            "interfaceVersion": 1,
+                            "inputTransport": "stdin-json",
+                            "inputSchemaVersion": 1,
+                            "maxInputBytes": 4096,
+                            "hardTimeoutSeconds": 10,
+                            "silentOutput": True,
+                            "execution": {
+                                "caller": "management-user",
+                                "sudo": False,
+                                "dockerSocketAccess": False,
+                                "producerLinuxProof": "required",
+                            },
+                            "identifierFormats": {
+                                "generationId": "lowercase-hex-64",
+                                "agentContainerId": "lowercase-hex-64",
+                                "workerContainerId": "lowercase-hex-64",
+                            },
+                            "operations": {
+                                "begin": {
+                                    "requestFields": [
+                                        "schemaVersion",
+                                        "operation",
+                                        "generationId",
+                                    ],
+                                    "invalidatesPreviousReleases": True,
+                                },
+                                "assert-pending": {
+                                    "requestFields": [
+                                        "schemaVersion",
+                                        "operation",
+                                        "generationId",
+                                    ],
+                                    "requiresCurrentUnreleasedGeneration": True,
+                                },
+                                "release": {
+                                    "requestFields": [
+                                        "schemaVersion",
+                                        "operation",
+                                        "generationId",
+                                        "agentContainerId",
+                                        "workerContainerId",
+                                    ],
+                                    "requiresCurrentUnreleasedGeneration": True,
+                                    "agentContainerBinding": "exact",
+                                    "workerContainerBinding": (
+                                        "exact-stopped-candidate"
+                                    ),
+                                },
+                                "abort": {
+                                    "requestFields": [
+                                        "schemaVersion",
+                                        "operation",
+                                        "generationId",
+                                    ],
+                                    "revokesGeneration": True,
+                                },
+                            },
+                            "workerAuthorization": {
+                                "default": "deny",
+                                "requiresExactCurrentRelease": True,
+                            },
+                        },
+                        "lifecycle": {
+                            "restartPolicy": "no",
+                            "bootPolicy": "manual-after-fresh-qr",
+                            "producerLinuxProof": "required",
+                        },
                         "credential": {
                             "type": "file",
                             "environmentVariable": (
@@ -234,6 +502,9 @@ class RuntimeFixture:
                             "readOnly": True,
                             "forbiddenEnvironmentVariable": (
                                 "CF_AGENT_WECHAT_TOKEN"
+                            ),
+                            "workerReadabilityProof": (
+                                "producer-linux-integration"
                             ),
                         },
                     },
@@ -248,6 +519,9 @@ class RuntimeFixture:
         self.home.mkdir()
         for name, value in {
             "gateway_running": "1",
+            "gateway_exists": "1",
+            "gateway_gate_state": "inactive",
+            "gateway_gate_mode": "healthy",
             "worker_heartbeat": "healthy",
             "agent_exists": "1",
             "agent_running": "1",
@@ -373,6 +647,7 @@ class RuntimeFixture:
                 "MOCK_GATEWAY_COMPOSE_FILE": str(self.gateway_compose),
                 "MOCK_GATEWAY_ENV_FILE": str(self.gateway_env),
                 "MOCK_GATEWAY_PROJECT_DIR": str(self.gateway_dir),
+                "MOCK_GATEWAY_GATE_LOG": str(self.gateway_gate_log),
                 "MOCK_AGENT_TOKEN_FILE": str(self.secrets / "auth-token"),
                 "MOCK_APPROVED_AGENT_IMAGE":
                     "ghcr.io/example/agent-wechat@sha256:" + ("0" * 64),
@@ -557,6 +832,17 @@ class RuntimeFixture:
             if line
         ]
 
+    def gate_lines(self) -> list[str]:
+        if not self.gateway_gate_log.exists():
+            return []
+        return [
+            line
+            for line in self.gateway_gate_log.read_text(
+                encoding="ascii"
+            ).splitlines()
+            if line
+        ]
+
     def audit_lines(self) -> list[str]:
         return [
             line
@@ -716,6 +1002,41 @@ class ForcedQrRuntimeTests(unittest.TestCase):
             self, self.fixture.runtime
         )
         return manifest
+
+    def assert_candidate_rejected_before_archive(
+        self,
+        result: subprocess.CompletedProcess[str],
+        storage_before: str,
+    ) -> None:
+        self.assert_failed(result)
+        self.assertIn(
+            "failed during phase: attest_stopped_agent_candidate",
+            result.stdout,
+        )
+        self.assertEqual(tree_digest(self.fixture.storage), storage_before)
+        self.assertEqual(self.fixture.archive_dirs(), [])
+        self.assertTrue(
+            (self.fixture.runtime / "data" / "old-state.marker").is_file()
+        )
+        self.assertFalse(
+            (self.fixture.runtime / "data" / "agent-runtime.log").exists()
+        )
+        self.assertEqual(self.fixture.read_state("gateway_running"), "0")
+        self.assertEqual(self.fixture.read_state("agent_exists"), "0")
+        self.assertEqual(self.fixture.read_state("agent_running"), "0")
+        mutations = self.fixture.mutation_lines()
+        self.assertIn("agent container create stopped", mutations)
+        self.assertNotIn("agent container start attested candidate", mutations)
+        self.assertNotIn("gateway worker start", mutations)
+        self.assertEqual(self.fixture.login_log.read_text(encoding="utf-8"), "")
+        self.assertNotIn("扫描二维码", result.stdout)
+        self.fixture.assert_no_sensitive_text(
+            self,
+            result.stdout,
+            self.fixture.audit_log.read_text(encoding="utf-8"),
+            self.fixture.mutation_log.read_text(encoding="utf-8"),
+            self.fixture.login_log.read_text(encoding="utf-8"),
+        )
 
     def assert_failed_worker_release_preserves_agent(
         self,
@@ -949,7 +1270,8 @@ class ForcedQrRuntimeTests(unittest.TestCase):
                 "gateway worker stop",
                 "agent container stop",
                 "agent container remove",
-                "agent container start",
+                "agent container create stopped",
+                "agent container start attested candidate",
                 "gateway worker start",
             ],
         )
@@ -959,6 +1281,37 @@ class ForcedQrRuntimeTests(unittest.TestCase):
             (self.fixture.runtime / "data" / "agent-runtime.log").is_file()
         )
         audit = self.fixture.audit_lines()
+        gate_operations = self.fixture.gate_lines()
+        self.assertEqual(gate_operations[0], "begin")
+        self.assertEqual(gate_operations[-1], "release")
+        self.assertGreaterEqual(
+            gate_operations.count("assert-pending"), 8
+        )
+        self.assertEqual(gate_operations.count("release"), 1)
+        self.assertNotIn("abort", gate_operations)
+        self.assertEqual(
+            self.fixture.read_state("gateway_gate_state"), "released"
+        )
+        self.assertEqual(
+            self.fixture.read_state("gateway_gate_agent_id"), "a" * 64
+        )
+        self.assertEqual(
+            self.fixture.read_state("gateway_gate_worker_id"), "c" * 64
+        )
+        self.assertLess(
+            audit.index("gateway worker stop"),
+            audit.index("gateway gate begin"),
+        )
+        self.assertLess(
+            audit.index("gateway worker create stopped"),
+            audit.index("gateway gate release"),
+        )
+        self.assertLess(
+            audit.index("gateway gate release"),
+            audit.index("gateway worker start"),
+        )
+        self.assertNotIn("gateway worker pre-release denied", audit)
+        self.assertNotIn("forbidden gateway compose up", audit)
         self.assertLess(
             audit.index("GET /api/messages/<redacted>"),
             audit.index("gateway worker start"),
@@ -1011,6 +1364,56 @@ class ForcedQrRuntimeTests(unittest.TestCase):
 
     def test_each_start_rejects_startup_and_rendered_policy_drift(self) -> None:
         cases = (
+            (
+                "active-agent-unit",
+                {"agent_unit_activity": "active"},
+                "must be inactive",
+            ),
+            (
+                "active-agent-unit-inventory",
+                {"agent_unit_active": "1"},
+                "unapproved active agent-wechat unit",
+            ),
+            (
+                "active-generic-service",
+                {"indirect_agent_unit_active": "1"},
+                "active systemd unit could supervise agent-wechat",
+            ),
+            (
+                "active-timer-chain",
+                {"generic_timer_active": "1"},
+                "systemd timer could automatically start",
+            ),
+            (
+                "active-path-chain",
+                {"explicit_path_active": "1"},
+                "systemd path unit could automatically start",
+            ),
+            (
+                "active-socket-chain",
+                {"explicit_socket_active": "1"},
+                "systemd socket could automatically start",
+            ),
+            (
+                "active-target-chain",
+                {"target_wants_active": "1"},
+                "systemd target could automatically start",
+            ),
+            (
+                "system-state-partial-timeout",
+                {"systemd_partial_timeout": "1"},
+                "systemd state probe failed",
+            ),
+            (
+                "agent-activity-partial-timeout",
+                {"agent_activity_partial_timeout": "1"},
+                "activity probe failed",
+            ),
+            (
+                "agent-enablement-partial-timeout",
+                {"agent_enablement_partial_timeout": "1"},
+                "enablement probe failed",
+            ),
             (
                 "enabled-unit",
                 {"agent_unit_enabled": "1"},
@@ -1177,6 +1580,10 @@ class ForcedQrRuntimeTests(unittest.TestCase):
             with self.subTest(case=label):
                 for name, value in state.items():
                     self.fixture.write_state(name, value)
+                if any(
+                    "partial_timeout" in name for name in state
+                ):
+                    self.fixture.env["DOCKER_COMMAND_TIMEOUT"] = "1"
                 before = tree_digest(self.fixture.storage)
                 result = self.fixture.run("start-qr-login.sh")
                 self.assert_failed(result)
@@ -1192,6 +1599,13 @@ class ForcedQrRuntimeTests(unittest.TestCase):
 
     def test_exact_actual_container_attestation_rejects_drift(self) -> None:
         cases = (
+            ("previously-started-exited", "actual_status", "exited"),
+            ("restarting", "actual_restarting", "true"),
+            ("paused", "actual_paused", "true"),
+            ("dead", "actual_dead", "true"),
+            ("oom-killed", "actual_oom_killed", "true"),
+            ("nonzero-exit", "actual_exit_code", "1"),
+            ("restart-count", "actual_restart_count", "1"),
             ("restart", "actual_restart", "unless-stopped"),
             (
                 "image",
@@ -1257,9 +1671,10 @@ class ForcedQrRuntimeTests(unittest.TestCase):
                 )
             with self.subTest(case=label):
                 self.fixture.write_state(state_name, value)
+                storage_before = tree_digest(self.fixture.storage)
                 result = self.fixture.run("start-qr-login.sh")
-                self.assert_failed_lifecycle_cleanup(
-                    result, "start_agent_container"
+                self.assert_candidate_rejected_before_archive(
+                    result, storage_before
                 )
                 self.assertIn(
                     "exact production runtime contract", result.stdout
@@ -1297,11 +1712,12 @@ class ForcedQrRuntimeTests(unittest.TestCase):
                     docker_transport
                 )
                 self.fixture.write_state(state_name, "1")
+                storage_before = tree_digest(self.fixture.storage)
 
                 result = self.fixture.run("start-qr-login.sh", trace=True)
 
-                self.assert_failed_lifecycle_cleanup(
-                    result, "start_agent_container"
+                self.assert_candidate_rejected_before_archive(
+                    result, storage_before
                 )
                 self.assertIn(
                     "exact production runtime contract", result.stdout
@@ -1359,10 +1775,12 @@ class ForcedQrRuntimeTests(unittest.TestCase):
             encoding="utf-8"
         )
         self.fixture.write_state("mutate_agent_compose_after_config", "1")
+        storage_before = tree_digest(self.fixture.storage)
 
         result = self.fixture.run("start-qr-login.sh")
 
-        self.assert_succeeded(result)
+        self.assert_failed(result)
+        self.assertIn("Compose changed during the fresh QR operation", result.stdout)
         self.assertEqual(
             self.fixture.read_state("agent_compose_mutated"), "1"
         )
@@ -1379,13 +1797,18 @@ class ForcedQrRuntimeTests(unittest.TestCase):
         audit = "\n".join(self.fixture.audit_lines())
         self.assertIn("agent compose invocation verified", audit)
         self.assertNotIn("attacker.invalid", result.stdout + audit)
-        self.assertIn(
-            "agent container start", self.fixture.mutation_lines()
+        self.assertEqual(tree_digest(self.fixture.storage), storage_before)
+        self.assertEqual(self.fixture.archive_dirs(), [])
+        self.assertTrue(
+            (self.fixture.runtime / "data" / "old-state.marker").is_file()
         )
-        self.assertIn(
-            "gateway worker start", self.fixture.mutation_lines()
-        )
-        self.assertEqual(self.fixture.read_state("gateway_running"), "1")
+        mutations = self.fixture.mutation_lines()
+        self.assertNotIn("agent container create stopped", mutations)
+        self.assertNotIn("agent container start attested candidate", mutations)
+        self.assertNotIn("gateway worker start", mutations)
+        self.assertEqual(self.fixture.read_state("gateway_running"), "0")
+        self.assertEqual(self.fixture.read_state("agent_exists"), "0")
+        self.assertNotIn("扫描二维码", result.stdout)
 
     def test_runtime_permission_drift_is_rejected_before_mutation(self) -> None:
         cases = (
@@ -1430,6 +1853,119 @@ class ForcedQrRuntimeTests(unittest.TestCase):
                 self.assertEqual(
                     self.fixture.read_state("gateway_running"), "1"
                 )
+
+    def test_runtime_parent_default_acl_is_rejected_before_mutation(
+        self,
+    ) -> None:
+        setfacl = shutil.which("setfacl")
+        if setfacl is None:
+            self.skipTest("setfacl is unavailable")
+        subprocess.run(
+            [
+                setfacl,
+                "-m",
+                "d:u:65534:rwx",
+                os.fspath(self.fixture.storage),
+            ],
+            check=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env={"LANG": "C.UTF-8", "LC_ALL": "C.UTF-8"},
+            timeout=5,
+        )
+        attributes = os.listxattr(self.fixture.storage)
+        self.assertTrue(
+            any("posix_acl_default" in os.fsdecode(name) for name in attributes),
+            attributes,
+        )
+        storage_before = tree_digest(self.fixture.storage)
+
+        result = self.fixture.run("start-qr-login.sh")
+
+        self.assert_failed(result)
+        self.assertIn("extended attributes or ACLs", result.stdout)
+        self.assertEqual(tree_digest(self.fixture.storage), storage_before)
+        self.assertEqual(self.fixture.mutation_lines(), [])
+        self.assertEqual(self.fixture.archive_dirs(), [])
+        self.assertEqual(self.fixture.login_log.read_text(), "")
+        self.assertEqual(self.fixture.read_state("gateway_running"), "1")
+
+    def test_management_numeric_boundaries_fail_before_lifecycle_mutation(
+        self,
+    ) -> None:
+        cases = (
+            ("port", "AGENT_WECHAT_PORT", "65536"),
+            ("runtime-uid", "CF_AGENT_WECHAT_RUNTIME_UID", "4294967295"),
+            ("runtime-gid", "CF_AGENT_WECHAT_RUNTIME_GID", "4294967295"),
+            (
+                "management-gid",
+                "CF_AGENT_WECHAT_MANAGEMENT_GID",
+                "4294967295",
+            ),
+        )
+        for index, (label, key, value) in enumerate(cases):
+            if index:
+                self.fixture.close()
+                self.fixture = RuntimeFixture(
+                    f"{self._testMethodName}-{label}"
+                )
+            with self.subTest(case=label):
+                self.fixture.replace_agent_env(key, value)
+                result = self.fixture.run("start-qr-login.sh")
+                self.assert_failed(result)
+                self.assertIn(
+                    "docker/.env failed byte-safe validation", result.stdout
+                )
+                self.assertEqual(self.fixture.mutation_lines(), [])
+                self.assertEqual(self.fixture.archive_dirs(), [])
+                self.assertEqual(self.fixture.login_log.read_text(), "")
+                self.assertEqual(
+                    self.fixture.read_state("gateway_running"), "1"
+                )
+                self.assertNotIn("扫描二维码", result.stdout)
+
+    def test_archive_capacity_is_rechecked_at_archive_commit_boundary(
+        self,
+    ) -> None:
+        for index, (label, state_name) in enumerate(
+            (
+                ("space", "df_available_blocks_after_first"),
+                ("inode", "df_available_inodes_after_first"),
+            )
+        ):
+            if index:
+                self.fixture.close()
+                self.fixture = RuntimeFixture(
+                    f"{self._testMethodName}-{label}"
+                )
+            with self.subTest(case=label):
+                self.fixture.write_state(state_name, "0")
+                result = self.fixture.run("start-qr-login.sh")
+                self.assert_failed(result)
+                self.assertIn(
+                    "below the approved free space or inode", result.stdout
+                )
+                self.assertEqual(
+                    self.fixture.read_state("df_capacity_probe_count"), "2"
+                )
+                self.assertEqual(self.fixture.archive_dirs(), [])
+                self.assertTrue(
+                    (
+                        self.fixture.runtime / "data" / "old-state.marker"
+                    ).is_file()
+                )
+                self.assertEqual(self.fixture.login_log.read_text(), "")
+                self.assertEqual(
+                    self.fixture.read_state("gateway_running"), "0"
+                )
+                mutations = self.fixture.mutation_lines()
+                self.assertIn("agent container create stopped", mutations)
+                self.assertNotIn(
+                    "agent container start attested candidate", mutations
+                )
+                self.assertNotIn("gateway worker start", mutations)
+                self.assertNotIn("扫描二维码", result.stdout)
 
     def test_archive_capacity_and_inode_gates_stop_worker_before_qr(self) -> None:
         cases = (
@@ -1487,6 +2023,68 @@ class ForcedQrRuntimeTests(unittest.TestCase):
         self.assertEqual(self.fixture.login_log.read_text(), "")
         self.assertNotIn("扫描二维码", result.stdout)
 
+    def test_archive_capacity_rejects_unsafe_df_numbers_before_archive(
+        self,
+    ) -> None:
+        cases = (
+            ("block-total-overflow", "df_total_blocks", str(1 << 63)),
+            (
+                "block-byte-overflow",
+                "df_available_blocks",
+                str(((1 << 63) - 1) // 1024 + 1),
+            ),
+            ("inode-total-overflow", "df_total_inodes", str(1 << 63)),
+            ("inode-available-overflow", "df_available_inodes", str(1 << 63)),
+            ("malformed-block", "df_available_blocks", "not-a-number"),
+        )
+        for index, (label, state_name, value) in enumerate(cases):
+            if index:
+                self.fixture.close()
+                self.fixture = RuntimeFixture(
+                    f"{self._testMethodName}-{label}"
+                )
+            with self.subTest(case=label):
+                self.fixture.write_state(state_name, value)
+                result = self.fixture.run("start-qr-login.sh")
+                self.assert_failed(result)
+                self.assertRegex(
+                    result.stdout,
+                    r"(invalid capacity|could not be measured)",
+                )
+                self.assertEqual(
+                    self.fixture.read_state("gateway_running"), "0"
+                )
+                self.assertEqual(self.fixture.archive_dirs(), [])
+                self.assertEqual(self.fixture.login_log.read_text(), "")
+                self.assertNotIn("扫描二维码", result.stdout)
+
+    def test_archive_capacity_rejects_available_greater_than_total(
+        self,
+    ) -> None:
+        cases = (
+            ("blocks", "df_total_blocks", "10", "df_available_blocks", "11"),
+            ("inodes", "df_total_inodes", "10", "df_available_inodes", "11"),
+        )
+        for index, case in enumerate(cases):
+            label, total_name, total, available_name, available = case
+            if index:
+                self.fixture.close()
+                self.fixture = RuntimeFixture(
+                    f"{self._testMethodName}-{label}"
+                )
+            with self.subTest(case=label):
+                self.fixture.write_state(total_name, total)
+                self.fixture.write_state(available_name, available)
+                result = self.fixture.run("start-qr-login.sh")
+                self.assert_failed(result)
+                self.assertIn("invalid capacity", result.stdout)
+                self.assertEqual(
+                    self.fixture.read_state("gateway_running"), "0"
+                )
+                self.assertEqual(self.fixture.archive_dirs(), [])
+                self.assertEqual(self.fixture.login_log.read_text(), "")
+                self.assertNotIn("扫描二维码", result.stdout)
+
     def test_archive_capacity_df_hard_timeout_fails_before_archive_or_qr(
         self,
     ) -> None:
@@ -1515,6 +2113,7 @@ class ForcedQrRuntimeTests(unittest.TestCase):
             "credential-path-mismatch",
             "plaintext-credential",
             "checker-missing",
+            "gate-missing",
             "version-incompatible",
         )
         for index, mode in enumerate(cases):
@@ -1539,6 +2138,8 @@ class ForcedQrRuntimeTests(unittest.TestCase):
                     )
                 elif mode == "checker-missing":
                     self.fixture.gateway_heartbeat.unlink()
+                elif mode == "gate-missing":
+                    self.fixture.gateway_release_gate.unlink()
                 else:
                     contract = json.loads(
                         self.fixture.gateway_contract.read_text(
@@ -1606,13 +2207,180 @@ class ForcedQrRuntimeTests(unittest.TestCase):
             + self.fixture.mutation_log.read_text(encoding="utf-8"),
         )
 
+    def test_gateway_gate_begin_failure_and_sensitive_output_fail_closed(
+        self,
+    ) -> None:
+        for index, mode in enumerate(("fail-begin", "sensitive-begin")):
+            if index:
+                self.fixture.close()
+                self.fixture = RuntimeFixture(
+                    f"{self._testMethodName}-{mode}"
+                )
+            with self.subTest(mode=mode):
+                self.fixture.write_state("gateway_gate_mode", mode)
+                before = tree_digest(self.fixture.storage)
+
+                result = self.fixture.run("start-qr-login.sh")
+
+                self.assert_failed(result)
+                self.assertEqual(tree_digest(self.fixture.storage), before)
+                self.assertEqual(self.fixture.archive_dirs(), [])
+                self.assertEqual(self.fixture.login_log.read_text(), "")
+                self.assertEqual(
+                    self.fixture.read_state("gateway_running"), "0"
+                )
+                self.assertNotIn(
+                    "gateway worker start", self.fixture.mutation_lines()
+                )
+                self.assertEqual(self.fixture.gate_lines(), ["begin"])
+                self.assertIn("begin_gateway_generation", result.stdout)
+                self.fixture.assert_no_sensitive_text(self, result.stdout)
+
+    def test_gateway_gate_release_failures_abort_without_worker_start(
+        self,
+    ) -> None:
+        cases = (
+            "fail-release",
+            "timeout-release",
+            "sensitive-release",
+            "mismatched-agent",
+        )
+        for index, mode in enumerate(cases):
+            if index:
+                self.fixture.close()
+                self.fixture = RuntimeFixture(
+                    f"{self._testMethodName}-{mode}"
+                )
+            with self.subTest(mode=mode):
+                if mode == "mismatched-agent":
+                    self.fixture.write_state(
+                        "gateway_gate_expected_agent", "d" * 64
+                    )
+                else:
+                    self.fixture.write_state("gateway_gate_mode", mode)
+
+                result = self.fixture.run(
+                    "start-qr-login.sh", timeout=30
+                )
+
+                self.assert_failed_worker_release_preserves_agent(
+                    result,
+                    "release_gateway_generation",
+                    worker_started=False,
+                )
+                operations = self.fixture.gate_lines()
+                self.assertEqual(operations[0], "begin")
+                self.assertIn("release", operations)
+                self.assertEqual(operations[-1], "abort")
+                self.assertEqual(
+                    self.fixture.read_state("gateway_gate_state"),
+                    "aborted",
+                )
+                self.assertNotIn(
+                    "gateway worker start", self.fixture.mutation_lines()
+                )
+                self.fixture.assert_no_sensitive_text(self, result.stdout)
+
+    def test_worker_default_deny_blocks_start_without_effective_release(
+        self,
+    ) -> None:
+        self.fixture.write_state(
+            "gateway_gate_mode", "no-authorize-release"
+        )
+
+        result = self.fixture.run("start-qr-login.sh")
+
+        self.assert_failed_worker_release_preserves_agent(
+            result, "start_gateway_worker", worker_started=False
+        )
+        self.assertIn(
+            "gateway worker pre-release denied",
+            self.fixture.audit_lines(),
+        )
+        self.assertEqual(self.fixture.gate_lines()[-1], "abort")
+        self.assertEqual(
+            self.fixture.read_state("gateway_gate_state"), "aborted"
+        )
+        self.fixture.assert_no_sensitive_text(self, result.stdout)
+
+    def test_pending_generation_drift_aborts_qr_and_keeps_worker_stopped(
+        self,
+    ) -> None:
+        self.fixture.env["MOCK_LOGIN_MODE"] = "block"
+        process = self.fixture.popen("start-qr-login.sh")
+        deadline = time.monotonic() + 8
+        while (
+            time.monotonic() < deadline
+            and not self.fixture.login_pause_file.exists()
+        ):
+            if process.poll() is not None:
+                self.fail(
+                    process.stdout.read()
+                    if process.stdout
+                    else "start exited before QR generation drift"
+                )
+            time.sleep(0.05)
+        self.assertTrue(self.fixture.login_pause_file.exists())
+        self.fixture.write_state("gateway_gate_generation", "d" * 64)
+        self.fixture.login_continue_file.touch()
+        output, _ = process.communicate(timeout=15)
+        result = subprocess.CompletedProcess(
+            process.args, process.returncode, output
+        )
+
+        self.assert_failed_lifecycle_cleanup(
+            result, "force_qr_login", worker_started=False
+        )
+        self.assertEqual(self.fixture.gate_lines()[-1], "abort")
+        self.assertEqual(
+            self.fixture.read_state("gateway_gate_state"), "pending"
+        )
+        self.assertIn(
+            "generation revocation could not be confirmed",
+            result.stdout,
+        )
+        self.assertNotIn(
+            "gateway worker start", self.fixture.mutation_lines()
+        )
+
+    def test_gate_replacement_race_never_executes_or_leaks(self) -> None:
+        replacement = self.fixture.root / "replacement-runtime-gate"
+        marker = self.fixture.root / "replacement-gate-executed"
+        replacement.write_text(
+            "#!/bin/sh\n"
+            + f"printf '%s\\n' {shlex.quote(self.fixture.token)}\n"
+            + f"printf replaced > {shlex.quote(str(marker))}\n"
+            + "exit 0\n",
+            encoding="utf-8",
+        )
+        replacement.chmod(0o755)
+        self.fixture.env[
+            "CF_AGENT_WECHAT_TEST_GATEWAY_GATE_REPLACEMENT"
+        ] = str(replacement)
+        before = tree_digest(self.fixture.storage)
+
+        result = self.fixture.run("start-qr-login.sh")
+
+        self.assert_failed(result)
+        self.assertIn("begin_gateway_generation", result.stdout)
+        self.assertEqual(tree_digest(self.fixture.storage), before)
+        self.assertFalse(marker.exists())
+        self.assertNotIn(self.fixture.token, result.stdout)
+        self.assertEqual(self.fixture.archive_dirs(), [])
+        self.assertEqual(self.fixture.read_state("gateway_running"), "0")
+        self.assertNotIn(
+            "gateway worker start", self.fixture.mutation_lines()
+        )
+
     def test_live_gateway_worker_credential_drift_revokes_worker(self) -> None:
         self.fixture.write_state(
             "gateway_actual_token_source", "/tmp/unapproved-token"
         )
         result = self.fixture.run("start-qr-login.sh")
         manifest = self.assert_failed_worker_release_preserves_agent(
-            result, "start_gateway_worker", worker_started=True
+            result,
+            "create_gateway_worker_candidate",
+            worker_started=False,
         )
         self.assertEqual(manifest["archiveResult"], "succeeded")
         self.assertIn("file credential contract", result.stdout)
@@ -1657,6 +2425,31 @@ class ForcedQrRuntimeTests(unittest.TestCase):
             token_before,
         )
         self.fixture.assert_tree_has_no_sensitive_text(self, archived)
+
+    def test_first_start_without_prior_runtime_uses_attested_candidate(
+        self,
+    ) -> None:
+        shutil.rmtree(self.fixture.runtime)
+
+        result = self.fixture.run("start-qr-login.sh")
+
+        self.assert_succeeded(result)
+        self.assertEqual(self.fixture.archive_dirs(), [])
+        self.assertTrue((self.fixture.runtime / "data").is_dir())
+        self.assertTrue((self.fixture.runtime / "wechat-home").is_dir())
+        self.assertEqual(
+            self.fixture.mutation_lines(),
+            [
+                "gateway worker stop",
+                "agent container stop",
+                "agent container remove",
+                "agent container create stopped",
+                "agent container start attested candidate",
+                "gateway worker start",
+            ],
+        )
+        self.assertEqual(self.fixture.read_state("agent_running"), "1")
+        self.assertEqual(self.fixture.read_state("gateway_running"), "1")
 
     def test_legacy_home_move_failure_rolls_data_back_without_split(self) -> None:
         self.fixture.create_legacy_layout(remove_runtime=True)
@@ -1968,7 +2761,8 @@ class ForcedQrRuntimeTests(unittest.TestCase):
                 "gateway worker stop",
                 "agent container stop",
                 "agent container remove",
-                "agent container start",
+                "agent container create stopped",
+                "agent container start attested candidate",
                 "gateway worker stop",
                 "agent container stop",
                 "agent container remove",
@@ -2137,7 +2931,8 @@ class ForcedQrRuntimeTests(unittest.TestCase):
                 "gateway worker stop",
                 "agent container stop",
                 "agent container remove",
-                "agent container start",
+                "agent container create stopped",
+                "agent container start attested candidate",
                 "gateway worker start",
                 "gateway worker stop",
             ],
@@ -2273,6 +3068,81 @@ class ForcedQrRuntimeTests(unittest.TestCase):
         for archived in archives:
             self.fixture.assert_tree_has_no_sensitive_text(self, archived)
 
+    def test_worker_restarted_during_qr_wait_is_stopped_and_aborts(
+        self,
+    ) -> None:
+        self.fixture.env["MOCK_LOGIN_MODE"] = "block"
+        process = self.fixture.popen("start-qr-login.sh")
+        deadline = time.monotonic() + 8
+        while (
+            time.monotonic() < deadline
+            and not self.fixture.login_pause_file.exists()
+        ):
+            if process.poll() is not None:
+                self.fail(
+                    process.stdout.read()
+                    if process.stdout
+                    else "fresh QR process exited before QR wait"
+                )
+            time.sleep(0.05)
+        self.assertTrue(self.fixture.login_pause_file.exists())
+
+        self.fixture.write_state("gateway_running", "1")
+        output, _ = process.communicate(timeout=10)
+        result = subprocess.CompletedProcess(
+            process.args,
+            process.returncode,
+            output,
+        )
+
+        manifest = self.assert_failed_lifecycle_cleanup(
+            result, "force_qr_login"
+        )
+        self.assertEqual(manifest["archiveResult"], "succeeded")
+        self.assertIn(
+            "became active before authorized fresh-runtime release",
+            result.stdout,
+        )
+        self.assertIn("扫描二维码", result.stdout)
+        self.assertEqual(self.fixture.read_state("gateway_running"), "0")
+        mutations = self.fixture.mutation_lines()
+        self.assertGreaterEqual(
+            mutations.count("gateway worker stop"), 2
+        )
+        self.assertNotIn("gateway worker start", mutations)
+        self.fixture.assert_no_sensitive_text(self, result.stdout)
+
+    def test_final_release_rejects_agent_container_id_replacement(self) -> None:
+        self.fixture.env["MOCK_LOGIN_MODE"] = "block"
+        process = self.fixture.popen("start-qr-login.sh")
+        deadline = time.monotonic() + 8
+        while (
+            time.monotonic() < deadline
+            and not self.fixture.login_pause_file.exists()
+        ):
+            if process.poll() is not None:
+                self.fail(
+                    process.stdout.read()
+                    if process.stdout
+                    else "fresh QR process exited before pause"
+                )
+            time.sleep(0.05)
+        self.assertTrue(self.fixture.login_pause_file.exists())
+        self.fixture.write_state("agent_compose_id", "d" * 64)
+        self.fixture.login_continue_file.touch()
+        output, _ = process.communicate(timeout=10)
+        result = subprocess.CompletedProcess(
+            process.args,
+            process.returncode,
+            output,
+        )
+
+        self.assert_failed_lifecycle_cleanup(
+            result, "revalidate_final_runtime_contract"
+        )
+        self.assertIn("container identity changed", result.stdout)
+        self.assertNotIn("gateway worker start", self.fixture.mutation_lines())
+
     def test_concurrent_start_allows_only_one_lock_holder(self) -> None:
         self.fixture.env["MOCK_LOGIN_MODE"] = "block"
         first = self.fixture.popen("start-qr-login.sh")
@@ -2327,7 +3197,8 @@ class ForcedQrRuntimeTests(unittest.TestCase):
                 "gateway worker stop",
                 "agent container stop",
                 "agent container remove",
-                "agent container start",
+                "agent container create stopped",
+                "agent container start attested candidate",
                 "gateway worker start",
             ],
         )
@@ -2482,6 +3353,11 @@ class ForcedQrRuntimeTests(unittest.TestCase):
                 self.assertEqual(manifest["archiveResult"], "succeeded")
                 self.assertIn("heartbeat", result.stdout.lower())
                 self.fixture.assert_no_sensitive_text(self, result.stdout)
+                self.assertEqual(self.fixture.gate_lines()[-1], "abort")
+                self.assertEqual(
+                    self.fixture.read_state("gateway_gate_state"),
+                    "aborted",
+                )
                 mutations = self.fixture.mutation_lines()
                 worker_start = mutations.index("gateway worker start")
                 self.assertEqual(
@@ -2492,7 +3368,7 @@ class ForcedQrRuntimeTests(unittest.TestCase):
                     "post-up failure needs immediate rollback plus EXIT fallback",
                 )
 
-    def test_worker_rollback_stop_failure_retries_in_exit_guard(self) -> None:
+    def test_worker_compose_stop_failure_uses_exact_label_fallback(self) -> None:
         self.fixture.write_state("worker_heartbeat", "unhealthy")
         self.fixture.write_state("gateway_cleanup_stop_failures", "1")
 
@@ -2505,17 +3381,23 @@ class ForcedQrRuntimeTests(unittest.TestCase):
         worker_start = mutations.index("gateway worker start")
         self.assertEqual(
             mutations[worker_start + 1 :],
-            ["gateway worker stop failed", "gateway worker stop"],
+            [
+                "gateway worker stop failed",
+                "gateway worker direct stop",
+                "gateway worker stop",
+            ],
         )
-        self.assertIn("rollback could not be confirmed", result.stdout)
+        self.assertNotIn("rollback could not be confirmed", result.stdout)
         self.assertIn("remains stopped", result.stdout)
         self.assertNotIn("state is unknown", result.stdout)
+        self.assertEqual(self.fixture.read_state("gateway_running"), "0")
 
     def test_worker_rollback_unknown_after_both_stop_attempts_fail(
         self,
     ) -> None:
         self.fixture.write_state("worker_heartbeat", "unhealthy")
         self.fixture.write_state("gateway_cleanup_stop_failures", "2")
+        self.fixture.write_state("gateway_direct_stop_error", "1")
 
         result = self.fixture.run("start-qr-login.sh", timeout=30)
 
@@ -2534,6 +3416,39 @@ class ForcedQrRuntimeTests(unittest.TestCase):
             "AI scheduling was not started",
             result.stdout,
         )
+
+    def test_worker_direct_fallback_rejects_label_mismatch(self) -> None:
+        self.fixture.write_state("worker_heartbeat", "unhealthy")
+        self.fixture.write_state("gateway_cleanup_stop_failures", "2")
+        self.fixture.write_state("gateway_actual_project", "attacker-project")
+
+        result = self.fixture.run("start-qr-login.sh", timeout=30)
+
+        self.assert_failed(result)
+        self.assertEqual(self.fixture.read_state("gateway_running"), "1")
+        self.assertIn("rollback could not be confirmed", result.stdout)
+        mutations = self.fixture.mutation_lines()
+        self.assertNotIn("gateway worker direct stop", mutations)
+        self.assertEqual(
+            mutations.count("gateway worker stop failed"),
+            2,
+        )
+        self.fixture.assert_no_sensitive_text(self, result.stdout)
+
+    def test_worker_id_replacement_is_rolled_back_immediately(self) -> None:
+        self.fixture.write_state("worker_heartbeat", "replace-instance")
+
+        result = self.fixture.run("start-qr-login.sh", timeout=30)
+
+        self.assert_failed_worker_release_preserves_agent(
+            result, "start_gateway_worker", worker_started=True
+        )
+        self.assertIn("instance identity changed", result.stdout)
+        self.assertEqual(self.fixture.read_state("gateway_running"), "0")
+        mutations = self.fixture.mutation_lines()
+        self.assertIn("gateway worker stop", mutations)
+        self.assertNotIn("gateway worker direct stop", mutations)
+        self.fixture.assert_no_sensitive_text(self, result.stdout)
 
     def test_checker_replacement_race_never_executes_or_leaks(
         self,

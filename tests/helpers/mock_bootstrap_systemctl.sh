@@ -8,6 +8,10 @@ printf 'systemctl\t%s\n' "$*" >> "${STATE_DIR}/systemctl.log"
 
 case "${1:-}" in
   is-system-running)
+    if [ -e "${STATE_DIR}/systemd-partial-timeout" ]; then
+      printf '%s\n' running
+      sleep 30
+    fi
     if [ -e "${STATE_DIR}/systemd-offline" ]; then
       printf '%s\n' offline
       exit 1
@@ -15,12 +19,43 @@ case "${1:-}" in
     printf '%s\n' running
     ;;
   is-active)
-    [ "${2:-}" = docker.service ] || exit 2
-    if [ -e "${STATE_DIR}/docker-inactive" ]; then
-      printf '%s\n' inactive
-      exit 3
-    fi
-    printf '%s\n' active
+    case "${2:-}" in
+      docker.service)
+        if [ -e "${STATE_DIR}/docker-inactive" ]; then
+          printf '%s\n' inactive
+          exit 3
+        fi
+        printf '%s\n' active
+        ;;
+      cf-agent-wechat.service)
+        if [ -e "${STATE_DIR}/agent-activity-partial-timeout" ]; then
+          printf '%s\n' inactive
+          sleep 30
+        fi
+        if [ -e "${STATE_DIR}/agent-unit-active" ]; then
+          printf '%s\n' active
+          exit 0
+        fi
+        printf '%s\n' inactive
+        exit 3
+        ;;
+      *) exit 2 ;;
+    esac
+    ;;
+  list-units)
+    printf '%s\n' 'docker.service loaded active running Docker'
+    [ ! -e "${STATE_DIR}/agent-unit-active" ] ||
+      printf '%s\n' 'cf-agent-wechat.service loaded active running Agent'
+    [ ! -e "${STATE_DIR}/hidden-agent-unit-active" ] ||
+      printf '%s\n' 'restore-runtime.service loaded active running Restore'
+    [ ! -e "${STATE_DIR}/generic-agent-timer-active" ] ||
+      printf '%s\n' 'nightly-maintenance.timer loaded active waiting Timer'
+    [ ! -e "${STATE_DIR}/generic-agent-path-active" ] ||
+      printf '%s\n' 'watched-maintenance.path loaded active waiting Path'
+    [ ! -e "${STATE_DIR}/generic-agent-socket-active" ] ||
+      printf '%s\n' 'wakeup-gateway.socket loaded active listening Socket'
+    [ ! -e "${STATE_DIR}/generic-agent-target-active" ] ||
+      printf '%s\n' 'boot-maintenance.target loaded active active Target'
     ;;
   is-enabled)
     case "${2:-}" in
@@ -32,6 +67,10 @@ case "${1:-}" in
         printf '%s\n' enabled
         ;;
       cf-agent-wechat.service)
+        if [ -e "${STATE_DIR}/agent-enablement-partial-timeout" ]; then
+          printf '%s\n' not-found
+          sleep 30
+        fi
         if [ -e "${STATE_DIR}/agent-unit-enabled" ]; then
           printf '%s\n' enabled
           exit 0

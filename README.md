@@ -95,10 +95,16 @@ Debian 启动
   -> 确认 wechat-worker running/healthy/heartbeat
 ```
 
-本仓库会在启动脚本开始变更 runtime 前停止并复核 `wechat-worker`，但不能修改或保证
-Gateway 自身的重启策略。必须在 CFserver 实机确认：Debian 启动至人工执行脚本前，
-`wechat-worker` 的 restart/boot stop gate 能让它持续停止。该现场门禁未验证前，不得
-宣称重启窗口已经由本仓库保证安全。
+本仓库会在 Archive、Agent start、QR、运行态验证和最终 Worker release 边界重复用
+Compose 状态与精确 Docker labels 证明 `wechat-worker` stopped。QR WebSocket 等待期间
+主流程也会轮询；发现外部启动时立即停止 Worker、终止本次登录并 fail closed。
+
+这些检查只能检测并撤销本仓库取得控制后的并发启动，不能原子禁止 Gateway、外部
+supervisor 或另一名管理员在两个检查之间启动 Worker。Contract v1 的
+`bootPolicy=manual-after-fresh-qr` 因此要求 Gateway producer 提供绑定同一 fresh
+runtime generation 的 generation/release gate：默认拒绝启动，只有当前扫码和
+auth/chats/messages 全部验证后才能释放，旧 release 不能授权下一轮。该 producer gate、
+Gateway restart 策略和 Debian boot stop 证据未发布前，不得宣称启动窗口安全。
 
 在变更前预览动作：
 
@@ -178,8 +184,13 @@ symlink、额外 hardlink 或特殊文件均 fail closed。新 Runtime 始终按
 
 Token 不属于 runtime，不得复制进 runtime、归档、日志、环境变量、argv、Docker inspect
 或 Compose config。归档前的有界 no-follow 扫描不跟随 symlink、不跨文件系统，拒绝
-FIFO、socket、device 等特殊文件，并限制文件数、总字节和扫描时间；扫描失败或命中
-Token 都在归档和二维码之前 fail closed。
+FIFO、socket、device 等特殊文件；扫描同时检查普通文件内容和每个目录项名称的原始
+文件系统字节，并拒绝任何 xattr/POSIX ACL，避免 Token 随 metadata 进入 Archive。
+`docker/.env` 的扫描上限不得超过 200,000 个 entry；扫描器另有不可配置的 200,000
+entry attestation 上限和 64 MiB 累计编码相对路径上限，并同时限制普通文件总字节与
+扫描时间。扫描失败或命中当前独立 Agent Token 都在归档和二维码之前 fail closed。
+最终重验依赖 Agent 容器已停止且部署 principal 受信；它不声称能抵御在最后一次检查后
+仍可写 Runtime 的同权限或 root 写入者，该项必须由 CFserver 权限与进程 inventory 证明。
 
 每次启动在取得管理锁后先停止并确认 Gateway `worker` service，再校验 Archive 可用
 bytes、百分比和 inode，并输出脱敏 inventory；任一阈值不满足时 Worker 保持停止，且
@@ -232,6 +243,10 @@ forced production 只接受能够在渲染前检查 Token 的文本 QR payload�
   rootful daemon、`live-restore=false`、未启用的 `cf-agent-wechat.service`/同类
   auto-start unit 和渲染的 `restart=no`；创建后还精确检查实际容器 image、project、
   name、RestartPolicy、mount、loopback port、network alias 和环境。
+- systemd 扫描枚举 enabled/linked 与 active service/timer/path/socket/target，并检查
+  timer/path/socket 的直接 activation target 及 target 的一跳 `Wants`/`Requires`。
+  它不递归证明任意深度依赖，也不覆盖 cron、Swarm、Kubernetes、外部配置管理或人工
+  `docker start/run`；这些启动源仍属于 CFserver 人工 inventory pending。
 - `PROXY` 只允许空值或 `http`/`https`/`socks5`/`socks5h` 的无凭证
   `scheme://host:port`；userinfo、path、query、fragment 和控制字符全部拒绝。当前不
   支持认证代理，代理密码不得进入普通环境或 `docker inspect`。
@@ -239,7 +254,9 @@ forced production 只接受能够在渲染前检查 Token 的文本 QR payload�
   no-input、禁用版本检查、有界网络 timeout/retry 及整体 hard timeout。已安装依赖与
   lock digest 合同时快速复用，否则事务式重建。启动流程先停止并确认 Worker，再做
   容量/inventory 和 venv 准备；依赖失败仍发生在 Agent 容器、Archive 和 QR 变更前，
-  Worker 保持停止。
+  Worker 保持停止。依赖 helper 会快照 Python、venv、lock 和 verifier 的全部现存祖先
+  device/inode/owner/group/mode/type，并在创建、pip、验证、stamp、cleanup 与 rollback
+  前后重验；祖先漂移时停止路径操作并保留受限现场。
 - start/stop/retention 共用 root-protected 管理锁；文件精确为批准 owner、
   `CF_AGENT_WECHAT_MANAGEMENT_GID`、mode `0640`、单 hardlink、非 symlink 且为空。
   flock 随进程退出释放，普通非管理用户不能持锁。

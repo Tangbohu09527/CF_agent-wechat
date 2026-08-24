@@ -74,7 +74,9 @@ require_agent_compose_environment() {
 }
 
 print_container_inspect() {
-  local identity actual_container actual_image actual_project actual_restart
+  local identity actual_running actual_status actual_restarting actual_paused
+  local actual_dead actual_oom_killed actual_exit_code actual_restart_count
+  local actual_container actual_image actual_project actual_restart
   local actual_bind_ip actual_port actual_proxy actual_rust alias actual_image_id
   local actual_privileged actual_cap_add actual_security_opt actual_devices
   local actual_device_requests actual_pid_mode actual_ipc_mode actual_uts_mode
@@ -93,6 +95,18 @@ print_container_inspect() {
   local actual_token_mount_rw
 
   identity="$(state_get actual_container_id aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa)"
+  actual_running="$(state_get agent_running 1)"
+  if [ "$actual_running" = 1 ]; then
+    actual_status="$(state_get actual_status running)"
+  else
+    actual_status="$(state_get actual_status created)"
+  fi
+  actual_restarting="$(state_get actual_restarting false)"
+  actual_paused="$(state_get actual_paused false)"
+  actual_dead="$(state_get actual_dead false)"
+  actual_oom_killed="$(state_get actual_oom_killed false)"
+  actual_exit_code="$(state_get actual_exit_code 0)"
+  actual_restart_count="$(state_get actual_restart_count 0)"
   actual_container="$(state_get actual_container "$MOCK_APPROVED_AGENT_CONTAINER")"
   actual_image="$(state_get actual_image "$MOCK_APPROVED_AGENT_IMAGE")"
   actual_image_id="$(state_get actual_container_image_id sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb)"
@@ -146,8 +160,13 @@ print_container_inspect() {
   actual_home_mount_rw="$(state_get actual_home_mount_rw true)"
   actual_token_mount_rw="$(state_get actual_token_mount_rw false)"
 
-  printf '[{"Id":"%s","Image":"%s","Name":"/%s",' \
-    "$identity" "$actual_image_id" "$actual_container"
+  if [ "$actual_running" = 1 ]; then actual_running=true; else actual_running=false; fi
+  printf '[{"Id":"%s","Image":"%s","Name":"/%s","RestartCount":%s,' \
+    "$identity" "$actual_image_id" "$actual_container" "$actual_restart_count"
+  printf '"State":{"Status":"%s","Running":%s,"Restarting":%s,' \
+    "$actual_status" "$actual_running" "$actual_restarting"
+  printf '"Paused":%s,"Dead":%s,"OOMKilled":%s,"ExitCode":%s},' \
+    "$actual_paused" "$actual_dead" "$actual_oom_killed" "$actual_exit_code"
   if [ "$(state_get actual_inspect_contains_token 0)" = 1 ]; then
     printf '"FixtureOpaque":"'
     tr -d '\n' < "$MOCK_APPROVED_TOKEN_FILE"
@@ -195,7 +214,11 @@ print_container_inspect() {
     printf ',"8080/tcp":[{"HostIp":"127.0.0.1","HostPort":"8080"}]'
   fi
   printf '}},'
-  printf '"NetworkSettings":{"Ports":{"6174/tcp":[{"HostIp":"%s","HostPort":"%s"}]' "$actual_bind_ip" "$actual_port"
+  if [ "$actual_running" = true ]; then
+    printf '"NetworkSettings":{"Ports":{"6174/tcp":[{"HostIp":"%s","HostPort":"%s"}]' "$actual_bind_ip" "$actual_port"
+  else
+    printf '"NetworkSettings":{"Ports":{"6174/tcp":null'
+  fi
   if [ "$(state_get actual_extra_port 0)" = 1 ]; then
     printf ',"8080/tcp":[{"HostIp":"127.0.0.1","HostPort":"8080"}]'
   fi
@@ -238,7 +261,8 @@ print_image_inspect() {
 }
 
 print_gateway_worker_inspect() {
-  local project service pointer source destination read_write
+  local project service pointer source destination read_write identity
+  local running status
 
   project="$(state_get gateway_actual_project cf-agent-gateway)"
   service="$(state_get gateway_actual_service worker)"
@@ -246,8 +270,19 @@ print_gateway_worker_inspect() {
   source="$(state_get gateway_actual_token_source "$MOCK_APPROVED_TOKEN_FILE")"
   destination="$(state_get gateway_actual_token_destination /run/secrets/cf-agent-wechat-auth-token)"
   read_write="$(state_get gateway_actual_token_rw false)"
+  identity="$(state_get gateway_compose_id cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc)"
+  running="$(state_get gateway_running 0)"
+  if [ "$running" = 1 ]; then
+    status=running
+    running=true
+  else
+    status=created
+    running=false
+  fi
 
-  printf '[{"Config":{"Labels":{'
+  printf '[{"Id":"%s","State":{"Status":"%s","Running":%s,' "$identity" "$status" "$running"
+  printf '"Restarting":false,"Paused":false,"Dead":false},'
+  printf '"Config":{"Labels":{'
   printf '"com.docker.compose.project":"%s",' "$project"
   printf '"com.docker.compose.service":"%s"},' "$service"
   printf '"Env":["PATH=/usr/local/bin:/usr/bin"'
@@ -258,7 +293,8 @@ print_gateway_worker_inspect() {
     printf '"'
   fi
   printf ']},'
-  printf '"HostConfig":{"Tmpfs":{},"Devices":[]},'
+  printf '"HostConfig":{"Tmpfs":{},"Devices":[],"RestartPolicy":'
+  printf '{"Name":"no","MaximumRetryCount":0}},'
   printf '"Mounts":[{"Type":"bind","Source":"%s",' "$source"
   printf '"Destination":"%s","RW":%s}]}]\n' "$destination" "$read_write"
 }
@@ -300,6 +336,45 @@ case "${1:-}" in
     print_image_inspect
     exit 0
     ;;
+  ps)
+    record 'docker ps labelled gateway worker'
+    docker_arguments=" $* "
+    [[ "$docker_arguments" == *" --filter label=com.docker.compose.project=cf-agent-gateway "* ]] ||
+      exit 65
+    [[ "$docker_arguments" == *" --filter label=com.docker.compose.service=worker "* ]] ||
+      exit 65
+    [[ "$docker_arguments" == *" --format {{.ID}} "* ]] || exit 65
+    docker_arguments=""
+    [ "$(state_get gateway_direct_ps_error 0)" != 1 ] || exit 70
+    if [ "$(state_get gateway_running 1)" = 1 ]; then
+      state_get gateway_direct_id cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+      printf '\n'
+    fi
+    exit 0
+    ;;
+  start)
+    record 'docker start attested agent candidate'
+    [ "$#" -eq 2 ] || exit 65
+    [ "${2:-}" = "$(state_get agent_compose_id aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa)" ] || exit 65
+    [ "$(state_get agent_exists 0)" = 1 ] || exit 65
+    mutate 'agent container start attested candidate'
+    state_set agent_running 1
+    state_set agent_started_once 1
+    state_set wechat_calls 0
+    printf '%s\n' logged_out > "${MOCK_AUTH_STATE_FILE:?}"
+    printf '%s\n' 'agent runtime evidence' > "$MOCK_APPROVED_RUNTIME_ROOT/data/agent-runtime.log"
+    exit 0
+    ;;
+  stop)
+    record 'docker stop labelled gateway worker'
+    [ "${2:-}" = --time ] && [ "${3:-}" = 10 ] || exit 65
+    shift 3
+    [ "$#" -gt 0 ] || exit 65
+    [ "$(state_get gateway_direct_stop_error 0)" != 1 ] || exit 76
+    mutate 'gateway worker direct stop'
+    state_set gateway_running 0
+    exit 0
+    ;;
   exec)
     record 'docker exec wechat-process-check'
     process_script="${5:-}"
@@ -337,9 +412,30 @@ case "${1:-}" in
   inspect)
     record 'docker inspect'
     case "$*" in
+      *'{{.Id}}|{{.State.Status}}|{{.State.Running}}'*)
+        target="${*: -1}"
+        [ "$target" = "$(state_get gateway_compose_id cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc)" ] || exit 65
+        if [ "$(state_get gateway_running 0)" = 1 ]; then
+          printf '%s|running|true|false|false|false\n' "$target"
+        else
+          printf '%s|created|false|false|false|false\n' "$target"
+        fi
+        ;;
+      *'com.docker.compose.project'*)
+        target="${*: -1}"
+        [ "$target" = "$(state_get gateway_direct_id cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc)" ] || exit 65
+        printf '%s|%s|' \
+          "$(state_get gateway_actual_project cf-agent-gateway)" \
+          "$(state_get gateway_actual_service worker)"
+        if [ "$(state_get gateway_running 1)" = 1 ]; then
+          printf '%s\n' true
+        else
+          printf '%s\n' false
+        fi
+        ;;
       *'.State.Health'*)
         target="${*: -1}"
-        if [ "$target" = gateway-worker-fixture ]; then
+        if [ "$target" = "$(state_get gateway_compose_id cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc)" ]; then
           state_get worker_health healthy
         else
           state_get container_health healthy
@@ -351,7 +447,7 @@ case "${1:-}" in
         ;;
       *)
         target="${*: -1}"
-        if [ "$target" = gateway-worker-fixture ]; then
+        if [ "$target" = "$(state_get gateway_compose_id cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc)" ]; then
           print_gateway_worker_inspect
         else
           print_container_inspect
@@ -509,8 +605,7 @@ case "$command_name" in
         printf '"'
       fi
       printf '},"volumes":[{"type":"bind","source":"%s",' "$gateway_source"
-      printf '"target":"%s","read_only":%s}]}}}\n' \
-        "$gateway_target" "$gateway_read_only"
+      printf '"target":"%s","read_only":%s}],"restart":"no"}}}\n' "$gateway_target" "$gateway_read_only"
     elif [ "$compose_kind" = gateway ] && printf '%s\n' "$@" | grep -qx -- '--services'; then
       printf '%s\n' worker
     fi
@@ -519,23 +614,25 @@ case "$command_name" in
     record "$compose_kind compose ps"
     service="${*: -1}"
     if [ "$compose_kind" = gateway ]; then
+      gateway_compose_id="$(state_get gateway_compose_id cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc)"
       [ "$service" = worker ] || exit 65
       if [ "$(state_get gateway_ps_error 0)" = 1 ]; then record 'gateway compose ps error'; exit 70; fi
-      if [ "$(state_get gateway_running 1)" = 1 ]; then
-        printf '%s\n' gateway-worker-fixture
+      if { [[ " $* " == *" --all "* ]] && [ "$(state_get gateway_exists 1)" = 1 ]; } || [ "$(state_get gateway_running 1)" = 1 ]; then
+        printf '%s\n' "$gateway_compose_id"
       fi
     else
+      agent_compose_id="$(state_get agent_compose_id aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa)"
       [ "$service" = agent-wechat ] || exit 65
       if [ "$(state_get agent_ps_error 0)" = 1 ]; then record 'agent compose ps error'; exit 70; fi
       case " $* " in
         *' --all '*)
           if [ "$(state_get agent_exists 1)" = 1 ]; then
-            printf '%s\n' agent-container-fixture
+            printf '%s\n' "$agent_compose_id"
           fi
           ;;
         *)
           if [ "$(state_get agent_running 1)" = 1 ]; then
-            printf '%s\n' agent-container-fixture
+            printf '%s\n' "$agent_compose_id"
           fi
           ;;
       esac
@@ -549,7 +646,7 @@ case "$command_name" in
           state_get gateway_cleanup_stop_failures 0
         )"
         if [ "$remaining_failures" -gt 0 ]; then
-          state_set gateway_cleanup_stop_failures +            "$((remaining_failures - 1))"
+          state_set gateway_cleanup_stop_failures "$((remaining_failures - 1))"
           mutate 'gateway worker stop failed'
           exit 76
         fi
@@ -577,22 +674,47 @@ case "$command_name" in
     state_set agent_exists 0
     state_set agent_running 0
     ;;
+  create)
+    [ "$compose_kind" = gateway ] || exit 65
+    [ "${*: -1}" = worker ] || exit 65
+    case " $* " in
+      *' --force-recreate '*' --no-deps '*) ;;
+      *) record 'gateway candidate create flags invalid'; exit 65 ;;
+    esac
+    record 'gateway worker create stopped'
+    state_set gateway_exists 1
+    state_set gateway_running 0
+    ;;
+  start)
+    [ "$compose_kind" = gateway ] || exit 65
+    [ "${*: -1}" = worker ] || exit 65
+    gateway_compose_id="$(state_get gateway_compose_id cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc)"
+    if [ "$(state_get gateway_exists 0)" != 1 ] || [ "$(state_get gateway_gate_state inactive)" != released ] || [ "$(state_get gateway_gate_worker_id missing)" != "$gateway_compose_id" ]; then
+      record 'gateway worker pre-release denied'
+      exit 77
+    fi
+    if [ "$(state_get gateway_start_error 0)" = 1 ]; then
+      record 'gateway worker start failed'
+      exit 75
+    fi
+    mutate 'gateway worker start'
+    state_set gateway_running 1
+    state_set gateway_started_once 1
+    ;;
   up)
     if [ "$compose_kind" = gateway ]; then
-      [ "${*: -1}" = worker ] || exit 65
-      if [ "$(state_get gateway_start_error 0)" = 1 ]; then record 'gateway worker start failed'; exit 75; fi
-      mutate 'gateway worker start'
-      state_set gateway_running 1
-      state_set gateway_started_once 1
+      record 'forbidden gateway compose up'
+      exit 66
     else
       [ "${*: -1}" = agent-wechat ] || exit 65
-      mutate 'agent container start'
+      case " $* " in
+        *' --no-start '*' --force-recreate '*' --no-deps '*) ;;
+        *) record 'agent candidate create flags invalid'; exit 65 ;;
+      esac
+      mutate 'agent container create stopped'
       state_set agent_exists 1
-      state_set agent_running 1
-      state_set agent_started_once 1
-      state_set wechat_calls 0
-      printf '%s\n' logged_out > "${MOCK_AUTH_STATE_FILE:?}"
-      printf '%s\n' 'agent runtime evidence' > "$MOCK_APPROVED_RUNTIME_ROOT/data/agent-runtime.log"
+      state_set agent_running 0
+      state_set agent_started_once 0
     fi
     ;;
   down)

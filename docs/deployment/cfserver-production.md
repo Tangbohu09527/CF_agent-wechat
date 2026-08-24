@@ -65,6 +65,12 @@ Hermes 数据。Gateway 和 Hermes 上下文仍由各自数据库持久化。
 启动到人工执行脚本之前 worker 已停止。Gateway restart/boot stop gate 是 CFserver
 实机验收前置条件，不得写成由本仓库代码保证。
 
+脚本取得控制后会在 Archive、Agent start、QR、运行态验证和最终 release 边界重复证明
+Worker stopped，并在 QR 等待期间检测、停止任何外部启动后失败退出。该消费者侧撤销
+仍不是原子排他；Gateway compatible producer 必须提供绑定当前 fresh runtime generation
+的 deny-by-default release gate，确保 direct Compose、supervisor 和 stale release 都
+不能绕过扫码后的完整验证。
+
 ## 生产目录
 
 代码目录：
@@ -291,7 +297,8 @@ cd /opt/cf-agent-wechat
    停止，不移动 Archive、不显示 QR。
 7. 验证固定 `/usr/bin/python3`、仓库 Hash lock 与 passwd home 下 QR venv；正确环境
    快速复用，不匹配则在 hard timeout 内事务式重建。失败时不变更 Agent/Archive，
-   Worker 保持停止。
+   Worker 保持停止。helper 快照所有现存路径祖先的 device/inode/owner/group/mode/type，
+   并在 venv、pip、验证、stamp、cleanup 与 rollback 前后重验；漂移后停止路径操作。
 8. 把 Token 读入仅当前进程内存；Token 不进入 argv、
    environment、inspect、Compose config、日志或错误。
 9. 停止并删除旧 `agent-wechat` 容器，不执行 Compose `down`；原子归档当前 Runtime，
@@ -395,6 +402,12 @@ forced production 只接受能够在渲染前检查 Token 的文本 QR payload�
 Archive 是完整旧 Runtime，可能包含 WeChat session、账号/聊天标识、消息元数据和内容，
 整体为 `restricted` 敏感资产。不得自动上传、分享、加入 CI artifact 或挂回生产；
 独立 Agent API Token 被严格禁止进入 payload。
+
+隔离扫描以 no-follow/no-cross-filesystem 方式检查普通文件内容和目录项名称的原始字节，
+拒绝任何 xattr/POSIX ACL、额外 hardlink 和特殊文件；失败发生在二维码之前且不输出
+路径内容或 Token。`docker/.env` 的 entry 上限不得超过 200,000；扫描器的编译上限同为
+200,000 entry，attestation 累计编码相对路径另有 64 MiB 硬上限。扫描通过不表示
+Archive 已去标识化，也不替代“容器已停止、部署 principal 受信”的写入者边界。
 
 Manifest schema v2 使用 `manifestData` 表示 manifest 自身不含实际 Token/账号/Chat ID/
 消息正文；`archivePayloadClassification` 则明确 payload 可能包含这些 WeChat 数据，

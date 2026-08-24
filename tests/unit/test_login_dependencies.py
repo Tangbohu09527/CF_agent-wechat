@@ -78,7 +78,13 @@ class LoginDependencyContractTests(unittest.TestCase):
             "pip setuptools wheel",
             "validate-runtime",
             'bounded_clean_python "$python_bin" -I -B "$verifier"',
-            'verify-installed "$requirements_file" "$venv_dir"',
+            "capture_requirements_snapshot",
+            "readonly requirements_snapshot_base64 requirements_source_identity",
+            "validate_requirements_snapshot",
+            "require_unchanged_requirements_source",
+            'verify-installed <(emit_requirements_snapshot) "$venv_dir"',
+            "--requirement <(emit_requirements_snapshot)",
+            'post_install_lock_sha="$(validate_requirements_snapshot)"',
             'audit-tree "$candidate"',
             '--retries "$retries"',
             '--timeout "$network_timeout"',
@@ -86,6 +92,8 @@ class LoginDependencyContractTests(unittest.TestCase):
             with self.subTest(fragment=fragment):
                 self.assertIn(fragment, helper)
         self.assertNotIn("--proxy", helper)
+        self.assertNotIn('--requirement "$requirements_file"', helper)
+        self.assertNotIn('verify-installed "$requirements_file"', helper)
 
         runtime_gate = helper.index("validate-runtime")
         parent_creation = helper.index(
@@ -106,7 +114,9 @@ class LoginDependencyContractTests(unittest.TestCase):
 
         common = (REPO_ROOT / "scripts" / "common.sh").read_text(encoding="utf-8")
         self.assertIn('PYTHONDONTWRITEBYTECODE=1 PYTHONNOUSERSITE=1', common)
-        self.assertIn('"$LOGIN_PYTHON" -I -B "$@"', common)
+        self.assertIn("LOGIN_PYTHON_COMMAND=(", common)
+        self.assertIn('"$LOGIN_PYTHON" -I -B', common)
+        self.assertIn('"${LOGIN_PYTHON_COMMAND[@]}" "$@"', common)
         self.assertIn('"$CF_AGENT_WECHAT_TESTING")', common)
 
 

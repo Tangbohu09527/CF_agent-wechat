@@ -17,13 +17,26 @@ AUDIT_LOG=""
 AUDIT_PATH=""
 REAL_DOCKER=""
 REAL_SUDO=""
+TEST_STAGE="fixture setup"
 
 fail() {
-  printf 'FAIL: %s\n' "$*" >&2
+  printf 'FAIL [%s, line %s]: %s\n' \
+    "$TEST_STAGE" "${BASH_LINENO[0]:-unknown}" "$*" >&2
   exit 1
 }
 
+report_unexpected_error() {
+  local exit_status="$1"
+  local line_number="$2"
+
+  trap - ERR
+  printf 'FAIL [%s, line %s]: unexpected command failure (exit %s)\n' \
+    "$TEST_STAGE" "$line_number" "$exit_status" >&2
+  exit "$exit_status"
+}
+
 cleanup() {
+  trap - ERR
   set +e
   if [ -n "$LOGIN_PID" ]; then
     kill "$LOGIN_PID" 2>/dev/null
@@ -49,6 +62,7 @@ cleanup() {
   fi
 }
 trap cleanup EXIT
+trap 'report_unexpected_error "$?" "$LINENO"' ERR
 
 if [ "${GITHUB_ACTIONS:-}" != "true" ] || \
   [ "${CF_AGENT_WECHAT_PERMISSION_TEST:-}" != "1" ]; then
@@ -202,9 +216,11 @@ chown root:root "$DOCKER_SOCKET"
 chmod 600 "$DOCKER_SOCKET"
 
 install -d -o root -g root -m 755 "$GATEWAY_DEPLOY_DIR"
-install -d -o root -g root -m 755 "$MOCK_DOCKER_STATE_DIR"
+install -d -o "$TEST_USER" -g "$TEST_USER" -m 700 "$MOCK_DOCKER_STATE_DIR"
 : > "$MOCK_DOCKER_LOG"
 : > "$MOCK_DOCKER_MUTATION_LOG"
+chown "$TEST_USER:$TEST_USER" "$MOCK_DOCKER_LOG" "$MOCK_DOCKER_MUTATION_LOG"
+chmod 600 "$MOCK_DOCKER_LOG" "$MOCK_DOCKER_MUTATION_LOG"
 printf '%s\n' 'services:' '  agent-wechat: {}' > "$AGENT_COMPOSE_FILE"
 printf '%s\n' \
   'COMPOSE_PROJECT_NAME=cf-agent-wechat' \
@@ -228,6 +244,10 @@ printf '%s\n' \
   'RUST_LOG=info' > "$AGENT_ENV_FILE"
 printf '%s\n' 'services:' '  worker: {}' > "$GATEWAY_COMPOSE_FILE"
 chmod 600 "$AGENT_COMPOSE_FILE" "$GATEWAY_COMPOSE_FILE"
+install -o "$TEST_USER" -g "$TEST_USER" -m 600 \
+  "$AGENT_COMPOSE_FILE" "${MOCK_DOCKER_STATE_DIR}/approved-agent-compose"
+install -o "$TEST_USER" -g "$TEST_USER" -m 600 \
+  "$GATEWAY_COMPOSE_FILE" "${MOCK_DOCKER_STATE_DIR}/approved-gateway-compose"
 printf '%s\n' \
   'CF_AGENT_WECHAT_TOKEN_FILE=/run/secrets/cf-agent-wechat-auth-token' \
   "FIXTURE_SENTINEL=$GATEWAY_ENV_SENTINEL" > "$GATEWAY_ENV_FILE"
@@ -308,6 +328,12 @@ printf '%s\n' 1 > "${MOCK_DOCKER_STATE_DIR}/agent_exists"
 printf '%s\n' 1 > "${MOCK_DOCKER_STATE_DIR}/agent_running"
 printf '%s\n' 1 > "${MOCK_DOCKER_STATE_DIR}/gateway_running"
 printf 'logged_in\n' > "$STATE_FILE"
+chown "$TEST_USER:$TEST_USER" "$STATE_FILE"
+chown "$TEST_USER:$TEST_USER" \
+  "${MOCK_DOCKER_STATE_DIR}/agent_exists" \
+  "${MOCK_DOCKER_STATE_DIR}/agent_running" \
+  "${MOCK_DOCKER_STATE_DIR}/gateway_running"
+chmod 600 "${MOCK_DOCKER_STATE_DIR}/"{agent_exists,agent_running,gateway_running}
 reset_audit() {
   if [ -s "$AUDIT_LOG" ] &&
     grep -Fq -- "$AGENT_ENV_SENTINEL" "$AUDIT_LOG"; then
@@ -583,6 +609,7 @@ exec "./scripts/$2"
     cf-agent-wechat-test "$TEST_REPO" "$script_name"
 }
 
+TEST_STAGE="root-only secret and isolated Docker socket"
 assert_secret_permissions
 [ "$(CF_AGENT_WECHAT_TESTING=1 /bin/bash -c \
   'source "$1"; printf "%s" "$CONTAINER_NAME"' \
@@ -594,6 +621,7 @@ fi
 [ -S "$DOCKER_SOCKET" ] || fail "isolated Docker socket fixture is missing"
 printf 'PASS isolated fake Docker socket is root protected\n'
 
+TEST_STAGE="real Docker socket sudo fallback"
 REAL_DOCKER_FALLBACK_OUTPUT="${TEST_ROOT}/real-docker-fallback.out"
 if "$REAL_SUDO" -u "$TEST_USER" -H /usr/bin/docker info \
   >/dev/null 2>&1; then
@@ -618,6 +646,7 @@ grep -Eq '"[^"]+"' "$REAL_DOCKER_FALLBACK_OUTPUT" ||
 assert_file_has_no_token "$REAL_DOCKER_FALLBACK_OUTPUT"
 printf 'PASS production fixed Docker uses real sudo socket fallback in disposable CI\n'
 
+TEST_STAGE="runtime management lock permissions"
 AUDIT_COMMANDS="$("$REAL_SUDO" -u "$TEST_USER" -H env PATH="$AUDIT_PATH" \
   /bin/bash -c 'command -v docker; command -v sudo')"
 EXPECTED_AUDIT_COMMANDS="$(printf '%s\n%s' "${AUDIT_BIN}/docker" "${AUDIT_BIN}/sudo")"
@@ -658,6 +687,7 @@ fi
 assert_file_has_no_token "$NON_MANAGEMENT_LOCK_OUTPUT"
 printf 'PASS protected runtime lock ownership, mode, and lifecycle\n'
 
+TEST_STAGE="approved Runtime ownership contract"
 ROOT_OWNED_RUNTIME="${TEST_ROOT}/root-owned-runtime"
 install -d -o root -g root -m 700 \
   "$ROOT_OWNED_RUNTIME" \
@@ -690,6 +720,7 @@ assert_file_has_no_token "$ROOT_OWNED_RUNTIME_OUTPUT"
 rm -rf -- "$ROOT_OWNED_RUNTIME"
 printf 'PASS root:root 0700 Runtime rejected by approved 1000:1000/0700 contract\n'
 
+TEST_STAGE="ordinary-user direct Docker status"
 reset_audit
 DETECT_OUTPUT="$("$REAL_SUDO" -u "$TEST_USER" -H env \
   CF_AGENT_WECHAT_TESTING=1 \
@@ -710,6 +741,7 @@ DETECT_OUTPUT="$("$REAL_SUDO" -u "$TEST_USER" -H env \
 assert_no_sudo_calls "direct testing Docker status"
 printf 'PASS testing Docker status runs directly without sudo\n'
 
+TEST_STAGE="canonical WeChat process identity"
 reset_audit
 COMMON_IDENTITY_OUTPUT="${TEST_ROOT}/common-identity.out"
 if ! "$REAL_SUDO" -u "$TEST_USER" -H env \
@@ -739,6 +771,7 @@ assert_no_sudo_python "common WeChat identity Docker fallback"
 assert_file_has_no_token "$COMMON_IDENTITY_OUTPUT"
 printf 'PASS canonical WeChat identity with direct testing Docker\n'
 
+TEST_STAGE="non-permission Docker error handling"
 reset_audit
 if NONPERMISSION_OUTPUT="$("$REAL_SUDO" -u "$TEST_USER" -H env \
   CF_AGENT_WECHAT_TESTING=1 \
@@ -763,6 +796,7 @@ assert_file_has_no_token "$NONPERMISSION_FILE"
 assert_no_sudo_python "non-permission Docker error"
 printf 'PASS non-permission Docker error does not use sudo\n'
 
+TEST_STAGE="runtime Docker mock privilege boundary"
 reset_audit
 assert_runtime_mock_runs_directly info info
 assert_runtime_mock_runs_directly compose \
@@ -773,6 +807,7 @@ assert_runtime_mock_runs_directly exec exec "$TEST_CONTAINER" true
 assert_runtime_mock_runs_directly inspect inspect "$TEST_CONTAINER"
 printf 'PASS runtime Docker mock rejects every sudo execution path\n'
 
+TEST_STAGE="failed-agent cleanup privilege boundary"
 reset_audit
 CLEANUP_ERROR="${TEST_ROOT}/cleanup.err"
 if ! CLEANUP_OUTPUT="$("$REAL_SUDO" -u "$TEST_USER" -H env \
@@ -835,6 +870,7 @@ assert_file_has_no_token "$MOCK_DOCKER_LOG"
 assert_file_has_no_token "$MOCK_DOCKER_MUTATION_LOG"
 printf 'PASS failed-agent cleanup with direct testing Docker and protected config sudo\n'
 
+TEST_STAGE="ordinary-user root-only Token status"
 printf '%s\n' 1 > "${MOCK_DOCKER_STATE_DIR}/agent_exists"
 printf '%s\n' 1 > "${MOCK_DOCKER_STATE_DIR}/agent_running"
 reset_audit
@@ -877,6 +913,7 @@ assert_file_has_no_token "$MOCK_DOCKER_LOG"
 assert_file_has_no_token "$MOCK_DOCKER_MUTATION_LOG"
 printf 'PASS root-only token with ordinary-user status.sh\n'
 
+TEST_STAGE="shell trace and curl credential redaction"
 printf '%s\n' '--verbose' > "${TEST_HOME}/.curlrc"
 chown "$TEST_USER:$TEST_USER" "${TEST_HOME}/.curlrc"
 TRACE_OUTPUT="${TEST_ROOT}/trace.out"
@@ -919,6 +956,7 @@ if grep -q 'Authorization: Bearer' "$TRACE_OUTPUT"; then
 fi
 printf 'PASS shell trace and curlrc token protection\n'
 
+TEST_STAGE="forced fresh QR compatibility entrypoint"
 : > "$LOG_FILE"
 reset_audit
 LOGIN_SHORT_OUTPUT="${TEST_ROOT}/login-short.out"
@@ -937,6 +975,7 @@ assert_file_has_no_token "$LOGIN_SHORT_OUTPUT"
 assert_secret_permissions
 printf 'PASS existing logged_in state cannot bypass the fresh QR entrypoint\n'
 
+TEST_STAGE="root-only Token process isolation"
 reset_audit
 TOKEN_PROCESS_OUTPUT="${TEST_ROOT}/token-process.out"
 TOKEN_PROCESS_READY="${TEST_HOME}/token-process.ready"
@@ -978,6 +1017,7 @@ assert_no_sudo_python "ordinary-user Token load"
 assert_file_has_no_token "$TOKEN_PROCESS_OUTPUT"
 printf 'PASS sudo -v then sudo -n root-only Token load without process leakage\n'
 
+TEST_STAGE="root-only Token ancestor validation"
 TOKEN_ANCESTOR_LINK="${TEST_ROOT}/token-ancestor-link"
 ln -s -- "$SECRETS_DIR" "$TOKEN_ANCESTOR_LINK"
 reset_audit
@@ -1009,6 +1049,7 @@ assert_file_has_no_token "$AUDIT_LOG"
 rm -f -- "$TOKEN_ANCESTOR_LINK"
 printf 'PASS root-only Token rejects symbolic-link ancestors after sudo authorization\n'
 
+TEST_STAGE="testing helper root rejection"
 reset_audit
 ROOT_TOKEN_OUTPUT="${TEST_ROOT}/root-token.out"
 if env CF_AGENT_WECHAT_TESTING=1 \
@@ -1027,6 +1068,7 @@ assert_no_sudo_calls "root Token load"
 assert_file_has_no_token "$ROOT_TOKEN_OUTPUT"
 printf 'PASS testing helpers reject root execution before reading Token data\n'
 
+TEST_STAGE="ordinary-user Python environment"
 reset_audit
 "$REAL_SUDO" -u "$TEST_USER" -H env \
   CF_AGENT_WECHAT_TESTING=1 \
@@ -1052,6 +1094,7 @@ assert_tmp_has_no_token
 assert_secret_permissions
 printf 'PASS ordinary-user venv and writable locations contain no Token\n'
 
+TEST_STAGE="missing root-only Token distinction"
 reset_audit
 mv "$TOKEN_FILE" "${TOKEN_FILE}.saved"
 MISSING_OUTPUT="${TEST_ROOT}/missing.out"
@@ -1082,6 +1125,7 @@ assert_file_has_no_token "$MISSING_OUTPUT"
 assert_secret_permissions
 printf 'PASS missing root-only token distinction\n'
 
+TEST_STAGE="ordinary user without sudo"
 NO_SUDO_OUTPUT="${TEST_ROOT}/no-sudo.out"
 if timeout 15s sudo -u "$NO_SUDO_USER" -H env \
   CF_AGENT_WECHAT_TESTING=1 \
@@ -1116,6 +1160,7 @@ assert_file_has_no_token "$LOG_FILE"
 assert_secret_permissions
 printf 'PASS explicit no-sudo permission error\n'
 
+TEST_STAGE="root-only management file loading"
 reset_audit
 ROOT_CONFIG_OUTPUT="${TEST_ROOT}/root-config.out"
 ROOT_CONFIG_ERROR="${TEST_ROOT}/root-config.error"

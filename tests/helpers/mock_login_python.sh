@@ -86,6 +86,8 @@ case " $* " in
     else
       printf '%s\n' 'QR login new-account=false' >> "${MOCK_LOGIN_LOG:?}"
     fi
+    printf '%s\n' '请使用手机微信扫描二维码：'
+    printf '%s\n' '[fixture QR rendered in terminal]'
     if [ "${MOCK_LOGIN_MODE:-success}" = "block" ]; then
       : > "${MOCK_LOGIN_PAUSE_FILE:?}"
       while [ ! -e "${MOCK_LOGIN_CONTINUE_FILE:?}" ]; do
@@ -96,8 +98,6 @@ case " $* " in
       printf '%s\n' 'fixture login failed' >&2
       exit 1
     fi
-    printf '%s\n' '请使用手机微信扫描二维码：'
-    printf '%s\n' '[fixture QR rendered in terminal]'
     printf '%s\n' '登录成功。'
     printf '%s\n' 'logged_in' > "${MOCK_AUTH_STATE_FILE:?}"
     if [ -n "${MOCK_WECHAT_AFTER_LOGIN:-}" ]; then

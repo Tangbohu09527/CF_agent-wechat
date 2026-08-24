@@ -32,10 +32,12 @@ payload。若旧 runtime 已存在该名字，移动前的有界扫描必须在�
 fail closed；工具不得覆盖旧 payload，也不得把旧文件误当作 schema v2 manifest。
 
 归档移动执行完整 no-follow/no-cross-filesystem 树扫描，记录每个 entry 的
-device/inode/type/link-count/owner/mode/size/ctime；rename 前重验精确 entry 集合与身份，
-并验证受保护 parent、同一文件系统和目标不存在。移动只使用 dirfd-relative rename，
-随后对目标重做身份复核。任一竞态或复核失败都 fail closed 并尝试原路回滚，不退化为
-复制、跟随 symlink 或覆盖目标；该控制不能替代 trusted deployment principal 边界。
+device/inode/type/link-count/owner/mode/size/ctime；普通文件内容和每个目录项名称的原始
+文件系统字节都检查当前独立 Agent Token，任何 xattr（包括 POSIX ACL）一律拒绝。
+rename 前重验精确 entry 集合与身份，并验证受保护 parent、同一文件系统和目标不存在。
+移动只使用 dirfd-relative rename，随后对目标重做身份复核。任一竞态、metadata 或复核
+失败都 fail closed 并尝试原路回滚，不退化为复制、跟随 symlink 或覆盖目标；该控制
+不能替代 trusted deployment principal 边界，也不表示 payload 已去标识化。
 
 归档使用两阶段发布事务。工具先创建 root-protected
 `.incomplete-<UTC-name>-<pid>` staging，将旧 payload 移入后 fsync 来源与目标 parent，

@@ -41,6 +41,7 @@ for _management_env_name in \
     CF_AGENT_WECHAT_TEST_ROOT \
     CF_AGENT_WECHAT_TEST_GATEWAY_VERIFIER_REPLACEMENT \
     CF_AGENT_WECHAT_TEST_GATEWAY_CHECKER_REPLACEMENT \
+    CF_AGENT_WECHAT_TEST_GATEWAY_GATE_REPLACEMENT \
     CF_AGENT_WECHAT_TOKEN CF_AGENT_WECHAT_TOKEN_FILE AUTH_TOKEN \
     CF_AGENT_WECHAT_TEST_PIP_INSTALL_TIMEOUT \
     CF_AGENT_WECHAT_TEST_PIP_NETWORK_TIMEOUT \
@@ -62,7 +63,7 @@ for _management_env_name in \
     if [ "${CF_AGENT_WECHAT_TESTING:-0}" != "1" ]; then
       unset "$_management_env_name"
     else
-      export -n "$_management_env_name" 2>/dev/null || :
+      export -n "${_management_env_name?}" 2>/dev/null || :
       case "$_management_env_name" in
         AUTH_TOKEN|CF_AGENT_WECHAT_TOKEN|PROXY|HTTP_PROXY|HTTPS_PROXY|ALL_PROXY|http_proxy|https_proxy|all_proxy|NO_PROXY|no_proxy)
           unset "$_management_env_name"

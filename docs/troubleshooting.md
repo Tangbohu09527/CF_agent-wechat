@@ -208,9 +208,10 @@ ensurepip 缺失或 timeout 都在 Agent 容器、Archive 和 QR 变更前失败
 ## Runtime 树扫描失败
 
 扫描器不跟随 symlink、不跨文件系统，拒绝额外 hardlink、FIFO、socket、device 等特殊
-文件，并限制普通文件数、总字节和总时间。symlink loop、树外链接、大文件/大树超限、
-扫描错误或 Token 命中均 fail closed，错误不输出文件内容或 Token。保留现场并在受限
-终端修复异常节点；不要改用递归 `grep -R`，也不要放宽为跟随链接。
+文件以及任何 xattr/POSIX ACL；文件内容和每个目录项名称的原始字节都会检查当前 Token，
+并限制普通文件数、总字节和总时间。symlink loop、树外链接、大文件/大树超限、扫描错误
+或 Token 命中均 fail closed，错误不输出文件名、文件内容或 Token。保留现场并在受限
+终端修复异常节点；不要改用递归 `grep -R`，也不要放宽为跟随链接或保留 xattr。
 
 ## 启动策略或实际容器 attestation 失败
 

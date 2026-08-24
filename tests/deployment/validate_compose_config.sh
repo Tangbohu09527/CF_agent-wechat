@@ -146,4 +146,4 @@ assert str(logging.get("options", {}).get("max-size")) == "20m", logging
 assert str(logging.get("options", {}).get("max-file")) == "3", logging
 PY
 
-printf '%s\n' 'PASS: real production Compose render enforces forced fresh QR contracts'
+printf '%s\n' 'PASS: real production Compose render satisfies the production runtime contract'

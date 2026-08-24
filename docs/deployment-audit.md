@@ -45,9 +45,9 @@ merge、rebase 或 cherry-pick。
 | Compose | clean environment；批准 image/project/container/port/mount/alias/env 与 `restart=no` 精确 attestation | 静态合同、真实 render、fake Docker inspect |
 | Restart | crash/daemon/host 均不恢复 | Alpine/Nginx policy fixture 只覆盖 Docker policy；实际 Agent、QR 和 Host 待实机 |
 | Runtime 权限 | 现有/legacy 与新 Runtime 精确匹配批准非 root UID/GID/mode，不继承漂移 | permissions 与 lifecycle |
-| Runtime 树 | no-follow、no-cross-filesystem；拒绝 link/特殊文件，限制文件数/字节/时间；Token 不命中 | scanner unit/integration |
+| Runtime 树 | no-follow、no-cross-filesystem；拒绝 link/特殊文件/xattr/ACL；200,000 entry 与 64 MiB 编码路径硬上限；Token 不命中 | scanner unit/integration，含真实 `setfacl` fixture |
 | Archive | 固定生产 storage/runtime/archive/Token 路径；原子归档；schema v2 restricted 分类；有 hard timeout 的 bytes/percent/inode、inventory、默认 dry-run retention | archive unit/lifecycle |
-| 依赖 | GIL-enabled CPython 3.10-3.14、stamp schema v3、Pillow 12.3.0、Hash-locked binary-only requirements、clean pip、hard timeout；仅结构安全的漂移事务重建 | dependency integrity；Linux CI 不替代 CFserver |
+| 依赖 | GIL-enabled CPython 3.10-3.14、stamp schema v3、Pillow 12.3.0、Hash-locked binary-only requirements、clean pip、hard timeout；祖先 identity 快照；仅结构安全的漂移事务重建 | dependency integrity；Linux CI 不替代 CFserver |
 | Proxy | 仅无凭证 `scheme://host:port`，无 userinfo/path/query/fragment/control | environment/Compose tests |
 | 管理锁 | 批准 owner/management GID、`0640`、单 hardlink、非 symlink；非管理用户不可持锁 | permissions/concurrency |
 | QR | 当前 TTY 显示可审计文本 fresh QR 后才接受成功；拒绝 PNG-only | QR unit/integration；真机待验证 |
@@ -79,6 +79,12 @@ rootful/default endpoint、`live-restore=false`、Agent auto-start unit 和 Comp
 实际容器还必须精确满足批准 image/RestartPolicy/mount/port/alias。Docker、Compose 和
 API 调用均受 hard timeout。forced production 只接受渲染前可检查 Token 的文本 QR；
 PNG-only `qrDataUrl` 在输出前 fail closed。
+
+systemd 证据只覆盖已枚举的 enabled/linked/active unit、timer/path/socket 的直接目标和
+target 的一跳 `Wants`/`Requires`，不递归证明任意深度依赖，也不覆盖 cron、Swarm、
+Kubernetes、外部配置管理或人工 Docker 操作。Runtime scanner 的最后重验同样依赖
+stopped writer 和 trusted deployment principal。这些边界均保留为 CFserver 人工审计，
+CI 不能宣称已经穷尽。
 
 ## Gateway 边界
 
@@ -121,7 +127,9 @@ Gateway boot stop gate、Worker healthy/heartbeat 和真实重启窗口必须在
 
 Token、二维码、微信账号、联系人、聊天 ID、消息正文、服务器地址、API Key 和密码不得
 进入 Git、manifest、日志、错误、CI 输出或 artifact。Token 还不得进入 argv、process
-environment、Docker inspect、Compose config、Runtime 或 Archive。
+environment、Docker inspect、Compose config、Runtime 或 Archive。Runtime 扫描检查文件
+内容和目录项名称的原始字节，并拒绝所有 xattr/POSIX ACL；它证明当前独立 Agent Token
+未按这些形式进入 Archive，但不把完整微信 payload 宣称为已去标识化。
 
 Archive payload 可能包含完整旧 session、账号/聊天标识、消息元数据和内容，整体为
 `restricted`。Manifest schema v2 的 `manifestData` 只描述 manifest 自身不含实际值；

@@ -152,7 +152,10 @@ def _decode_input(data: bytes) -> str:
 def _positive_decimal(key: str, value: str, *, maximum: int) -> None:
     if re.fullmatch(r"[1-9][0-9]*", value, re.ASCII) is None:
         raise ManagementEnvError(f"{key} must be a positive decimal integer")
-    if int(value) > maximum:
+    maximum_text = str(maximum)
+    if len(value) > len(maximum_text) or (
+        len(value) == len(maximum_text) and value > maximum_text
+    ):
         raise ManagementEnvError(f"{key} exceeds its approved numeric range")
 
 
@@ -242,7 +245,9 @@ def _validate_value(key: str, value: str) -> None:
                 "CF_AGENT_WECHAT_RUNTIME_MODE must be exactly 700"
             )
     elif key == "CF_AGENT_WECHAT_MIN_FREE_PERCENT":
-        if re.fullmatch(r"[0-9]+", value, re.ASCII) is None or int(value) > 100:
+        if re.fullmatch(r"(?:0|[1-9][0-9]*)", value, re.ASCII) is None or (
+            len(value) > 3 or (len(value) == 3 and value > "100")
+        ):
             raise ManagementEnvError(
                 "CF_AGENT_WECHAT_MIN_FREE_PERCENT must be between 0 and 100"
             )

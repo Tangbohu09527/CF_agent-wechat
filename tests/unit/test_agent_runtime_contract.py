@@ -154,6 +154,23 @@ class AgentRuntimeContractTests(unittest.TestCase):
             status.index("runtime_attest_actual_agent_container"),
         )
 
+    def test_standalone_status_never_downgrades_the_bound_checker(self) -> None:
+        status = STATUS_SCRIPT.read_text(encoding="utf-8")
+        self.assertIn(
+            '"$GATEWAY_RELEASE_GATE_COMMAND" "Gateway runtime release gate"',
+            status,
+        )
+        self.assertIn(
+            'worker_heartbeat="unavailable_without_release_binding"',
+            status,
+        )
+        self.assertNotIn("gateway_worker_heartbeat_is_healthy", status)
+        self.assertIn(
+            "heartbeat is unavailable without an exact released "
+            "runtime-generation binding",
+            status,
+        )
+
     def test_management_environment_load_follows_file_validation(self) -> None:
         for function_name in (
             "runtime_validate_configuration",
@@ -216,6 +233,231 @@ class AgentRuntimeContractTests(unittest.TestCase):
                 self.assertIn(path, validation)
                 self.assertIn(label, validation)
         self.assertIn("runtime_validate_approved_runtime_directory", validation)
+
+    def test_managed_directories_reject_acl_and_xattr_inheritance(self) -> None:
+        validator = function_body(
+            self.content,
+            "runtime_validate_directory_without_extended_attributes",
+        )
+        for fragment in (
+            "O_DIRECTORY",
+            "O_NOFOLLOW",
+            "O_CLOEXEC",
+            "os.listxattr(descriptor)",
+            "identity(after) != identity(opened)",
+            "identity(final) != identity(opened)",
+        ):
+            with self.subTest(fragment=fragment):
+                self.assertIn(fragment, validator)
+
+        validation = function_body(
+            self.content,
+            "runtime_validate_configuration",
+        )
+        for path, label in (
+            ("$STORAGE_ROOT", "Storage root"),
+            ("${STORAGE_ROOT}/secrets", "Secrets root"),
+            ("$runtime_parent", "Runtime parent"),
+            ("$archive_parent", "Archive parent"),
+        ):
+            with self.subTest(path=path):
+                self.assertIn(
+                    "runtime_validate_directory_without_extended_attributes "
+                    f'"{path}" "{label}"',
+                    validation,
+                )
+
+        archive = function_body(
+            self.content,
+            "runtime_validate_restricted_archive_root",
+        )
+        self.assertIn(
+            'runtime_validate_directory_without_extended_attributes '
+            '"$ARCHIVE_ROOT" "Archive root"',
+            archive,
+        )
+
+        bootstrap = BOOTSTRAP_SCRIPT.read_text(encoding="utf-8")
+        bootstrap_validator = function_body(
+            bootstrap,
+            "validate_directory_without_extended_attributes",
+        )
+        for fragment in (
+            "O_DIRECTORY",
+            "O_NOFOLLOW",
+            "O_CLOEXEC",
+            "os.listxattr(descriptor)",
+            "run_privileged_with_hard_timeout",
+        ):
+            self.assertIn(fragment, bootstrap_validator)
+        ensure = function_body(bootstrap, "ensure_root_directory")
+        runtime_directory = function_body(
+            bootstrap,
+            "validate_runtime_directory",
+        )
+        self.assertIn(
+            'validate_directory_without_extended_attributes "$label" "$path"',
+            ensure,
+        )
+        self.assertIn(
+            'validate_directory_without_extended_attributes "$label" "$path"',
+            runtime_directory,
+        )
+        management = function_body(bootstrap, "prepare_management_state")
+        for label in (
+            "runtime parent",
+            "archive parent",
+            "secrets parent",
+        ):
+            self.assertIn(label, management)
+        self.assertLess(
+            management.index("runtime parent"),
+            management.index("create_auth_token"),
+        )
+
+    def test_fresh_runtime_is_exact_empty_nofollow_tree(self) -> None:
+        start = START_SCRIPT.read_text(encoding="utf-8")
+        create = function_body(start, "create_fresh_runtime")
+        prepare = function_body(
+            start,
+            "prepare_agent_candidate_before_archive",
+        )
+        self.assertIn(
+            'runtime_validate_directory_without_extended_attributes '
+            '"$runtime_parent" "Runtime parent"',
+            create,
+        )
+        self.assertIn('runtime_path_exists "$RUNTIME_ROOT"', create)
+        self.assertLess(
+            create.index(
+                "runtime_validate_directory_without_extended_attributes"
+            ),
+            create.index("runtime_privileged install"),
+        )
+        self.assertGreater(
+            create.index("runtime_assert_fresh_runtime_tree"),
+            create.rindex("runtime_validate_approved_runtime_directory"),
+        )
+        self.assertLess(
+            prepare.index(
+                "runtime_validate_directory_without_extended_attributes"
+            ),
+            prepare.index("capture_runtime_metadata"),
+        )
+
+        archive_gate = function_body(
+            start,
+            "revalidate_archive_directory_contract",
+        )
+        for label in (
+            "Storage root",
+            "Secrets root",
+            "Runtime parent",
+            "Archive parent",
+        ):
+            self.assertIn(label, archive_gate)
+        archive = function_body(start, "archive_current_runtime")
+        self.assertGreaterEqual(
+            archive.count("revalidate_archive_directory_contract"),
+            4,
+        )
+        publish = function_body(start, "publish_archive_staging")
+        self.assertGreaterEqual(publish.count("os.listxattr"), 2)
+
+        scanner = SCAN_SCRIPT.read_text(encoding="utf-8")
+        self.assertIn("--require-empty-runtime-layout", scanner)
+        self.assertIn('expected_paths = {"data", "wechat-home"}', scanner)
+        protected_parent = scanner[
+            scanner.index("def open_protected_parent") :
+            scanner.index("def assert_destination_absent")
+        ]
+        self.assertIn(
+            "reject_extended_attributes(descriptor)",
+            protected_parent,
+        )
+
+    def test_management_numbers_are_bounded_before_arithmetic(self) -> None:
+        loader = function_body(
+            self.content, "runtime_load_management_environment"
+        )
+        capacity = function_body(
+            self.content, "runtime_check_archive_capacity"
+        )
+        percent = function_body(
+            self.content, "runtime_percent_required_units"
+        )
+        for fragment in (
+            'RUNTIME_INT64_MAX="9223372036854775807"',
+            'RUNTIME_UID_GID_MAX="4294967294"',
+            'RUNTIME_MAX_KIB_FOR_BYTE_CONVERSION="9007199254740991"',
+            'runtime_positive_decimal_is_at_most "$value" 65535',
+            '"$value" "$RUNTIME_UID_GID_MAX"',
+            'runtime_decimal_is_at_most "$value" 200000',
+            '"$value" "$RUNTIME_INT64_MAX"',
+            'runtime_decimal_is_at_most "$value" 100',
+        ):
+            with self.subTest(fragment=fragment):
+                self.assertIn(fragment, self.content)
+        self.assertNotIn("10#$value", loader)
+        self.assertNotIn('[ "$value" -gt', loader)
+        self.assertNotIn("available_blocks * 100", capacity)
+        self.assertLess(
+            capacity.index('"$RUNTIME_MAX_KIB_FOR_BYTE_CONVERSION"'),
+            capacity.index("available_blocks * 1024"),
+        )
+        self.assertIn(
+            'runtime_decimal_is_at_most "$available_blocks" "$total_blocks"',
+            capacity,
+        )
+        self.assertIn(
+            'runtime_decimal_is_at_most "$available_inodes" "$total_inodes"',
+            capacity,
+        )
+        self.assertIn("quotient * percent", percent)
+        self.assertIn("scaled_remainder / 100", percent)
+
+        bootstrap = BOOTSTRAP_SCRIPT.read_text(encoding="utf-8")
+        parser = function_body(bootstrap, "parse_agent_environment")
+        self.assertIn('MAX_SIGNED_INTEGER="9223372036854775807"', bootstrap)
+        self.assertIn('MAX_UID_GID="4294967294"', bootstrap)
+        self.assertIn('decimal_is_at_most "$ENV_PORT" 65535', parser)
+        self.assertIn(
+            'decimal_is_at_most "$ENV_RUNTIME_UID" "$MAX_UID_GID"',
+            parser,
+        )
+        self.assertIn(
+            'decimal_is_at_most "$ENV_RUNTIME_GID" "$MAX_UID_GID"',
+            parser,
+        )
+        self.assertIn(
+            'decimal_is_at_most "$ENV_MANAGEMENT_GID" "$MAX_UID_GID"',
+            parser,
+        )
+        self.assertIn(
+            'decimal_is_at_most "$ENV_MIN_FREE_PERCENT" 100', parser
+        )
+        self.assertIn(
+            'decimal_is_at_most "$ENV_TOKEN_SCAN_MAX_FILES" 200000', parser
+        )
+        self.assertNotIn("10#$ENV_TOKEN_SCAN_MAX_FILES", parser)
+        self.assertNotIn('[ "$ENV_MIN_FREE_PERCENT" -le', parser)
+
+    def test_archive_capacity_is_rechecked_at_commit_boundary(self) -> None:
+        start = START_SCRIPT.read_text(encoding="utf-8")
+        main = function_body(start, "main")
+        first_capacity = main.index("runtime_check_archive_capacity")
+        worker_guard = main.index(
+            'FLOW_PHASE="guard_worker_before_archive"', first_capacity
+        )
+        second_capacity = main.index(
+            "runtime_check_archive_capacity", first_capacity + 1
+        )
+        archive = main.index("archive_current_runtime", second_capacity)
+
+        self.assertEqual(main.count("runtime_check_archive_capacity"), 2)
+        self.assertLess(first_capacity, worker_guard)
+        self.assertLess(worker_guard, second_capacity)
+        self.assertLess(second_capacity, archive)
 
 
 class ManagementEnvironmentIsolationContractTests(unittest.TestCase):
@@ -369,6 +611,12 @@ class ManagementEnvironmentIsolationContractTests(unittest.TestCase):
         archive_capacity = function_body(
             self.runtime, "runtime_check_archive_capacity"
         )
+
+        self.assertIn(
+            'docker_bin="${DOCKER_BIN:-${CF_AGENT_WECHAT_DOCKER_BIN:-}}"',
+            readonly_docker,
+        )
+        self.assertIn('docker_bin="/usr/bin/docker"', readonly_docker)
 
         testing_stop = readonly_docker.index(
             'if [ "$CF_AGENT_WECHAT_TESTING" = "1" ]; then'

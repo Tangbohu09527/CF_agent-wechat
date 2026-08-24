@@ -14,7 +14,7 @@ else
     return 1
   fi
   case "$_runtime_scripts_dir_declaration" in
-    'declare -r '*|'declare -r -- '*) ;;
+    'declare -r '*) ;;
     *)
       printf '%s\n' 'Production management scripts directory is not immutable.' >&2
       return 1
@@ -38,13 +38,15 @@ GATEWAY_PROJECT_DIR="${CF_AGENT_GATEWAY_PROJECT_DIR:-/opt/cf-agent-gateway}"
 GATEWAY_COMPOSE_FILE="${CF_AGENT_GATEWAY_COMPOSE_FILE:-${GATEWAY_PROJECT_DIR}/docker-compose.prod.yml}"
 GATEWAY_ENV_FILE="${CF_AGENT_GATEWAY_ENV_FILE:-${GATEWAY_PROJECT_DIR}/.env}"
 GATEWAY_HEARTBEAT_COMMAND="${GATEWAY_PROJECT_DIR}/deploy/check-wechat-worker-heartbeat"
+GATEWAY_RELEASE_GATE_COMMAND="${GATEWAY_PROJECT_DIR}/deploy/wechat-runtime-release-gate"
 GATEWAY_CONTRACT_FILE="${GATEWAY_PROJECT_DIR}/deploy/wechat-runtime-contract.json"
 GATEWAY_PROJECT_NAME="cf-agent-gateway"
-GATEWAY_CONTRACT_VERSION="1"
 GATEWAY_HEARTBEAT_MAX_AGE="30"
+GATEWAY_RUNTIME_COMMAND_TIMEOUT="10"
 GATEWAY_PRODUCER_REPOSITORY="Tangbohu09527/CF_agent-gateway"
 GATEWAY_COMPATIBLE_COMMIT=""
 GATEWAY_CHECKER_SHA256=""
+GATEWAY_RELEASE_GATE_SHA256=""
 GATEWAY_CONTRACT_VERIFIER="${RUNTIME_SCRIPTS_DIR}/verify_gateway_contract.py"
 RUNTIME_TREE_SCANNER="${RUNTIME_SCRIPTS_DIR}/scan_runtime_tree.py"
 ARCHIVE_RUNTIME_TOOL="${RUNTIME_SCRIPTS_DIR}/archive-runtime.py"
@@ -185,6 +187,7 @@ IFS= read -r -d '' GATEWAY_CHECKER_SNAPSHOT_LOADER <<'PYTHON' || :
 import fcntl
 import hashlib
 import hmac
+import json
 import os
 import selectors
 import signal
@@ -227,10 +230,12 @@ try:
         expected_digest,
         approved_uid_raw,
         execution_timeout_raw,
+        executable_kind,
+        input_transport,
     ) = (
-        sys.argv[1:7]
+        sys.argv[1:9]
     )
-    script_arguments = sys.argv[7:]
+    script_arguments = sys.argv[9:]
     approved_uid = int(approved_uid_raw)
     execution_timeout = int(execution_timeout_raw)
     if (
@@ -239,6 +244,9 @@ try:
         or not os.path.isabs(working_directory)
         or approved_uid < 0
         or execution_timeout <= 0
+        or executable_kind not in {"checker", "gate"}
+        or input_transport not in {"none", "stdin-json"}
+        or (mode == "digest" and input_transport != "none")
         or not hasattr(os, "O_NOFOLLOW")
         or not hasattr(os, "memfd_create")
         or not hasattr(fcntl, "F_ADD_SEALS")
@@ -285,10 +293,11 @@ try:
         mode == "execute"
         and os.environ.get("CF_AGENT_WECHAT_TESTING") == "1"
     ):
-        replacement = os.environ.get(
-            "CF_AGENT_WECHAT_TEST_GATEWAY_CHECKER_REPLACEMENT",
-            "",
-        )
+        replacement_variable = {
+            "checker": "CF_AGENT_WECHAT_TEST_GATEWAY_CHECKER_REPLACEMENT",
+            "gate": "CF_AGENT_WECHAT_TEST_GATEWAY_GATE_REPLACEMENT",
+        }[executable_kind]
+        replacement = os.environ.get(replacement_variable, "")
         if replacement:
             testing_root = os.environ.get("CF_AGENT_WECHAT_TEST_ROOT", "")
             if (
@@ -341,8 +350,20 @@ try:
     ):
         fail()
 
+    request_data = b""
+    if input_transport == "stdin-json":
+        request_data = sys.stdin.buffer.read(4097)
+        if not request_data or len(request_data) > 4096:
+            fail()
+        try:
+            request_payload = json.loads(request_data.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            fail()
+        if not isinstance(request_payload, dict):
+            fail()
+
     snapshot_descriptor = os.memfd_create(
-        "cf-agent-wechat-heartbeat-checker",
+        f"cf-agent-wechat-gateway-{executable_kind}",
         os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING,
     )
     offset = 0
@@ -371,7 +392,11 @@ try:
     child = subprocess.Popen(
         [path, *script_arguments],
         executable=executable_path,
-        stdin=subprocess.DEVNULL,
+        stdin=(
+            subprocess.PIPE
+            if input_transport == "stdin-json"
+            else subprocess.DEVNULL
+        ),
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         close_fds=True,
@@ -402,6 +427,16 @@ try:
     def forward_termination(_signum, _frame):
         terminate_process_group()
         raise SystemExit(124)
+
+    if request_data:
+        if child.stdin is None:
+            fail()
+        try:
+            child.stdin.write(request_data)
+            child.stdin.close()
+        except (BrokenPipeError, OSError):
+            terminate_process_group()
+            raise SystemExit(1)
 
     signal.signal(signal.SIGTERM, forward_termination)
     signal.signal(signal.SIGINT, forward_termination)
@@ -487,6 +522,12 @@ finally:
 PYTHON
 readonly GATEWAY_CHECKER_SNAPSHOT_LOADER
 
+RUNTIME_INT64_MAX="9223372036854775807"
+RUNTIME_UID_GID_MAX="4294967294"
+RUNTIME_MAX_KIB_FOR_BYTE_CONVERSION="9007199254740991"
+readonly RUNTIME_INT64_MAX RUNTIME_UID_GID_MAX
+readonly RUNTIME_MAX_KIB_FOR_BYTE_CONVERSION
+
 RUNTIME_DEFAULT_UID="${CF_AGENT_WECHAT_RUNTIME_UID:-1000}"
 RUNTIME_DEFAULT_GID="${CF_AGENT_WECHAT_RUNTIME_GID:-1000}"
 RUNTIME_DEFAULT_MODE="${CF_AGENT_WECHAT_RUNTIME_MODE:-700}"
@@ -545,6 +586,11 @@ GATEWAY_SERVICE="worker"
 RUNTIME_LOCK_FD=""
 AGENT_COMPOSE_SNAPSHOT=""
 GATEWAY_COMPOSE_SNAPSHOT=""
+ATTESTED_AGENT_CONTAINER_ID=""
+GATEWAY_WORKER_CONTAINER_ID=""
+GATEWAY_GENERATION_ID=""
+GATEWAY_GATE_BEGUN=0
+GATEWAY_GATE_RELEASED=0
 RUNTIME_DOCKER_USES_SUDO=0
 RUNTIME_COMPOSE_USES_SUDO=0
 RUNTIME_SUDO_AUTHORIZED=0
@@ -554,6 +600,40 @@ AGENT_WECHAT_BIND_IP="127.0.0.1"
 AGENT_WECHAT_PUBLISHED_PORT="6174"
 RUNTIME_MANAGEMENT_ENV_ERROR=""
 LAST_ERROR="${LAST_ERROR:-}"
+RUNTIME_PERCENT_REQUIRED_UNITS=""
+
+runtime_decimal_is_at_most() {
+  local value="$1" maximum="$2"
+  local value_length maximum_length
+  local LC_ALL=C
+
+  [[ "$value" =~ ^(0|[1-9][0-9]*)$ ]] || return 1
+  [[ "$maximum" =~ ^(0|[1-9][0-9]*)$ ]] || return 1
+  value_length="${#value}"
+  maximum_length="${#maximum}"
+  [ "$value_length" -lt "$maximum_length" ] && return 0
+  [ "$value_length" -gt "$maximum_length" ] && return 1
+  [[ "$value" == "$maximum" || "$value" < "$maximum" ]]
+}
+
+runtime_positive_decimal_is_at_most() {
+  [[ "$1" =~ ^[1-9][0-9]*$ ]] &&
+    runtime_decimal_is_at_most "$1" "$2"
+}
+
+runtime_percent_required_units() {
+  local total="$1" percent="$2"
+  local quotient remainder scaled_remainder
+
+  quotient=$((total / 100))
+  remainder=$((total % 100))
+  scaled_remainder=$((remainder * percent))
+  RUNTIME_PERCENT_REQUIRED_UNITS=$((
+    quotient * percent +
+    scaled_remainder / 100 +
+    (scaled_remainder % 100 != 0)
+  ))
+}
 
 runtime_proxy_is_safe() {
   local value="$1"
@@ -626,12 +706,14 @@ runtime_validate_testing_gateway_isolation() {
     "$GATEWAY_COMPOSE_FILE"
     "$GATEWAY_ENV_FILE"
     "$GATEWAY_HEARTBEAT_COMMAND"
+    "$GATEWAY_RELEASE_GATE_COMMAND"
     "$GATEWAY_CONTRACT_FILE"
   )
   labels=(
     "Gateway Compose file"
     "Gateway environment file"
     "Gateway heartbeat checker"
+    "Gateway runtime release gate"
     "Gateway runtime contract"
   )
   for index in "${!paths[@]}"; do
@@ -737,6 +819,14 @@ runtime_validate_testing_replacement_isolation() {
   runtime_validate_testing_replacement_file \
     "${CF_AGENT_WECHAT_TEST_GATEWAY_CHECKER_REPLACEMENT:-}" \
     "Gateway checker" || return 1
+  if [ -n "${CF_AGENT_WECHAT_TEST_GATEWAY_GATE_REPLACEMENT:-}" ]; then
+    runtime_validate_testing_path_isolation \
+      "$GATEWAY_RELEASE_GATE_COMMAND" "Gateway gate replacement target" \
+      confined || return 1
+  fi
+  runtime_validate_testing_replacement_file \
+    "${CF_AGENT_WECHAT_TEST_GATEWAY_GATE_REPLACEMENT:-}" \
+    "Gateway gate" || return 1
 }
 
 runtime_validate_testing_tool_isolation() {
@@ -901,7 +991,7 @@ runtime_load_management_environment() {
         AGENT_WECHAT_BIND_IP="$value"
         ;;
       AGENT_WECHAT_PORT)
-        if ! [[ "$value" =~ ^[1-9][0-9]*$ ]] || [ "$value" -gt 65535 ]; then
+        if ! runtime_positive_decimal_is_at_most "$value" 65535; then
           RUNTIME_MANAGEMENT_ENV_ERROR="docker/.env AGENT_WECHAT_PORT is invalid."
           return 1
         fi
@@ -944,8 +1034,9 @@ runtime_load_management_environment() {
       CF_AGENT_WECHAT_STORAGE_ROOT) STORAGE_ROOT="$value" ;;
       CF_AGENT_WECHAT_RUNTIME_ROOT) RUNTIME_ROOT="$value" ;;
       CF_AGENT_WECHAT_RUNTIME_UID|CF_AGENT_WECHAT_RUNTIME_GID|CF_AGENT_WECHAT_MANAGEMENT_GID)
-        if ! [[ "$value" =~ ^[1-9][0-9]*$ ]]; then
-          RUNTIME_MANAGEMENT_ENV_ERROR="docker/.env ${key} must be a non-root numeric ID."
+        if ! runtime_positive_decimal_is_at_most \
+          "$value" "$RUNTIME_UID_GID_MAX"; then
+          RUNTIME_MANAGEMENT_ENV_ERROR="docker/.env ${key} must be a non-root numeric ID in the approved range."
           return 1
         fi
         ;;
@@ -955,18 +1046,32 @@ runtime_load_management_environment() {
           return 1
         fi
         ;;
-      CF_AGENT_WECHAT_MIN_FREE_BYTES|CF_AGENT_WECHAT_MIN_FREE_INODES|CF_AGENT_WECHAT_TOKEN_SCAN_MAX_FILES|CF_AGENT_WECHAT_TOKEN_SCAN_MAX_BYTES)
+      CF_AGENT_WECHAT_TOKEN_SCAN_MAX_FILES)
         if ! [[ "$value" =~ ^[1-9][0-9]*$ ]]; then
           RUNTIME_MANAGEMENT_ENV_ERROR="docker/.env ${key} must be a positive integer."
           return 1
         fi
+        if ! runtime_decimal_is_at_most "$value" 200000; then
+          RUNTIME_MANAGEMENT_ENV_ERROR="docker/.env CF_AGENT_WECHAT_TOKEN_SCAN_MAX_FILES must not exceed the compiled scanner limit."
+          return 1
+        fi
+        ;;
+      CF_AGENT_WECHAT_MIN_FREE_BYTES|CF_AGENT_WECHAT_MIN_FREE_INODES|CF_AGENT_WECHAT_TOKEN_SCAN_MAX_BYTES)
+        if ! runtime_positive_decimal_is_at_most \
+          "$value" "$RUNTIME_INT64_MAX"; then
+          RUNTIME_MANAGEMENT_ENV_ERROR="docker/.env ${key} must be a positive integer in the approved range."
+          return 1
+        fi
         ;;
       CF_AGENT_WECHAT_MIN_FREE_PERCENT)
-        if ! [[ "$value" =~ ^[0-9]+$ ]] || [ "$value" -gt 100 ]; then
+        if ! runtime_decimal_is_at_most "$value" 100; then
           RUNTIME_MANAGEMENT_ENV_ERROR="docker/.env CF_AGENT_WECHAT_MIN_FREE_PERCENT must be between 0 and 100."
           return 1
         fi
         ;;
+    esac
+    # Apply only after the independent validation pass has accepted the value.
+    case "$key" in
       CF_AGENT_WECHAT_ARCHIVE_ROOT) ARCHIVE_ROOT="$value" ;;
       AGENT_WECHAT_CONTAINER_NAME) APPROVED_AGENT_CONTAINER="$value"; CONTAINER_NAME="$value" ;;
       AGENT_WECHAT_PORT) AGENT_WECHAT_PUBLISHED_PORT="$value" ;;
@@ -1033,8 +1138,8 @@ runtime_validate_uint() {
   local name="$1"
   local value="$2"
 
-  if ! [[ "$value" =~ ^[0-9]+$ ]]; then
-    LAST_ERROR="${name} must be a non-negative integer."
+  if ! runtime_decimal_is_at_most "$value" "$RUNTIME_INT64_MAX"; then
+    LAST_ERROR="${name} must be a non-negative integer in the approved range."
     return 1
   fi
 }
@@ -1136,6 +1241,7 @@ runtime_assert_tree_has_no_auth_token() {
   local label="$2"
   local move_to="${3:-}"
   local reserved_top_level_name="${4:-}"
+  local require_empty_runtime_layout="${5:-0}"
   local -a scanner_arguments=(
     --root "$root"
     --token-file "$TOKEN_FILE"
@@ -1155,6 +1261,12 @@ runtime_assert_tree_has_no_auth_token() {
     scanner_arguments+=(--move-to "$move_to")
   [ -z "$reserved_top_level_name" ] ||
     scanner_arguments+=(--reserved-top-level-name "$reserved_top_level_name")
+  if [ "$require_empty_runtime_layout" = "1" ]; then
+    scanner_arguments+=(--require-empty-runtime-layout)
+  elif [ "$require_empty_runtime_layout" != "0" ]; then
+    LAST_ERROR="${label} requested an invalid runtime tree contract."
+    return 1
+  fi
   if runtime_privileged "$TIMEOUT_BIN" --signal=TERM --kill-after=2s \
     "${TOKEN_SCAN_TIMEOUT}s" /usr/bin/env -i \
     HOME=/nonexistent \
@@ -1166,6 +1278,10 @@ runtime_assert_tree_has_no_auth_token() {
   fi
   LAST_ERROR="${label} failed the bounded no-follow runtime tree and Token scan."
   return 1
+}
+
+runtime_assert_fresh_runtime_tree() {
+  runtime_assert_tree_has_no_auth_token "$1" "$2" "" "" 1
 }
 
 runtime_assert_management_sources_have_no_auth_token() {
@@ -1263,8 +1379,14 @@ runtime_validate_agent_environment_metadata_contract() {
       return 1
       ;;
   esac
+  # Read by start-qr-login.sh after this shared validator returns.
+  # shellcheck disable=SC2034
   AGENT_ENV_APPROVED_UID="$owner"
+  # Read by start-qr-login.sh after this shared validator returns.
+  # shellcheck disable=SC2034
   AGENT_ENV_APPROVED_GID="$group"
+  # Read by start-qr-login.sh after this shared validator returns.
+  # shellcheck disable=SC2034
   AGENT_ENV_APPROVED_MODE="$mode"
 }
 
@@ -1299,6 +1421,64 @@ runtime_validate_management_directory() {
     return 1
   fi
 }
+
+runtime_validate_directory_without_extended_attributes() {
+  local path="$1"
+  local label="$2"
+
+  if runtime_privileged_isolated_python "$TOKEN_SCAN_TIMEOUT" - "$path" >/dev/null 2>&1 <<'PY'
+import os
+import stat
+import sys
+
+path = sys.argv[1]
+required_flags = ("O_DIRECTORY", "O_NOFOLLOW", "O_CLOEXEC")
+if any(not hasattr(os, name) for name in required_flags):
+    raise SystemExit(1)
+
+def identity(metadata):
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_nlink,
+        metadata.st_uid,
+        metadata.st_gid,
+        metadata.st_ctime_ns,
+    )
+
+descriptor = -1
+try:
+    before = os.lstat(path)
+    if not stat.S_ISDIR(before.st_mode):
+        raise OSError
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    descriptor = os.open(path, flags)
+    opened = os.fstat(descriptor)
+    if identity(opened) != identity(before):
+        raise OSError
+    attributes = os.listxattr(descriptor)
+    after = os.fstat(descriptor)
+    final = os.lstat(path)
+    if (
+        attributes
+        or identity(after) != identity(opened)
+        or identity(final) != identity(opened)
+    ):
+        raise OSError
+except (OSError, ValueError):
+    raise SystemExit(1)
+finally:
+    if descriptor >= 0:
+        os.close(descriptor)
+PY
+  then
+    return 0
+  fi
+  LAST_ERROR="${label} must be a stable no-follow directory without extended attributes or ACLs."
+  return 1
+}
+
 runtime_validate_approved_runtime_directory() {
   local path="$1"
   local label="$2"
@@ -1322,6 +1502,8 @@ runtime_validate_approved_runtime_directory() {
     LAST_ERROR="${label} must exactly match approved UID:GID:mode ${expected}; repair it before retrying."
     return 1
   fi
+  runtime_validate_directory_without_extended_attributes "$path" "$label" ||
+    return 1
 }
 runtime_validate_restricted_archive_root() {
   local metadata expected current
@@ -1339,9 +1521,13 @@ runtime_validate_restricted_archive_root() {
   if [ "$CF_AGENT_WECHAT_TESTING" = "1" ]; then
     current="$(id -u):$(id -g):700"
     if [ "$metadata" = "$expected" ] || [ "$metadata" = "$current" ]; then
+      runtime_validate_directory_without_extended_attributes "$ARCHIVE_ROOT" "Archive root" ||
+        return 1
       return 0
     fi
   elif [ "$metadata" = "$expected" ]; then
+    runtime_validate_directory_without_extended_attributes "$ARCHIVE_ROOT" "Archive root" ||
+      return 1
     return 0
   fi
   LAST_ERROR="Archive root must be root:root mode 700."
@@ -1546,13 +1732,14 @@ runtime_attest_gateway_checkout() {
 }
 
 runtime_verify_gateway_provenance() {
-  local actual_checker_sha
+  local actual_checker_sha actual_gate_sha
   local actual_blob expected_blob relative_path absolute_path
 
   [ "$CF_AGENT_WECHAT_TESTING" != "1" ] || return 0
   if ! [[ "$GATEWAY_COMPATIBLE_COMMIT" =~ ^[0-9a-f]{40}$ ]] ||
-    ! [[ "$GATEWAY_CHECKER_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
-    LAST_ERROR="No compatible Gateway commit and checker digest have been published for this contract."
+    ! [[ "$GATEWAY_CHECKER_SHA256" =~ ^[0-9a-f]{64}$ ]] ||
+    ! [[ "$GATEWAY_RELEASE_GATE_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+    LAST_ERROR="No compatible Gateway commit, checker digest, and release-gate digest have been published for this contract."
     return 1
   fi
   runtime_attest_gateway_checkout "$GATEWAY_COMPATIBLE_COMMIT" || return 1
@@ -1560,7 +1747,8 @@ runtime_verify_gateway_provenance() {
   for relative_path in \
     docker-compose.prod.yml \
     deploy/wechat-runtime-contract.json \
-    deploy/check-wechat-worker-heartbeat; do
+    deploy/check-wechat-worker-heartbeat \
+    deploy/wechat-runtime-release-gate; do
     absolute_path="${GATEWAY_PROJECT_DIR}/${relative_path}"
     if ! runtime_gateway_git ls-files --error-unmatch -- "$relative_path" \
       >/dev/null 2>&1 ||
@@ -1577,6 +1765,13 @@ runtime_verify_gateway_provenance() {
   fi
   if [ "$actual_checker_sha" != "$GATEWAY_CHECKER_SHA256" ]; then
     LAST_ERROR="Gateway checker digest does not match the approved compatible commit."
+    return 1
+  fi
+  if ! actual_gate_sha="$(runtime_capture_gateway_gate_digest)"; then
+    return 1
+  fi
+  if [ "$actual_gate_sha" != "$GATEWAY_RELEASE_GATE_SHA256" ]; then
+    LAST_ERROR="Gateway release-gate digest does not match the approved compatible commit."
     return 1
   fi
 }
@@ -1645,7 +1840,8 @@ runtime_capture_gateway_verifier_digest() {
 
 runtime_execute_gateway_contract_verifier() {
   local checker_sha="$1"
-  local attestation_kind="$2"
+  local gate_sha="$2"
+  local attestation_kind="$3"
   local verifier_digest
 
   if ! verifier_digest="$(runtime_capture_gateway_verifier_digest)"; then
@@ -1656,6 +1852,7 @@ runtime_execute_gateway_contract_verifier() {
     --gateway-env "$GATEWAY_ENV_FILE" \
     --token-file "$TOKEN_FILE" \
     --checker "$GATEWAY_HEARTBEAT_COMMAND" \
+    --gate "$GATEWAY_RELEASE_GATE_COMMAND" \
     --service "$GATEWAY_SERVICE" \
     --project "$GATEWAY_PROJECT_NAME" \
     --alias cf-agent-wechat \
@@ -1663,18 +1860,26 @@ runtime_execute_gateway_contract_verifier() {
     --max-age "$GATEWAY_HEARTBEAT_MAX_AGE" \
     --producer-repository "$GATEWAY_PRODUCER_REPOSITORY" \
     --checker-sha256 "$checker_sha" \
+    --gate-sha256 "$gate_sha" \
     --attestation-kind "$attestation_kind" >/dev/null 2>&1
 }
 
-runtime_gateway_checker_snapshot() {
+runtime_gateway_executable_snapshot() {
   local timeout_seconds="$1"
-  local mode="$2"
-  local expected_digest="$3"
+  local executable_kind="$2"
+  local executable_path="$3"
+  local mode="$4"
+  local expected_digest="$5"
+  local input_transport="$6"
   local approved_uid
-  shift 3
+  shift 6
 
   case "$mode" in
     digest|execute) ;;
+    *) return 1 ;;
+  esac
+  case "$executable_kind:$input_transport" in
+    checker:none|checker:stdin-json|gate:none|gate:stdin-json) ;;
     *) return 1 ;;
   esac
   if ! approved_uid="$(/usr/bin/id -u)"; then
@@ -1687,10 +1892,11 @@ runtime_gateway_checker_snapshot() {
       "CF_AGENT_WECHAT_TEST_ROOT=$CF_AGENT_WECHAT_TEST_ROOT" \
       "CF_AGENT_WECHAT_TESTING=1" \
       "CF_AGENT_WECHAT_TEST_GATEWAY_CHECKER_REPLACEMENT=${CF_AGENT_WECHAT_TEST_GATEWAY_CHECKER_REPLACEMENT:-}" \
+      "CF_AGENT_WECHAT_TEST_GATEWAY_GATE_REPLACEMENT=${CF_AGENT_WECHAT_TEST_GATEWAY_GATE_REPLACEMENT:-}" \
       "$PYTHON_BIN" -I -c "$GATEWAY_CHECKER_SNAPSHOT_LOADER" \
-      gateway-checker-snapshot "$mode" "$GATEWAY_HEARTBEAT_COMMAND" \
+      gateway-executable-snapshot "$mode" "$executable_path" \
       "$GATEWAY_PROJECT_DIR" "$expected_digest" "$approved_uid" \
-      "$timeout_seconds" "$@"
+      "$timeout_seconds" "$executable_kind" "$input_transport" "$@"
   else
     runtime_with_timeout "$timeout_seconds" \
       /usr/bin/env -i \
@@ -1698,10 +1904,22 @@ runtime_gateway_checker_snapshot() {
       PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
       LANG=C.UTF-8 LC_ALL=C.UTF-8 \
       "$PYTHON_BIN" -I -c "$GATEWAY_CHECKER_SNAPSHOT_LOADER" \
-      gateway-checker-snapshot "$mode" "$GATEWAY_HEARTBEAT_COMMAND" \
+      gateway-executable-snapshot "$mode" "$executable_path" \
       "$GATEWAY_PROJECT_DIR" "$expected_digest" "$approved_uid" \
-      "$timeout_seconds" "$@"
+      "$timeout_seconds" "$executable_kind" "$input_transport" "$@"
   fi
+}
+
+runtime_gateway_checker_snapshot() {
+  runtime_gateway_executable_snapshot \
+    "$1" checker "$GATEWAY_HEARTBEAT_COMMAND" \
+    "$2" "$3" "$4" "${@:5}"
+}
+
+runtime_gateway_gate_snapshot() {
+  runtime_gateway_executable_snapshot \
+    "$1" gate "$GATEWAY_RELEASE_GATE_COMMAND" \
+    "$2" "$3" "$4" "${@:5}"
 }
 
 runtime_capture_gateway_checker_digest() {
@@ -1709,7 +1927,7 @@ runtime_capture_gateway_checker_digest() {
 
   if ! digest="$(
     runtime_gateway_checker_snapshot \
-      "$DOCKER_COMMAND_TIMEOUT" digest - 2>/dev/null
+      "$GATEWAY_RUNTIME_COMMAND_TIMEOUT" digest - none 2>/dev/null
   )" || ! [[ "$digest" =~ ^[0-9a-f]{64}$ ]]; then
     LAST_ERROR="Gateway heartbeat checker snapshot could not be validated."
     return 1
@@ -1717,12 +1935,171 @@ runtime_capture_gateway_checker_digest() {
   printf '%s' "$digest"
 }
 
+runtime_capture_gateway_gate_digest() {
+  local digest
+
+  if ! digest="$(
+    runtime_gateway_gate_snapshot \
+      "$GATEWAY_RUNTIME_COMMAND_TIMEOUT" digest - none 2>/dev/null
+  )" || ! [[ "$digest" =~ ^[0-9a-f]{64}$ ]]; then
+    LAST_ERROR="Gateway release-gate snapshot could not be validated."
+    return 1
+  fi
+  printf '%s' "$digest"
+}
+
+runtime_gateway_generation_id_is_valid() {
+  [[ "$1" =~ ^[0-9a-f]{64}$ ]]
+}
+
+runtime_gateway_write_request() {
+  local operation="$1"
+  local generation_id="$2"
+  local agent_container_id="${3:-}"
+  local worker_container_id="${4:-}"
+
+  runtime_gateway_generation_id_is_valid "$generation_id" || return 1
+  case "$operation" in
+    begin|assert-pending|abort)
+      [ -z "$agent_container_id" ] && [ -z "$worker_container_id" ] ||
+        return 1
+      printf '{"schemaVersion":1,"operation":"%s","generationId":"%s"}\n' \
+        "$operation" "$generation_id"
+      ;;
+    release)
+      runtime_gateway_generation_id_is_valid "$agent_container_id" &&
+        runtime_gateway_generation_id_is_valid "$worker_container_id" ||
+        return 1
+      printf '{"schemaVersion":1,"operation":"release","generationId":"%s","agentContainerId":"%s","workerContainerId":"%s"}\n' \
+        "$generation_id" "$agent_container_id" "$worker_container_id"
+      ;;
+    checker)
+      runtime_gateway_generation_id_is_valid "$agent_container_id" &&
+        runtime_gateway_generation_id_is_valid "$worker_container_id" ||
+        return 1
+      printf '{"schemaVersion":1,"generationId":"%s","agentContainerId":"%s","workerContainerId":"%s"}\n' \
+        "$generation_id" "$agent_container_id" "$worker_container_id"
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+runtime_effective_gateway_gate_digest() {
+  local digest="$GATEWAY_RELEASE_GATE_SHA256"
+
+  if [ "$CF_AGENT_WECHAT_TESTING" = "1" ]; then
+    digest="$(runtime_capture_gateway_gate_digest)" || return 1
+  fi
+  if ! [[ "$digest" =~ ^[0-9a-f]{64}$ ]]; then
+    LAST_ERROR="Gateway release-gate digest is not an approved SHA-256 value."
+    return 1
+  fi
+  printf '%s' "$digest"
+}
+
+runtime_invoke_gateway_gate() {
+  local operation="$1"
+  local agent_container_id="${2:-}"
+  local worker_container_id="${3:-}"
+  local gate_sha gate_status
+
+  if ! gate_sha="$(runtime_effective_gateway_gate_digest)"; then
+    return 1
+  fi
+  if runtime_gateway_write_request "$operation" "$GATEWAY_GENERATION_ID" \
+      "$agent_container_id" "$worker_container_id" |
+    runtime_gateway_gate_snapshot "$GATEWAY_RUNTIME_COMMAND_TIMEOUT" \
+      execute "$gate_sha" stdin-json >/dev/null 2>&1; then
+    return 0
+  else
+    gate_status=$?
+  fi
+  case "$gate_status" in
+    125)
+      LAST_ERROR="Gateway runtime release gate violated the silent-output contract."
+      ;;
+    124)
+      LAST_ERROR="Gateway runtime release gate exceeded its hard timeout."
+      ;;
+    126)
+      LAST_ERROR="Gateway runtime release-gate snapshot validation failed."
+      ;;
+    *)
+      LAST_ERROR="Gateway runtime release gate rejected the lifecycle transition."
+      ;;
+  esac
+  return 1
+}
+
+runtime_gateway_gate_begin() {
+  local generation_id
+
+  GATEWAY_GENERATION_ID=""
+  GATEWAY_GATE_BEGUN=0
+  GATEWAY_GATE_RELEASED=0
+  if ! generation_id="$(
+    runtime_with_timeout "$GATEWAY_RUNTIME_COMMAND_TIMEOUT" \
+      /usr/bin/env -i \
+      HOME=/nonexistent \
+      PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+      LANG=C.UTF-8 LC_ALL=C.UTF-8 \
+      "$PYTHON_BIN" -I -c 'import secrets; print(secrets.token_hex(32))' \
+      2>/dev/null
+  )" || ! runtime_gateway_generation_id_is_valid "$generation_id"; then
+    LAST_ERROR="A fresh Gateway runtime generation identifier could not be created."
+    return 1
+  fi
+  GATEWAY_GENERATION_ID="$generation_id"
+  generation_id=""
+  if ! runtime_invoke_gateway_gate begin; then
+    GATEWAY_GENERATION_ID=""
+    return 1
+  fi
+  GATEWAY_GATE_BEGUN=1
+}
+
+runtime_gateway_gate_assert_pending() {
+  if [ "$GATEWAY_GATE_BEGUN" -ne 1 ] ||
+    [ "$GATEWAY_GATE_RELEASED" -ne 0 ] ||
+    ! runtime_gateway_generation_id_is_valid "$GATEWAY_GENERATION_ID"; then
+    LAST_ERROR="Gateway runtime generation is not in an approved pending state."
+    return 1
+  fi
+  runtime_invoke_gateway_gate assert-pending
+}
+
+runtime_gateway_gate_release() {
+  if [ "$GATEWAY_GATE_BEGUN" -ne 1 ] ||
+    [ "$GATEWAY_GATE_RELEASED" -ne 0 ] ||
+    ! runtime_gateway_generation_id_is_valid "$ATTESTED_AGENT_CONTAINER_ID" ||
+    ! runtime_gateway_generation_id_is_valid "$GATEWAY_WORKER_CONTAINER_ID"; then
+    LAST_ERROR="Gateway runtime release identities are unavailable or invalid."
+    return 1
+  fi
+  if ! runtime_invoke_gateway_gate release \
+    "$ATTESTED_AGENT_CONTAINER_ID" "$GATEWAY_WORKER_CONTAINER_ID"; then
+    return 1
+  fi
+  GATEWAY_GATE_RELEASED=1
+}
+
+runtime_gateway_gate_abort() {
+  [ "$GATEWAY_GATE_BEGUN" -eq 1 ] || return 0
+  if ! runtime_invoke_gateway_gate abort; then
+    return 1
+  fi
+  GATEWAY_GATE_BEGUN=0
+  GATEWAY_GATE_RELEASED=0
+  GATEWAY_GENERATION_ID=""
+}
+
 runtime_verify_gateway_contract() {
-  local protected_path checker_sha
+  local protected_path checker_sha gate_sha
 
   for protected_path in "$TOKEN_FILE" "$GATEWAY_PROJECT_DIR" \
     "$GATEWAY_COMPOSE_FILE" "$GATEWAY_ENV_FILE" \
     "$GATEWAY_CONTRACT_FILE" "$GATEWAY_HEARTBEAT_COMMAND" \
+    "$GATEWAY_RELEASE_GATE_COMMAND" \
     "$GATEWAY_CONTRACT_VERIFIER"; do
     runtime_validate_no_symlink_ancestors "$protected_path" \
       "Gateway runtime contract input" || return 1
@@ -1733,6 +2110,7 @@ runtime_verify_gateway_contract() {
     runtime_validate_management_file "$GATEWAY_ENV_FILE" "Gateway environment" "600 0600" || return 1
     runtime_validate_management_file "$GATEWAY_CONTRACT_FILE" "Gateway runtime contract" "600 0600 644 0644" || return 1
     runtime_validate_management_file "$GATEWAY_HEARTBEAT_COMMAND" "Gateway heartbeat checker" || return 1
+    runtime_validate_management_file "$GATEWAY_RELEASE_GATE_COMMAND" "Gateway runtime release gate" || return 1
     runtime_validate_management_file \
       "$GATEWAY_CONTRACT_VERIFIER" "Gateway contract verifier" \
       "755 0755" || return 1
@@ -1741,63 +2119,120 @@ runtime_verify_gateway_contract() {
     runtime_validate_root_file "$GATEWAY_ENV_FILE" "Gateway environment" 600 || return 1
     runtime_validate_root_file "$GATEWAY_CONTRACT_FILE" "Gateway runtime contract" 644 || return 1
     runtime_validate_root_file "$GATEWAY_HEARTBEAT_COMMAND" "Gateway heartbeat checker" 755 || return 1
+    runtime_validate_root_file "$GATEWAY_RELEASE_GATE_COMMAND" "Gateway runtime release gate" 755 || return 1
     runtime_validate_management_file \
       "$GATEWAY_CONTRACT_VERIFIER" "Gateway contract verifier" \
       "755 0755" || return 1
   fi
-  if [ ! -x "$GATEWAY_HEARTBEAT_COMMAND" ]; then
-    LAST_ERROR="Gateway heartbeat checker must be executable."
+  if [ ! -x "$GATEWAY_HEARTBEAT_COMMAND" ] ||
+    [ ! -x "$GATEWAY_RELEASE_GATE_COMMAND" ]; then
+    LAST_ERROR="Gateway heartbeat checker and runtime release gate must be executable."
     return 1
   fi
   runtime_verify_gateway_provenance || return 1
   checker_sha="$GATEWAY_CHECKER_SHA256"
+  gate_sha="$GATEWAY_RELEASE_GATE_SHA256"
   if [ "$CF_AGENT_WECHAT_TESTING" = "1" ]; then
     if ! checker_sha="$(runtime_capture_gateway_checker_digest)"; then
       return 1
     fi
+    if ! gate_sha="$(runtime_capture_gateway_gate_digest)"; then
+      return 1
+    fi
   fi
-  if ! [[ "$checker_sha" =~ ^[0-9a-f]{64}$ ]]; then
-    LAST_ERROR="Gateway checker digest is not an approved SHA-256 value."
+  if ! [[ "$checker_sha" =~ ^[0-9a-f]{64}$ ]] ||
+    ! [[ "$gate_sha" =~ ^[0-9a-f]{64}$ ]]; then
+    LAST_ERROR="Gateway checker or release-gate digest is not an approved SHA-256 value."
     return 1
   fi
   if ! gateway_compose config --format json 2>/dev/null |
-    runtime_execute_gateway_contract_verifier "$checker_sha" compose; then
+    runtime_execute_gateway_contract_verifier \
+      "$checker_sha" "$gate_sha" compose; then
     LAST_ERROR="Gateway runtime contract or Agent Token agreement could not be verified."
     return 1
   fi
 }
 
 runtime_attest_gateway_worker_container() {
-  local checker_sha container_id
+  local expected_state="${1:-running}"
+  local expected_id="${2:-}"
+  local checker_sha gate_sha container_id running_ids state_contract
+  local expected_running
 
-  if ! container_id="$(gateway_compose ps --status running --quiet \
-    "$GATEWAY_SERVICE" 2>/dev/null)" ||
+  case "$expected_state" in
+    created)
+      expected_running=false
+      if ! container_id="$(gateway_compose ps --all --quiet \
+        "$GATEWAY_SERVICE" 2>/dev/null)" ||
+        ! running_ids="$(gateway_compose ps --status running --quiet \
+          "$GATEWAY_SERVICE" 2>/dev/null)" ||
+        [ -n "$running_ids" ]; then
+        LAST_ERROR="Gateway wechat-worker stopped candidate identity could not be attested."
+        return 1
+      fi
+      ;;
+    running)
+      expected_running=true
+      if ! container_id="$(gateway_compose ps --status running --quiet \
+        "$GATEWAY_SERVICE" 2>/dev/null)"; then
+        LAST_ERROR="Gateway wechat-worker running identity could not be attested."
+        return 1
+      fi
+      ;;
+    *)
+      LAST_ERROR="Gateway wechat-worker attestation state is invalid."
+      return 1
+      ;;
+  esac
+  if
     [ -z "$container_id" ] ||
-    [ "${container_id//$'\n'/}" != "$container_id" ]; then
+    [ "${container_id//$'\n'/}" != "$container_id" ] ||
+    ! [[ "$container_id" =~ ^[0-9a-f]{64}$ ]]
+  then
     LAST_ERROR="Gateway wechat-worker instance identity could not be attested."
     return 1
   fi
+  if [ -n "$expected_id" ] && [ "$container_id" != "$expected_id" ]; then
+    LAST_ERROR="Gateway wechat-worker instance identity changed during verification."
+    return 1
+  fi
+  if ! state_contract="$(runtime_docker inspect --format \
+    '{{.Id}}|{{.State.Status}}|{{.State.Running}}|{{.State.Restarting}}|{{.State.Paused}}|{{.State.Dead}}' \
+    "$container_id" 2>/dev/null)" ||
+    [ "$state_contract" != \
+      "${container_id}|${expected_state}|${expected_running}|false|false|false" ]; then
+    LAST_ERROR="Gateway wechat-worker container state is not the exact approved candidate state."
+    return 1
+  fi
   checker_sha="$GATEWAY_CHECKER_SHA256"
+  gate_sha="$GATEWAY_RELEASE_GATE_SHA256"
   if [ "$CF_AGENT_WECHAT_TESTING" = "1" ]; then
     if ! checker_sha="$(runtime_capture_gateway_checker_digest)"; then
       return 1
     fi
+    if ! gate_sha="$(runtime_capture_gateway_gate_digest)"; then
+      return 1
+    fi
   fi
-  if ! [[ "$checker_sha" =~ ^[0-9a-f]{64}$ ]]; then
-    LAST_ERROR="Gateway checker digest is not an approved SHA-256 value."
+  if ! [[ "$checker_sha" =~ ^[0-9a-f]{64}$ ]] ||
+    ! [[ "$gate_sha" =~ ^[0-9a-f]{64}$ ]]; then
+    LAST_ERROR="Gateway checker or release-gate digest is not an approved SHA-256 value."
     return 1
   fi
   if ! runtime_docker inspect "$container_id" 2>/dev/null |
-    runtime_execute_gateway_contract_verifier "$checker_sha" worker-inspect; then
+    runtime_execute_gateway_contract_verifier \
+      "$checker_sha" "$gate_sha" worker-inspect; then
     LAST_ERROR="Gateway wechat-worker violates the file credential contract."
     return 1
   fi
+  GATEWAY_WORKER_CONTAINER_ID="$container_id"
 }
 
 runtime_check_archive_capacity() {
   local probe block_output inode_output block_stats inode_stats
   local total_blocks available_blocks total_inodes available_inodes
-  local available_bytes free_percent
+  local available_bytes free_percent required_percent_blocks
+  local candidate_percent
 
   if runtime_privileged test -d "$ARCHIVE_ROOT"; then
     probe="$ARCHIVE_ROOT"
@@ -1857,18 +2292,34 @@ runtime_check_archive_capacity() {
     LAST_ERROR="Archive filesystem free inodes could not be measured."
     return 1
   fi
-  available_bytes=$((available_blocks * 1024))
-  if [ "$total_blocks" -eq 0 ]; then
+  if ! runtime_positive_decimal_is_at_most \
+      "$total_blocks" "$RUNTIME_INT64_MAX" ||
+    ! runtime_decimal_is_at_most \
+      "$available_blocks" "$RUNTIME_MAX_KIB_FOR_BYTE_CONVERSION" ||
+    ! runtime_decimal_is_at_most "$available_blocks" "$total_blocks" ||
+    ! runtime_positive_decimal_is_at_most \
+      "$total_inodes" "$RUNTIME_INT64_MAX" ||
+    ! runtime_decimal_is_at_most \
+      "$available_inodes" "$RUNTIME_INT64_MAX" ||
+    ! runtime_decimal_is_at_most "$available_inodes" "$total_inodes"; then
     LAST_ERROR="Archive filesystem reported an invalid capacity."
     return 1
   fi
-  free_percent=$((available_blocks * 100 / total_blocks))
+  available_bytes=$((available_blocks * 1024))
+  runtime_percent_required_units "$total_blocks" "$MIN_FREE_PERCENT"
+  required_percent_blocks="$RUNTIME_PERCENT_REQUIRED_UNITS"
   if [ "$available_bytes" -lt "$MIN_FREE_BYTES" ] ||
-    [ "$free_percent" -lt "$MIN_FREE_PERCENT" ] ||
+    [ "$available_blocks" -lt "$required_percent_blocks" ] ||
     [ "$available_inodes" -lt "$MIN_FREE_INODES" ]; then
     LAST_ERROR="Archive filesystem is below the approved free space or inode threshold."
     return 1
   fi
+  free_percent=0
+  for ((candidate_percent = 1; candidate_percent <= 100; candidate_percent++)); do
+    runtime_percent_required_units "$total_blocks" "$candidate_percent"
+    [ "$available_blocks" -ge "$RUNTIME_PERCENT_REQUIRED_UNITS" ] || break
+    free_percent="$candidate_percent"
+  done
   printf 'Archive capacity: %s bytes free (%s%%), %s inodes free.\n' \
     "$available_bytes" "$free_percent" "$available_inodes"
 }
@@ -2011,6 +2462,19 @@ runtime_systemctl() {
     "${clean_env[@]}" "$SYSTEMCTL_BIN" "$@"
 }
 
+runtime_capture_systemctl_probe() {
+  local captured probe_status
+
+  if captured="$(runtime_systemctl "$@" 2>/dev/null)"; then
+    probe_status=0
+  else
+    probe_status=$?
+  fi
+  RUNTIME_SYSTEMCTL_PROBE_OUTPUT="$captured"
+  RUNTIME_SYSTEMCTL_PROBE_STATUS="$probe_status"
+  return 0
+}
+
 runtime_systemd_read_unit_definition() {
   local unit="$1"
 
@@ -2121,7 +2585,8 @@ runtime_systemd_inspect_target_dependencies() {
 }
 
 runtime_validate_startup_policy() {
-  local state activity enablement enabled_units socket_metadata unit unit_state
+  local state activity agent_activity enablement enabled_units active_units probe_status
+  local socket_metadata unit unit_state loaded_state active_state sub_state
   local network_contract compose_version
 
   if [ "$CF_AGENT_WECHAT_TESTING" != "1" ]; then
@@ -2145,26 +2610,61 @@ runtime_validate_startup_policy() {
       ;;
   esac
 
-  state="$(runtime_systemctl is-system-running 2>/dev/null || true)"
-  case "$state" in
-    running|degraded) ;;
+  runtime_capture_systemctl_probe is-system-running
+  state="$RUNTIME_SYSTEMCTL_PROBE_OUTPUT"
+  probe_status="$RUNTIME_SYSTEMCTL_PROBE_STATUS"
+  case "${state}:${probe_status}" in
+    running:0|degraded:1) ;;
     *)
-      LAST_ERROR="systemd must be running or degraded before fresh QR."
+      LAST_ERROR="systemd state probe failed or systemd is not running or degraded before fresh QR."
       return 1
       ;;
   esac
-  activity="$(runtime_systemctl is-active docker.service 2>/dev/null || true)"
-  if [ "$activity" != "active" ]; then
+  runtime_capture_systemctl_probe is-active docker.service
+  activity="$RUNTIME_SYSTEMCTL_PROBE_OUTPUT"
+  probe_status="$RUNTIME_SYSTEMCTL_PROBE_STATUS"
+  if [ "$activity" != "active" ] || [ "$probe_status" -ne 0 ]; then
     LAST_ERROR="docker.service must be active before fresh QR."
     return 1
   fi
-  enablement="$(runtime_systemctl is-enabled cf-agent-wechat.service 2>/dev/null || true)"
+  runtime_capture_systemctl_probe is-active cf-agent-wechat.service
+  agent_activity="$RUNTIME_SYSTEMCTL_PROBE_OUTPUT"
+  probe_status="$RUNTIME_SYSTEMCTL_PROBE_STATUS"
+  case "${agent_activity}:${probe_status}" in
+    inactive:3|failed:3) ;;
+    active:0|activating:0|reloading:0|deactivating:0)
+      LAST_ERROR="cf-agent-wechat.service must be inactive before fresh QR."
+      return 1
+      ;;
+    *)
+      LAST_ERROR="cf-agent-wechat.service activity probe failed or returned an unsafe state."
+      return 1
+      ;;
+  esac
+  runtime_capture_systemctl_probe is-enabled cf-agent-wechat.service
+  enablement="$RUNTIME_SYSTEMCTL_PROBE_OUTPUT"
+  probe_status="$RUNTIME_SYSTEMCTL_PROBE_STATUS"
   case "$enablement" in
     enabled|enabled-runtime|linked|linked-runtime|alias)
+      if [ "$probe_status" -ne 0 ]; then
+        LAST_ERROR="cf-agent-wechat.service enablement probe failed."
+        return 1
+      fi
       LAST_ERROR="cf-agent-wechat.service must not be enabled."
       return 1
       ;;
-    disabled|static|masked|indirect|generated|transient|not-found) ;;
+    disabled|static|masked|indirect|generated|transient)
+      if [ "$probe_status" -ne 1 ]; then
+        LAST_ERROR="cf-agent-wechat.service enablement probe failed."
+        return 1
+      fi
+      ;;
+    not-found)
+      if [ "$probe_status" -ne 1 ] && [ "$probe_status" -ne 4 ]; then
+        LAST_ERROR="cf-agent-wechat.service enablement probe failed."
+        return 1
+      fi
+      ;;
     *)
       LAST_ERROR="cf-agent-wechat.service enablement could not be determined safely."
       return 1
@@ -2224,6 +2724,69 @@ runtime_validate_startup_policy() {
         ;;
     esac
   done <<< "$enabled_units"
+
+  if ! active_units="$(runtime_systemctl list-units \
+    --type=service,timer,path,socket,target \
+    --state=active,activating,reloading \
+    --plain --no-legend --no-pager 2>/dev/null)"; then
+    LAST_ERROR="Active systemd units could not be inspected."
+    return 1
+  fi
+  while read -r unit loaded_state active_state sub_state _; do
+    [ -n "$unit" ] || continue
+    if [ "$loaded_state" != "loaded" ]; then
+      LAST_ERROR="Active systemd unit inventory returned an unexpected load state."
+      return 1
+    fi
+    case "$active_state" in
+      active|activating|reloading) ;;
+      *)
+        LAST_ERROR="Active systemd unit inventory returned an unexpected activity state."
+        return 1
+        ;;
+    esac
+    [ -n "$sub_state" ] || {
+      LAST_ERROR="Active systemd unit inventory returned an incomplete state."
+      return 1
+    }
+    case "$unit" in
+      *.service|*.timer|*.path|*.socket|*.target) ;;
+      *)
+        LAST_ERROR="Active systemd unit inventory returned an unsupported unit type."
+        return 1
+        ;;
+    esac
+    if ! runtime_systemd_unit_name_is_valid "$unit"; then
+      LAST_ERROR="Active systemd unit inventory returned an invalid unit name."
+      return 1
+    fi
+    if runtime_systemd_unit_name_references_agent_runtime "$unit"; then
+      LAST_ERROR="An unapproved active agent-wechat unit was detected."
+      return 1
+    fi
+    if ! runtime_systemd_read_unit_definition "$unit"; then
+      LAST_ERROR="Active systemd unit definitions could not be inspected."
+      return 1
+    fi
+    if runtime_unit_definition_starts_agent "$RUNTIME_SYSTEMD_UNIT_DEFINITION"; then
+      LAST_ERROR="An active systemd unit could supervise agent-wechat."
+      return 1
+    fi
+    case "$unit" in
+      *.timer)
+        runtime_systemd_inspect_single_activation "$unit" Unit timer || return 1
+        ;;
+      *.path)
+        runtime_systemd_inspect_single_activation "$unit" Unit path || return 1
+        ;;
+      *.socket)
+        runtime_systemd_inspect_single_activation "$unit" Service socket || return 1
+        ;;
+      *.target)
+        runtime_systemd_inspect_target_dependencies "$unit" || return 1
+        ;;
+    esac
+  done <<< "$active_units"
 
   if ! compose_version="$(runtime_docker compose version --short 2>/dev/null)" ||
     ! [[ "$compose_version" =~ ^v?2[.] ]]; then
@@ -2357,6 +2920,37 @@ runtime_prepare_compose_snapshots() {
   runtime_capture_compose_snapshot \
     "$GATEWAY_COMPOSE_FILE" "Gateway Compose" \
     GATEWAY_COMPOSE_SNAPSHOT || return 1
+}
+
+runtime_verify_compose_snapshots_unchanged() {
+  local current_agent_snapshot current_gateway_snapshot
+
+  runtime_capture_compose_snapshot \
+    "$AGENT_COMPOSE_FILE" "agent-wechat Compose" \
+    current_agent_snapshot || return 1
+  if [ "$current_agent_snapshot" != "$AGENT_COMPOSE_SNAPSHOT" ]; then
+    current_agent_snapshot=""
+    LAST_ERROR="agent-wechat Compose changed during the fresh QR operation."
+    return 1
+  fi
+  current_agent_snapshot=""
+
+  runtime_capture_compose_snapshot \
+    "$GATEWAY_COMPOSE_FILE" "Gateway Compose" \
+    current_gateway_snapshot || return 1
+  if [ "$current_gateway_snapshot" != "$GATEWAY_COMPOSE_SNAPSHOT" ]; then
+    current_gateway_snapshot=""
+    LAST_ERROR="Gateway Compose changed during the fresh QR operation."
+    return 1
+  fi
+  current_gateway_snapshot=""
+}
+
+runtime_revalidate_start_gate() {
+  runtime_verify_compose_snapshots_unchanged || return 1
+  runtime_select_docker || return 1
+  runtime_validate_startup_policy || return 1
+  runtime_attest_agent_compose || return 1
 }
 
 runtime_select_compose_access() {
@@ -2669,9 +3263,18 @@ if not isinstance(options, dict) or (
 }
 
 runtime_attest_actual_agent_container() {
+  local expected_state="${1:-running}"
+  local expected_id="${2:-}"
   local container_ids container_id inspect_json image_inspect_json
   local runtime_canonical token_canonical
 
+  case "$expected_state" in
+    created|running) ;;
+    *)
+      LAST_ERROR="Agent container attestation state is invalid."
+      return 1
+      ;;
+  esac
   if [ -z "${AUTH_TOKEN:-}" ]; then
     LAST_ERROR="Agent Token is unavailable for exact container attestation."
     return 1
@@ -2683,6 +3286,14 @@ runtime_attest_actual_agent_container() {
     return 1
   fi
   container_id="$container_ids"
+  if ! [[ "$container_id" =~ ^[0-9a-f]{12,64}$ ]]; then
+    LAST_ERROR="The agent-wechat container identity is malformed."
+    return 1
+  fi
+  if [ -n "$expected_id" ] && [ "$container_id" != "$expected_id" ]; then
+    LAST_ERROR="The attested agent-wechat container identity changed."
+    return 1
+  fi
   if ! inspect_json="$(runtime_docker inspect "$container_id" 2>/dev/null)"; then
     LAST_ERROR="The created agent-wechat container could not be inspected."
     return 1
@@ -2724,6 +3335,7 @@ try:
     item = payload[0]
     config = item["Config"]
     host = item["HostConfig"]
+    state = item["State"]
     network_settings = item["NetworkSettings"]
     image_item = image_payload[0]
     image_config = image_item["Config"]
@@ -2739,7 +3351,28 @@ expected_bind_ip = sys.argv[6]
 expected_port = sys.argv[7]
 expected_proxy = sys.argv[8]
 expected_rust_log = sys.argv[9]
+expected_state = sys.argv[10]
+expected_container_id = sys.argv[11]
 
+if expected_state not in {"created", "running"}:
+    raise SystemExit(2)
+if not isinstance(state, dict) or state.get("Running") is not (
+    expected_state == "running"
+):
+    raise SystemExit(2)
+if state.get("Status") != expected_state:
+    raise SystemExit(2)
+for boolean_key in ("Restarting", "Paused", "Dead", "OOMKilled"):
+    if state.get(boolean_key) is not False:
+        raise SystemExit(2)
+exit_code = state.get("ExitCode")
+if isinstance(exit_code, bool) or exit_code != 0:
+    raise SystemExit(2)
+restart_count = item.get("RestartCount")
+if isinstance(restart_count, bool) or restart_count != 0:
+    raise SystemExit(2)
+if item.get("Id") != expected_container_id:
+    raise SystemExit(2)
 if item.get("Name") != "/" + expected_container:
     raise SystemExit(2)
 if config.get("Image") != expected_image:
@@ -2856,27 +3489,37 @@ for destination, source, writable in (
 port_key = "6174/tcp"
 network_ports = network_settings.get("Ports")
 host_port_bindings = host.get("PortBindings")
-if not isinstance(network_ports, dict) or not isinstance(host_port_bindings, dict):
+if not isinstance(host_port_bindings, dict) or set(host_port_bindings) != {port_key}:
     raise SystemExit(2)
-published_ports = {
-    key: values
-    for key, values in network_ports.items()
-    if values is not None
-}
-if (
-    set(published_ports) != {port_key}
-    or set(host_port_bindings) != {port_key}
+host_bindings = host_port_bindings[port_key]
+if not isinstance(host_bindings, list) or len(host_bindings) != 1:
+    raise SystemExit(2)
+host_binding = host_bindings[0]
+if not isinstance(host_binding, dict) or (
+    host_binding.get("HostIp") != expected_bind_ip
+    or str(host_binding.get("HostPort")) != expected_port
 ):
     raise SystemExit(2)
-bindings = published_ports[port_key]
-host_bindings = host_port_bindings[port_key]
-for values in (bindings, host_bindings):
-    if not isinstance(values, list) or len(values) != 1:
+if expected_state == "created":
+    if network_ports not in (None, {}, {port_key: None}):
         raise SystemExit(2)
-    value = values[0]
-    if not isinstance(value, dict) or (
-        value.get("HostIp") != expected_bind_ip
-        or str(value.get("HostPort")) != expected_port
+else:
+    if not isinstance(network_ports, dict):
+        raise SystemExit(2)
+    published_ports = {
+        key: values
+        for key, values in network_ports.items()
+        if values is not None
+    }
+    if set(published_ports) != {port_key}:
+        raise SystemExit(2)
+    bindings = published_ports[port_key]
+    if not isinstance(bindings, list) or len(bindings) != 1:
+        raise SystemExit(2)
+    binding = bindings[0]
+    if not isinstance(binding, dict) or (
+        binding.get("HostIp") != expected_bind_ip
+        or str(binding.get("HostPort")) != expected_port
     ):
         raise SystemExit(2)
 
@@ -2943,7 +3586,8 @@ if (
 ' "$runtime_canonical" "$token_canonical" "$APPROVED_AGENT_IMAGE" \
     "$APPROVED_AGENT_CONTAINER" "$APPROVED_AGENT_PROJECT" \
     "$AGENT_WECHAT_BIND_IP" "$AGENT_WECHAT_PUBLISHED_PORT" \
-    "$APPROVED_PROXY" "$APPROVED_RUST_LOG" >/dev/null; then
+    "$APPROVED_PROXY" "$APPROVED_RUST_LOG" \
+    "$expected_state" "$container_id" >/dev/null; then
     inspect_json=""
     image_inspect_json=""
     LAST_ERROR="Created agent-wechat container violates the exact production runtime contract."
@@ -2951,6 +3595,8 @@ if (
   fi
   inspect_json=""
   image_inspect_json=""
+  # Bound across candidate creation, fresh QR verification, and final release.
+  ATTESTED_AGENT_CONTAINER_ID="$container_id"
 }
 
 runtime_validate_configuration() {
@@ -3061,7 +3707,7 @@ runtime_validate_configuration() {
   for required_path in \
     "$AGENT_COMPOSE_FILE" "$AGENT_ENV_FILE" "$STORAGE_ROOT" "$RUNTIME_ROOT" "$ARCHIVE_ROOT" \
     "$GATEWAY_COMPOSE_FILE" "$GATEWAY_PROJECT_DIR" "$GATEWAY_ENV_FILE" \
-    "$GATEWAY_HEARTBEAT_COMMAND" "$GATEWAY_CONTRACT_FILE" \
+    "$GATEWAY_HEARTBEAT_COMMAND" "$GATEWAY_RELEASE_GATE_COMMAND" "$GATEWAY_CONTRACT_FILE" \
     "$GATEWAY_CONTRACT_VERIFIER" "$RUNTIME_TREE_SCANNER" "$ARCHIVE_RUNTIME_TOOL" "$MANAGEMENT_ENV_PARSER" "$TOKEN_FILE" \
     "$RUNTIME_LOCK_FILE"; do
     case "$required_path" in
@@ -3107,6 +3753,10 @@ runtime_validate_configuration() {
     runtime_validate_root_directory "$STORAGE_ROOT" "Storage root" 755 || return 1
     runtime_validate_root_directory "${STORAGE_ROOT}/secrets" "Secrets root" 700 || return 1
   fi
+  runtime_validate_directory_without_extended_attributes "$STORAGE_ROOT" "Storage root" ||
+    return 1
+  runtime_validate_directory_without_extended_attributes "${STORAGE_ROOT}/secrets" "Secrets root" ||
+    return 1
   runtime_validate_directory_or_missing "$RUNTIME_ROOT" "Runtime path" || return 1
   runtime_validate_directory_or_missing "$ARCHIVE_ROOT" "Archive path" || return 1
   runtime_validate_directory_or_missing \
@@ -3196,6 +3846,10 @@ runtime_validate_configuration() {
     LAST_ERROR="Runtime and archive parent directories must already exist."
     return 1
   fi
+  runtime_validate_directory_without_extended_attributes "$runtime_parent" "Runtime parent" ||
+    return 1
+  runtime_validate_directory_without_extended_attributes "$archive_parent" "Archive parent" ||
+    return 1
   runtime_validate_lock_parent "$lock_parent" || return 1
   if runtime_privileged test -L "$RUNTIME_LOCK_FILE" ||
     { runtime_privileged test -e "$RUNTIME_LOCK_FILE" &&
@@ -3493,45 +4147,196 @@ gateway_worker_is_running() {
   [ "$state" = "running" ]
 }
 
-stop_gateway_worker() {
-  local state
+runtime_gateway_worker_running_ids_by_label() {
+  local ids id count=0
 
-  if ! gateway_compose stop "$GATEWAY_SERVICE" >/dev/null 2>&1; then
-    LAST_ERROR="Gateway wechat-worker stop command failed."
+  if ! ids="$(runtime_docker ps \
+    --filter "label=com.docker.compose.project=${GATEWAY_PROJECT_NAME}" \
+    --filter "label=com.docker.compose.service=${GATEWAY_SERVICE}" \
+    --format '{{.ID}}' 2>/dev/null)"; then
+    LAST_ERROR="Gateway wechat-worker labelled container inventory failed."
     return 1
   fi
+  while IFS= read -r id; do
+    [ -n "$id" ] || continue
+    if ! [[ "$id" =~ ^[0-9a-f]{12,64}$ ]]; then
+      LAST_ERROR="Gateway wechat-worker labelled container inventory was malformed."
+      return 1
+    fi
+    count=$((count + 1))
+    if [ "$count" -gt 32 ]; then
+      LAST_ERROR="Gateway wechat-worker labelled container inventory exceeded its safety limit."
+      return 1
+    fi
+    printf '%s\n' "$id"
+  done <<< "$ids"
+}
+
+runtime_gateway_worker_is_strictly_stopped() {
+  local state labelled_ids
+
   if ! state="$(gateway_worker_state)"; then
-    LAST_ERROR="Gateway wechat-worker state could not be queried after stop."
+    LAST_ERROR="Gateway wechat-worker stopped state could not be proved through Compose."
     return 1
   fi
   if [ "$state" != "stopped" ]; then
-    LAST_ERROR="Gateway wechat-worker did not stop."
+    LAST_ERROR="Gateway wechat-worker became active before authorized fresh-runtime release."
     return 1
   fi
+  if ! labelled_ids="$(runtime_gateway_worker_running_ids_by_label)"; then
+    return 1
+  fi
+  if [ -n "$labelled_ids" ]; then
+    LAST_ERROR="A labelled Gateway wechat-worker became active before authorized fresh-runtime release."
+    return 1
+  fi
+  # Read by start-qr-login.sh after this shared lifecycle operation returns.
+  # shellcheck disable=SC2034
+  WORKER_STOP_CONFIRMED=1
+}
+
+runtime_gateway_worker_stop_target_is_exact() {
+  local container_id="$1" expected_running="$2" metadata
+
+  if ! metadata="$(runtime_docker inspect --format \
+    '{{index .Config.Labels "com.docker.compose.project"}}|{{index .Config.Labels "com.docker.compose.service"}}|{{.State.Running}}' \
+    "$container_id" 2>/dev/null)"; then
+    LAST_ERROR="Gateway wechat-worker direct-stop target could not be inspected."
+    return 1
+  fi
+  if [ "$metadata" != \
+    "${GATEWAY_PROJECT_NAME}|${GATEWAY_SERVICE}|${expected_running}" ]; then
+    LAST_ERROR="Gateway wechat-worker direct-stop target labels or state were not exact."
+    return 1
+  fi
+}
+
+runtime_stop_gateway_worker_direct() {
+  local ids_output remaining container_id
+  local -a container_ids=()
+
+  if ! ids_output="$(runtime_gateway_worker_running_ids_by_label)"; then
+    return 1
+  fi
+  if [ -n "$ids_output" ]; then
+    mapfile -t container_ids <<< "$ids_output"
+  fi
+  ids_output=""
+  for container_id in "${container_ids[@]}"; do
+    runtime_gateway_worker_stop_target_is_exact \
+      "$container_id" true || return 1
+  done
+  if [ "${#container_ids[@]}" -gt 0 ] &&
+    ! runtime_docker stop --time 10 "${container_ids[@]}" >/dev/null 2>&1; then
+    LAST_ERROR="Direct Docker stop of labelled Gateway wechat-worker containers failed."
+    return 1
+  fi
+  for container_id in "${container_ids[@]}"; do
+    runtime_gateway_worker_stop_target_is_exact \
+      "$container_id" false || return 1
+  done
+  if ! remaining="$(runtime_gateway_worker_running_ids_by_label)"; then
+    return 1
+  fi
+  if [ -n "$remaining" ]; then
+    LAST_ERROR="Labelled Gateway wechat-worker containers remain running after direct stop."
+    return 1
+  fi
+}
+
+stop_gateway_worker() {
+  local state remaining
+
+  if gateway_compose stop "$GATEWAY_SERVICE" >/dev/null 2>&1 &&
+    state="$(gateway_worker_state)" && [ "$state" = "stopped" ] &&
+    remaining="$(runtime_gateway_worker_running_ids_by_label)" &&
+    [ -z "$remaining" ]; then
+    return 0
+  fi
+  if runtime_stop_gateway_worker_direct; then
+    return 0
+  fi
+  LAST_ERROR="Gateway wechat-worker stop could not be confirmed by Compose or exact-label Docker fallback."
+  return 1
+}
+
+guard_gateway_worker_stopped() {
+  local observed_error
+
+  if runtime_gateway_worker_is_strictly_stopped; then
+    return 0
+  fi
+  observed_error="$LAST_ERROR"
+  if stop_gateway_worker; then
+    # Read by start-qr-login.sh after this shared lifecycle operation returns.
+    # shellcheck disable=SC2034
+    WORKER_STOP_CONFIRMED=1
+    LAST_ERROR="$observed_error It was stopped, and the fresh QR flow was aborted."
+  else
+    # shellcheck disable=SC2034
+    WORKER_STOP_CONFIRMED=0
+    LAST_ERROR="$observed_error Immediate Gateway wechat-worker stop could not be confirmed."
+  fi
+  return 1
 }
 
 rollback_gateway_worker_after_start_failure() {
   local original_error="$1"
 
   if stop_gateway_worker; then
-    GATEWAY_WORKER_IMMEDIATE_ROLLBACK_STATUS="confirmed_stopped"
     WORKER_STOP_CONFIRMED=1
     LAST_ERROR="$original_error"
   else
-    GATEWAY_WORKER_IMMEDIATE_ROLLBACK_STATUS="unconfirmed"
     WORKER_STOP_CONFIRMED=0
     LAST_ERROR="$original_error Immediate Gateway wechat-worker rollback could not be confirmed."
   fi
   return 0
 }
 
+prepare_gateway_worker_candidate() {
+  local original_error
+
+  GATEWAY_WORKER_CONTAINER_ID=""
+  if ! guard_gateway_worker_stopped; then
+    return 1
+  fi
+  if ! runtime_gateway_gate_assert_pending; then
+    return 1
+  fi
+  if ! gateway_compose create --force-recreate --no-deps \
+    "$GATEWAY_SERVICE" >/dev/null 2>&1; then
+    original_error="Gateway wechat-worker stopped candidate could not be created."
+    rollback_gateway_worker_after_start_failure "$original_error"
+    return 1
+  fi
+  if ! runtime_attest_gateway_worker_container created; then
+    original_error="$LAST_ERROR"
+    rollback_gateway_worker_after_start_failure "$original_error"
+    return 1
+  fi
+  WORKER_STOP_CONFIRMED=1
+}
+
 start_gateway_worker() {
   local state original_error
+  local expected_id="$GATEWAY_WORKER_CONTAINER_ID"
 
+  if [ "$GATEWAY_GATE_BEGUN" -ne 1 ] ||
+    [ "$GATEWAY_GATE_RELEASED" -ne 1 ] ||
+    ! runtime_gateway_generation_id_is_valid "$GATEWAY_GENERATION_ID" ||
+    ! runtime_gateway_generation_id_is_valid "$ATTESTED_AGENT_CONTAINER_ID" ||
+    ! runtime_gateway_generation_id_is_valid "$expected_id"; then
+    LAST_ERROR="Gateway worker cannot start without an exact released runtime generation."
+    return 1
+  fi
+  if ! runtime_attest_gateway_worker_container created "$expected_id"; then
+    return 1
+  fi
+
+  # Read by start-qr-login.sh after this shared lifecycle operation returns.
+  # shellcheck disable=SC2034
   WORKER_STOP_CONFIRMED=0
-  GATEWAY_WORKER_IMMEDIATE_ROLLBACK_STATUS="pending"
-
-  if ! gateway_compose up -d --no-deps "$GATEWAY_SERVICE" \
+  if ! gateway_compose start "$GATEWAY_SERVICE" \
     >/dev/null 2>&1; then
     original_error="Gateway wechat-worker start command failed."
     rollback_gateway_worker_after_start_failure "$original_error"
@@ -3552,17 +4357,27 @@ start_gateway_worker() {
     rollback_gateway_worker_after_start_failure "$original_error"
     return 1
   fi
-  if ! runtime_attest_gateway_worker_container; then
+  if ! runtime_attest_gateway_worker_container running "$expected_id"; then
     original_error="$LAST_ERROR"
     rollback_gateway_worker_after_start_failure "$original_error"
     return 1
   fi
-  if ! wait_for_gateway_worker_health; then
+  if ! wait_for_gateway_worker_health "$expected_id"; then
     original_error="$LAST_ERROR"
     rollback_gateway_worker_after_start_failure "$original_error"
     return 1
   fi
-  GATEWAY_WORKER_IMMEDIATE_ROLLBACK_STATUS="not_required"
+  if ! runtime_verify_gateway_contract; then
+    original_error="$LAST_ERROR"
+    rollback_gateway_worker_after_start_failure "$original_error"
+    return 1
+  fi
+  if ! runtime_attest_gateway_worker_container \
+    running "$expected_id"; then
+    original_error="$LAST_ERROR"
+    rollback_gateway_worker_after_start_failure "$original_error"
+    return 1
+  fi
 }
 
 container_health_status() {
@@ -3574,7 +4389,17 @@ container_health_status() {
 }
 
 gateway_worker_heartbeat_is_healthy() {
+  local expected_worker_id="${1:-}"
   local checker_status checker_sha
+
+  if [ "$GATEWAY_GATE_BEGUN" -ne 1 ] ||
+    [ "$GATEWAY_GATE_RELEASED" -ne 1 ] ||
+    ! runtime_gateway_generation_id_is_valid "$GATEWAY_GENERATION_ID" ||
+    ! runtime_gateway_generation_id_is_valid "$ATTESTED_AGENT_CONTAINER_ID" ||
+    ! runtime_gateway_generation_id_is_valid "$expected_worker_id"; then
+    LAST_ERROR="Gateway heartbeat checker requires an exact released runtime-generation binding."
+    return 1
+  fi
 
   checker_sha="$GATEWAY_CHECKER_SHA256"
   if [ "$CF_AGENT_WECHAT_TESTING" = "1" ]; then
@@ -3587,8 +4412,11 @@ gateway_worker_heartbeat_is_healthy() {
     return 1
   fi
 
-  if runtime_gateway_checker_snapshot \
-    "$WORKER_HEARTBEAT_TIMEOUT" execute "$checker_sha"; then
+  if runtime_gateway_write_request checker "$GATEWAY_GENERATION_ID" \
+      "$ATTESTED_AGENT_CONTAINER_ID" "$expected_worker_id" |
+    runtime_gateway_checker_snapshot \
+      "$GATEWAY_RUNTIME_COMMAND_TIMEOUT" execute \
+      "$checker_sha" stdin-json >/dev/null 2>&1; then
     return 0
   else
     checker_status=$?
@@ -3611,24 +4439,41 @@ gateway_worker_heartbeat_is_healthy() {
 }
 
 wait_for_gateway_worker_health() {
-  local started_at=$SECONDS container_id first_id="" health
+  local expected_id="${1:-}"
+  local started_at=$SECONDS container_id health
+
+  [ -n "$expected_id" ] || {
+    LAST_ERROR="Gateway wechat-worker attested identity is unavailable."
+    return 1
+  }
 
   while [ "$((SECONDS - started_at))" -lt "$WORKER_READY_TIMEOUT" ]; do
+    container_id=""
     if container_id="$(gateway_compose ps --status running --quiet \
-      "$GATEWAY_SERVICE" 2>/dev/null)" &&
-      [ -n "$container_id" ] &&
-      [ "${container_id//$'\n'/}" = "$container_id" ] &&
+      "$GATEWAY_SERVICE" 2>/dev/null)"; then
+      if [ -n "$container_id" ] && [ "$container_id" != "$expected_id" ]; then
+        LAST_ERROR="Gateway wechat-worker instance identity changed during stability verification."
+        return 1
+      fi
+    fi
+    if [ "$container_id" = "$expected_id" ] &&
       health="$(container_health_status "$container_id")" &&
       [ "$health" = "healthy" ] &&
-      gateway_worker_heartbeat_is_healthy; then
-      first_id="$container_id"
+      gateway_worker_heartbeat_is_healthy "$expected_id"; then
       sleep "$WORKER_STABLE_SECONDS"
       if container_id="$(gateway_compose ps --status running --quiet \
-        "$GATEWAY_SERVICE" 2>/dev/null)" &&
-        [ "$container_id" = "$first_id" ] &&
+        "$GATEWAY_SERVICE" 2>/dev/null)"; then
+        if [ -n "$container_id" ] && [ "$container_id" != "$expected_id" ]; then
+          LAST_ERROR="Gateway wechat-worker instance identity changed during stability verification."
+          return 1
+        fi
+      else
+        container_id=""
+      fi
+      if [ "$container_id" = "$expected_id" ] &&
         health="$(container_health_status "$container_id")" &&
         [ "$health" = "healthy" ] &&
-        gateway_worker_heartbeat_is_healthy; then
+        gateway_worker_heartbeat_is_healthy "$expected_id"; then
         return 0
       fi
     fi
@@ -3752,12 +4597,38 @@ cleanup_failed_agent_container() {
   return "$cleanup_failed"
 }
 
+create_agent_container_candidate() {
+  local state
+
+  ATTESTED_AGENT_CONTAINER_ID=""
+  if ! agent_compose up --no-start --force-recreate --no-deps agent-wechat \
+    >/dev/null 2>&1; then
+    LAST_ERROR="agent-wechat stopped candidate creation failed."
+    return 1
+  fi
+  if ! state="$(agent_container_state)"; then
+    LAST_ERROR="agent-wechat candidate state could not be queried."
+    return 1
+  fi
+  if [ "$state" != "stopped" ]; then
+    LAST_ERROR="agent-wechat candidate must remain stopped before Archive mutation."
+    return 1
+  fi
+  runtime_attest_actual_agent_container created || return 1
+}
+
 start_agent_container() {
   local state
 
-  if ! agent_compose up -d --force-recreate --no-deps agent-wechat \
+  if [ -z "$ATTESTED_AGENT_CONTAINER_ID" ]; then
+    LAST_ERROR="A stopped attested agent-wechat candidate is required before start."
+    return 1
+  fi
+  runtime_attest_actual_agent_container \
+    created "$ATTESTED_AGENT_CONTAINER_ID" || return 1
+  if ! runtime_docker start "$ATTESTED_AGENT_CONTAINER_ID" \
     >/dev/null 2>&1; then
-    LAST_ERROR="agent-wechat start command failed."
+    LAST_ERROR="The attested agent-wechat candidate start command failed."
     return 1
   fi
   if ! state="$(agent_container_state)"; then
@@ -3768,7 +4639,8 @@ start_agent_container() {
     LAST_ERROR="agent-wechat did not reach running state."
     return 1
   fi
-  runtime_attest_actual_agent_container || return 1
+  runtime_attest_actual_agent_container \
+    running "$ATTESTED_AGENT_CONTAINER_ID" || return 1
 }
 
 wait_for_agent_health() {
@@ -3845,4 +4717,6 @@ wait_for_stable_wechat_process() {
 }
 
 CF_AGENT_WECHAT_RUNTIME_COMMON_LOADED=1
+# Read by scripts that source this shared library.
+# shellcheck disable=SC2034
 readonly CF_AGENT_WECHAT_RUNTIME_COMMON_LOADED

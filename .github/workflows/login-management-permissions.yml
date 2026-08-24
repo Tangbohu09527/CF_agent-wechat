@@ -21,7 +21,7 @@ jobs:
       - name: Install required validation tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y shellcheck python3-venv
+          sudo apt-get install -y acl shellcheck python3-venv
 
       - name: Check Bash syntax
         shell: bash
@@ -87,7 +87,7 @@ jobs:
       - name: Install Bootstrap prerequisites
         run: |
           sudo apt-get update
-          sudo apt-get install -y python3-venv
+          sudo apt-get install -y acl python3-venv
       - name: Run ordinary-user staged Bootstrap tests
         env:
           CF_REQUIRE_BOOTSTRAP_DEPLOYMENT_TEST: "1"
@@ -107,6 +107,70 @@ jobs:
         run: >-
           sudo env GITHUB_ACTIONS=true CF_AGENT_WECHAT_PERMISSION_TEST=1
           bash tests/integration/login_management_permissions.sh
+
+  dependency-lock-platforms:
+    name: >-
+      Lock check and target-only wheel download
+      (CPython ${{ matrix.python-version }}, ${{ matrix.target-platform }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+        target-platform:
+          - manylinux_2_28_x86_64
+          - manylinux_2_28_aarch64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select the approved GIL-enabled CPython runtime
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Validate the dependency lock on CPython
+        run: |
+          python -I -B scripts/verify_login_dependencies.py validate-runtime
+          python -I -B scripts/verify_login_dependencies.py \
+            validate-lock scripts/requirements.txt > /dev/null
+
+      - name: Resolve hash-locked target wheels without executing them
+        shell: bash
+        env:
+          TARGET_PLATFORM: ${{ matrix.target-platform }}
+          TARGET_PYTHON: ${{ matrix.python-version }}
+          PIP_CONFIG_FILE: /dev/null
+          PIP_DISABLE_PIP_VERSION_CHECK: "1"
+          PIP_NO_CACHE_DIR: "1"
+          PIP_NO_INPUT: "1"
+        run: |
+          target_abi="cp${TARGET_PYTHON/./}"
+          destination="${RUNNER_TEMP}/locked-wheels"
+          mkdir -p -- "$destination"
+          timeout --signal=TERM --kill-after=5s 120s \
+            python -I -B -m pip download \
+              --require-hashes \
+              --only-binary=:all: \
+              --no-deps \
+              --retries 2 \
+              --timeout 15 \
+              --implementation cp \
+              --python-version "$TARGET_PYTHON" \
+              --abi "$target_abi" \
+              --platform "$TARGET_PLATFORM" \
+              --dest "$destination" \
+              --requirement scripts/requirements.txt
+          mapfile -d '' artifacts < <(
+            find "$destination" -maxdepth 1 -type f -print0
+          )
+          [ "${#artifacts[@]}" -eq 3 ]
+          for artifact in "${artifacts[@]}"; do
+            case "$artifact" in
+              *.whl) ;;
+              *) exit 1 ;;
+            esac
+          done
 
   compose-render:
     name: Real production Compose render

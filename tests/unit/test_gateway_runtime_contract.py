@@ -47,6 +47,8 @@ class GatewayRuntimeContractTests(unittest.TestCase):
             '-${GATEWAY_PROJECT_DIR}/.env}"',
             'GATEWAY_HEARTBEAT_COMMAND="${GATEWAY_PROJECT_DIR}/'
             'deploy/check-wechat-worker-heartbeat"',
+            'GATEWAY_RELEASE_GATE_COMMAND="${GATEWAY_PROJECT_DIR}/'
+            'deploy/wechat-runtime-release-gate"',
             'GATEWAY_CONTRACT_FILE="${GATEWAY_PROJECT_DIR}/'
             'deploy/wechat-runtime-contract.json"',
             'GATEWAY_SERVICE="worker"',
@@ -114,6 +116,110 @@ class GatewayRuntimeContractTests(unittest.TestCase):
             verifier.group("body"),
         )
 
+    def test_worker_is_guarded_during_qr_and_at_every_release_boundary(
+        self,
+    ) -> None:
+        strict = re.search(
+            r"runtime_gateway_worker_is_strictly_stopped\(\) "
+            r"\{(?P<body>.*?)\n\}",
+            self.content,
+            re.DOTALL,
+        )
+        guard = re.search(
+            r"guard_gateway_worker_stopped\(\) \{(?P<body>.*?)\n\}",
+            self.content,
+            re.DOTALL,
+        )
+        pending_guard = re.search(
+            r"guard_gateway_worker_and_generation_pending\(\) "
+            r"\{(?P<body>.*?)\n\}",
+            self.start_content,
+            re.DOTALL,
+        )
+        prepare_worker = re.search(
+            r"prepare_gateway_worker_candidate\(\) "
+            r"\{(?P<body>.*?)\n\}",
+            self.content,
+            re.DOTALL,
+        )
+        start_worker = re.search(
+            r"start_gateway_worker\(\) \{(?P<body>.*?)\n\}",
+            self.content,
+            re.DOTALL,
+        )
+        forced_login = re.search(
+            r"run_forced_login\(\) \{(?P<body>.*?)\n\}",
+            self.start_content,
+            re.DOTALL,
+        )
+        for match in (
+            strict,
+            guard,
+            pending_guard,
+            prepare_worker,
+            start_worker,
+            forced_login,
+        ):
+            self.assertIsNotNone(match)
+
+        self.assertIn("gateway_worker_state", strict.group("body"))
+        self.assertIn(
+            "runtime_gateway_worker_running_ids_by_label",
+            strict.group("body"),
+        )
+        self.assertIn("stop_gateway_worker", guard.group("body"))
+        self.assertIn("fresh QR flow was aborted", guard.group("body"))
+        self.assertIn(
+            "guard_gateway_worker_stopped", pending_guard.group("body")
+        )
+        self.assertIn(
+            "runtime_gateway_gate_assert_pending", pending_guard.group("body")
+        )
+
+        login_body = forced_login.group("body")
+        self.assertIn(
+            '"${LOGIN_PYTHON_COMMAND[@]}" "${login_arguments[@]}" &',
+            login_body,
+        )
+        self.assertIn('while kill -0 "$login_pid"', login_body)
+        self.assertIn('kill "$login_pid"', login_body)
+        self.assertIn('QR_LOGIN_HELPER_PID="$login_pid"', login_body)
+        self.assertIn('kill "$QR_LOGIN_HELPER_PID"', self.start_content)
+        self.assertIn('wait "$QR_LOGIN_HELPER_PID"', self.start_content)
+        self.assertGreaterEqual(
+            login_body.count("guard_gateway_worker_and_generation_pending"), 4
+        )
+
+        prepare_body = prepare_worker.group("body")
+        self.assertLess(
+            prepare_body.index("guard_gateway_worker_stopped"),
+            prepare_body.index("gateway_compose create"),
+        )
+        start_body = start_worker.group("body")
+        self.assertLess(
+            start_body.index("GATEWAY_GATE_RELEASED"),
+            start_body.index(
+                'runtime_attest_gateway_worker_container created "$expected_id"'
+            ),
+        )
+        self.assertLess(
+            start_body.index(
+                'runtime_attest_gateway_worker_container created "$expected_id"'
+            ),
+            start_body.index("gateway_compose start"),
+        )
+        phases = (
+            "guard_worker_before_archive",
+            "guard_worker_before_agent_start",
+            "guard_worker_before_qr",
+            "guard_worker_before_runtime_validation",
+            "guard_worker_before_final_attestation",
+            "guard_worker_before_gateway_release",
+            "guard_worker_at_release",
+        )
+        positions = [self.start_content.index(phase) for phase in phases]
+        self.assertEqual(positions, sorted(positions))
+
     def test_shell_supplies_producer_pins_and_rendered_compose_stdin(self) -> None:
         verifier = re.search(
             r"runtime_verify_gateway_contract\(\) \{(?P<body>.*?)\n\}",
@@ -136,19 +242,37 @@ class GatewayRuntimeContractTests(unittest.TestCase):
         )
         self.assertIn('checker_sha="$GATEWAY_CHECKER_SHA256"', function)
         self.assertIn('--checker-sha256 "$checker_sha"', runner_function)
+        self.assertIn('--gate "$GATEWAY_RELEASE_GATE_COMMAND"', runner_function)
+        self.assertIn('--gate-sha256 "$gate_sha"', runner_function)
         self.assertIn("gateway_compose config --format json", function)
-        self.assertIn(
-            'runtime_execute_gateway_contract_verifier "$checker_sha" compose',
-            function,
-        )
+        self.assertIn("runtime_execute_gateway_contract_verifier \\", function)
+        self.assertIn('"$checker_sha" "$gate_sha" compose', function)
         for fragment in (
             '"producer"',
             '"checkerSha256"',
+            '"releaseGateSha256"',
+            '"checkerRequest"',
+            '"releaseGate"',
             '"tokenAuthority"',
             '"credential"',
             'choices=("compose", "worker-inspect")',
         ):
             self.assertIn(fragment, self.verifier_content)
+
+    def test_verifier_requires_explicit_release_gate_pins(self) -> None:
+        for fragment in (
+            'parser.add_argument("--gate", required=True)',
+            'parser.add_argument("--gate-sha256", required=True)',
+            'arguments.gate_sha256',
+            '"releaseGateSha256"',
+            '"command": arguments.gate',
+            '"inputTransport": "stdin-json"',
+            '"generationId": "lowercase-hex-64"',
+            '"workerContainerBinding": "exact-stopped-candidate"',
+            '"requiresExactCurrentRelease": True',
+        ):
+            with self.subTest(fragment=fragment):
+                self.assertIn(fragment, self.verifier_content)
 
     def test_contract_pins_credential_checker_and_boot_policy(
         self,
@@ -161,6 +285,13 @@ class GatewayRuntimeContractTests(unittest.TestCase):
             '"producerLinuxProof": "required"',
             '"restartPolicy": "no"',
             '"bootPolicy": "manual-after-fresh-qr"',
+            '"releaseGateSha256"',
+            '"checkerRequest"',
+            '"releaseGate"',
+            '"hardTimeoutSeconds": 10',
+            '"silentOutput": True',
+            '"assert-pending"',
+            '"invalidatesPreviousReleases": True',
             'service.get("restart") != "no"',
             'restart_policy.get("Name") != "no"',
             'restart_policy.get("MaximumRetryCount") != 0',
@@ -180,6 +311,14 @@ class GatewayRuntimeContractTests(unittest.TestCase):
             "lifecycle.restartPolicy=no",
             "HostConfig.RestartPolicy",
             "bootPolicy=manual-after-fresh-qr",
+            "producer-enforced generation/release",
+            "releaseGateSha256",
+            "wechat-runtime-release-gate",
+            "assert-pending",
+            "exact-stopped-candidate",
+            "checkerRequest",
+            "stdin JSON",
+            "stale release",
             "Docker daemon restart 与 Debian reboot",
             "Docker Swarm",
             "Kubernetes",
@@ -196,6 +335,7 @@ class GatewayRuntimeContractTests(unittest.TestCase):
             "GATEWAY_PRODUCER_REPOSITORY",
             "GATEWAY_COMPATIBLE_COMMIT",
             "GATEWAY_CHECKER_SHA256",
+            "GATEWAY_RELEASE_GATE_SHA256",
         )
         for name in names:
             pattern = rf'^{name}=(?:"([^"]*)"|([0-9]+))$'
@@ -322,9 +462,11 @@ class GatewayRuntimeContractTests(unittest.TestCase):
             function,
         )
         self.assertIn(
-            '"$WORKER_HEARTBEAT_TIMEOUT" execute "$checker_sha"',
+            '"$GATEWAY_RUNTIME_COMMAND_TIMEOUT" execute',
             function,
         )
+        self.assertIn("runtime_gateway_write_request checker", function)
+        self.assertIn('"$checker_sha" stdin-json', function)
         self.assertIn("runtime_capture_gateway_checker_digest", function)
         self.assertNotIn('"$GATEWAY_HEARTBEAT_COMMAND"', function)
         self.assertNotIn("runtime_privileged", function)
@@ -375,9 +517,21 @@ class GatewayRuntimeContractTests(unittest.TestCase):
         )
         self.assertIsNotNone(runner)
         runner_body = runner.group("body")
-        self.assertIn('"$GATEWAY_PROJECT_DIR"', runner_body)
-        self.assertIn("/usr/bin/env -i", runner_body)
-        self.assertIn('"$PYTHON_BIN" -I -c', runner_body)
+        executor = re.search(
+            r"runtime_gateway_executable_snapshot\(\) \{"
+            r"(?P<body>.*?)\n\}",
+            self.content,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(executor)
+        executor_body = executor.group("body")
+        self.assertIn("runtime_gateway_executable_snapshot", runner_body)
+        self.assertIn(
+            'checker "$GATEWAY_HEARTBEAT_COMMAND"', runner_body
+        )
+        self.assertIn('"$GATEWAY_PROJECT_DIR"', executor_body)
+        self.assertIn("/usr/bin/env -i", executor_body)
+        self.assertIn('"$PYTHON_BIN" -I -c', executor_body)
         self.assertNotIn("runtime_privileged", runner_body)
         self.assertNotIn("sudo", runner_body)
 
@@ -433,14 +587,26 @@ class GatewayRuntimeContractTests(unittest.TestCase):
         )
         self.assertIsNotNone(start)
         body = start.group("body")
-        self.assertEqual(
-            body.count(
-                'rollback_gateway_worker_after_start_failure "$original_error"'
-            ),
-            6,
+        rollback_call = (
+            'rollback_gateway_worker_after_start_failure "$original_error"'
         )
+        failure_assignments = list(
+            re.finditer(r"^    original_error=", body, re.MULTILINE)
+        )
+        self.assertEqual(len(failure_assignments), 8)
+        self.assertEqual(body.count(rollback_call), len(failure_assignments))
+        for index, assignment in enumerate(failure_assignments):
+            branch_end = body.find("    return 1", assignment.start())
+            with self.subTest(failure_branch=index + 1):
+                self.assertNotEqual(branch_end, -1)
+                branch = body[assignment.start():branch_end]
+                self.assertIn(
+                    rollback_call,
+                    branch,
+                    "each Worker start failure must rollback immediately",
+                )
         for gate in (
-            "gateway_compose up",
+            "gateway_compose start",
             "gateway_worker_state",
             "runtime_verify_gateway_contract",
             "runtime_attest_gateway_worker_container",
@@ -481,12 +647,13 @@ class GatewayRuntimeContractTests(unittest.TestCase):
             '"$GATEWAY_CONTRACT_VERIFIER" "Gateway contract verifier"',
             self.status_content,
         )
-        self.assertEqual(
-            self.content.count(
-                'runtime_execute_gateway_contract_verifier "$checker_sha"'
-            ),
-            2,
+        verifier_calls = re.findall(
+            r"runtime_execute_gateway_contract_verifier \\\n"
+            r'\s+"\$checker_sha" "\$gate_sha" '
+            r"(compose|worker-inspect)",
+            self.content,
         )
+        self.assertCountEqual(verifier_calls, ("compose", "worker-inspect"))
         self.assertNotIn(
             '"$PYTHON_BIN" -I "$GATEWAY_CONTRACT_VERIFIER"',
             self.content,

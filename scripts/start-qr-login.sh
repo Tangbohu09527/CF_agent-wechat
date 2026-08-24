@@ -41,6 +41,7 @@ for _management_env_name in \
     CF_AGENT_WECHAT_TEST_ROOT \
     CF_AGENT_WECHAT_TEST_GATEWAY_VERIFIER_REPLACEMENT \
     CF_AGENT_WECHAT_TEST_GATEWAY_CHECKER_REPLACEMENT \
+    CF_AGENT_WECHAT_TEST_GATEWAY_GATE_REPLACEMENT \
     CF_AGENT_WECHAT_TOKEN CF_AGENT_WECHAT_TOKEN_FILE AUTH_TOKEN \
     CF_AGENT_WECHAT_TEST_PIP_INSTALL_TIMEOUT \
     CF_AGENT_WECHAT_TEST_PIP_NETWORK_TIMEOUT \
@@ -62,7 +63,7 @@ for _management_env_name in \
     if [ "${CF_AGENT_WECHAT_TESTING:-0}" != "1" ]; then
       unset "$_management_env_name"
     else
-      export -n "$_management_env_name" 2>/dev/null || :
+      export -n "${_management_env_name?}" 2>/dev/null || :
       case "$_management_env_name" in
         AUTH_TOKEN|CF_AGENT_WECHAT_TOKEN|PROXY|HTTP_PROXY|HTTPS_PROXY|ALL_PROXY|http_proxy|https_proxy|all_proxy|NO_PROXY|no_proxy)
           unset "$_management_env_name"
@@ -276,7 +277,9 @@ DRY_RUN=0
 FLOW_COMPLETE=0
 WORKER_GUARD=0
 WORKER_STOP_CONFIRMED=0
+QR_LOGIN_HELPER_PID=""
 AGENT_CLEANUP_GUARD=0
+CANDIDATE_TEMP_RUNTIME=0
 AGENT_FAILURE_CLEANUP_ATTEMPTED=false
 AGENT_FAILURE_CLEANUP_STOP_RESULT="not_attempted"
 AGENT_FAILURE_CLEANUP_REMOVE_RESULT="not_attempted"
@@ -653,11 +656,23 @@ PY
 on_exit() {
   local exit_status=$?
   local ended_at original_last_error preserved_archive=""
-  local agent_cleanup_failed=0 manifest_write_failed=0
+  local agent_cleanup_failed=0 manifest_write_failed=0 temp_runtime_cleanup_failed=0
+  local gate_abort_failed=0
 
   trap - EXIT
   set +e
   original_last_error="${LAST_ERROR:-}"
+  if [ -n "$QR_LOGIN_HELPER_PID" ]; then
+    kill "$QR_LOGIN_HELPER_PID" 2>/dev/null || :
+    wait "$QR_LOGIN_HELPER_PID" 2>/dev/null || :
+    QR_LOGIN_HELPER_PID=""
+  fi
+  if [ "$DRY_RUN" -eq 0 ] && [ "$FLOW_COMPLETE" -eq 0 ] &&
+    [ "$GATEWAY_GATE_BEGUN" -eq 1 ]; then
+    if ! runtime_gateway_gate_abort >/dev/null 2>&1; then
+      gate_abort_failed=1
+    fi
+  fi
   if [ "$DRY_RUN" -eq 0 ] && [ "$FLOW_COMPLETE" -eq 0 ] &&
     [ "$WORKER_GUARD" -eq 1 ]; then
     if stop_gateway_worker >/dev/null 2>&1; then
@@ -670,6 +685,12 @@ on_exit() {
     [ "$AGENT_CLEANUP_GUARD" -eq 1 ]; then
     if ! cleanup_failed_agent_container; then
       agent_cleanup_failed=1
+    fi
+  fi
+  if [ "$DRY_RUN" -eq 0 ] && [ "$FLOW_COMPLETE" -eq 0 ] &&
+    [ "$CANDIDATE_TEMP_RUNTIME" -eq 1 ]; then
+    if ! remove_temporary_candidate_runtime; then
+      temp_runtime_cleanup_failed=1
     fi
   fi
   if [ "$DRY_RUN" -eq 0 ] && [ "$FLOW_COMPLETE" -eq 0 ] &&
@@ -705,8 +726,14 @@ on_exit() {
         error "Failed-flow agent-wechat cleanup encountered errors (stop: ${AGENT_FAILURE_CLEANUP_STOP_RESULT}; remove: ${AGENT_FAILURE_CLEANUP_REMOVE_RESULT})."
       fi
     fi
+    if [ "$temp_runtime_cleanup_failed" -eq 1 ]; then
+      error "Temporary candidate Runtime cleanup failed; inspect it before retrying."
+    fi
     if [ "$manifest_write_failed" -eq 1 ]; then
       error "The failed-flow manifest could not be updated with cleanup results."
+    fi
+    if [ "$gate_abort_failed" -eq 1 ]; then
+      error "Gateway runtime generation revocation could not be confirmed; keep the Worker stopped and repair the published release gate before retrying."
     fi
   fi
   exit "$exit_status"
@@ -865,14 +892,17 @@ staging_pattern = re.compile(
     re.ASCII,
 )
 root_fd = -1
+staging_fd = -1
 moved = False
 try:
     if not final_pattern.fullmatch(final_name):
         raise OSError
     if not staging_pattern.fullmatch(staging_name):
         raise OSError
-    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
-    flags |= getattr(os, "O_NOFOLLOW", 0)
+    required_flags = ("O_DIRECTORY", "O_NOFOLLOW", "O_CLOEXEC")
+    if any(not hasattr(os, name) for name in required_flags):
+        raise OSError
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
     root_fd = os.open(root, flags)
     root_metadata = os.fstat(root_fd)
     if (
@@ -881,11 +911,49 @@ try:
         or stat.S_IMODE(root_metadata.st_mode) != 0o700
     ):
         raise OSError
+    if os.listxattr(root_fd):
+        raise OSError
+    root_after_xattrs = os.fstat(root_fd)
+    if (
+        root_after_xattrs.st_dev,
+        root_after_xattrs.st_ino,
+        root_after_xattrs.st_ctime_ns,
+    ) != (
+        root_metadata.st_dev,
+        root_metadata.st_ino,
+        root_metadata.st_ctime_ns,
+    ):
+        raise OSError
     staging = os.stat(staging_name, dir_fd=root_fd, follow_symlinks=False)
     if (
         not stat.S_ISDIR(staging.st_mode)
         or (staging.st_uid, staging.st_gid) != expected
         or stat.S_IMODE(staging.st_mode) != 0o700
+    ):
+        raise OSError
+    staging_fd = os.open(staging_name, flags, dir_fd=root_fd)
+    opened_staging = os.fstat(staging_fd)
+    if (
+        opened_staging.st_dev,
+        opened_staging.st_ino,
+        opened_staging.st_ctime_ns,
+    ) != (
+        staging.st_dev,
+        staging.st_ino,
+        staging.st_ctime_ns,
+    ):
+        raise OSError
+    if os.listxattr(staging_fd):
+        raise OSError
+    staging_after_xattrs = os.fstat(staging_fd)
+    if (
+        staging_after_xattrs.st_dev,
+        staging_after_xattrs.st_ino,
+        staging_after_xattrs.st_ctime_ns,
+    ) != (
+        opened_staging.st_dev,
+        opened_staging.st_ino,
+        opened_staging.st_ctime_ns,
     ):
         raise OSError
     try:
@@ -896,6 +964,12 @@ try:
         raise OSError
     os.rename(staging_name, final_name, src_dir_fd=root_fd, dst_dir_fd=root_fd)
     moved = True
+    archived = os.stat(final_name, dir_fd=root_fd, follow_symlinks=False)
+    if (archived.st_dev, archived.st_ino) != (
+        opened_staging.st_dev,
+        opened_staging.st_ino,
+    ):
+        raise OSError
     os.fsync(root_fd)
 except OSError:
     if moved and root_fd >= 0:
@@ -915,6 +989,8 @@ except OSError:
             pass
     raise SystemExit(1)
 finally:
+    if staging_fd >= 0:
+        os.close(staging_fd)
     if root_fd >= 0:
         os.close(root_fd)
 PY
@@ -925,9 +1001,29 @@ PY
   ARCHIVE_STAGING_PATH=""
 }
 
+revalidate_archive_directory_contract() {
+  local runtime_parent archive_parent
+
+  if ! runtime_parent="$(dirname -- "$RUNTIME_ROOT")" ||
+    ! archive_parent="$(dirname -- "$ARCHIVE_ROOT")"; then
+    LAST_ERROR="Runtime and Archive parents could not be resolved."
+    return 1
+  fi
+  runtime_validate_directory_without_extended_attributes "$STORAGE_ROOT" "Storage root" ||
+    return 1
+  runtime_validate_directory_without_extended_attributes "${STORAGE_ROOT}/secrets" "Secrets root" ||
+    return 1
+  runtime_validate_directory_without_extended_attributes "$runtime_parent" "Runtime parent" ||
+    return 1
+  runtime_validate_directory_without_extended_attributes "$archive_parent" "Archive parent" ||
+    return 1
+  runtime_validate_restricted_archive_root || return 1
+}
+
 archive_current_runtime() {
   local legacy_data_moved=0 published_staging_path=""
 
+  revalidate_archive_directory_contract || return 1
   if ! capture_runtime_metadata; then
     LAST_ERROR="Previous runtime metadata could not be captured."
     return 1
@@ -955,6 +1051,7 @@ archive_current_runtime() {
     LAST_ERROR="Archive root could not be created."
     return 1
   fi
+  revalidate_archive_directory_contract || return 1
 
   if [ "$SOURCE_LAYOUT" = "none" ]; then
     ARCHIVE_RESULT="not_required"
@@ -965,6 +1062,7 @@ archive_current_runtime() {
   if ! choose_archive_path || ! choose_archive_staging_path; then
     return 1
   fi
+  revalidate_archive_directory_contract || return 1
 
   if [ "$SOURCE_LAYOUT" = "runtime" ]; then
     if ! runtime_assert_tree_has_no_auth_token \
@@ -1050,6 +1148,7 @@ archive_current_runtime() {
   fi
 
   published_staging_path="$ARCHIVE_STAGING_PATH"
+  revalidate_archive_directory_contract || return 1
   if ! publish_archive_staging; then
     return 1
   fi
@@ -1061,6 +1160,18 @@ archive_current_runtime() {
 }
 
 create_fresh_runtime() {
+  local runtime_parent
+
+  if ! runtime_parent="$(dirname -- "$RUNTIME_ROOT")"; then
+    LAST_ERROR="Fresh runtime parent could not be resolved."
+    return 1
+  fi
+  runtime_validate_directory_without_extended_attributes "$runtime_parent" "Runtime parent" ||
+    return 1
+  if runtime_path_exists "$RUNTIME_ROOT"; then
+    LAST_ERROR="Fresh runtime root must not exist before creation."
+    return 1
+  fi
   if ! runtime_privileged install -d \
     -o "$RUNTIME_DEFAULT_UID" -g "$RUNTIME_DEFAULT_GID" -m "$RUNTIME_DEFAULT_MODE" \
     "$RUNTIME_ROOT"; then
@@ -1085,6 +1196,88 @@ create_fresh_runtime() {
     "${RUNTIME_ROOT}/data" "Fresh runtime data" 1 || return 1
   runtime_validate_approved_runtime_directory \
     "${RUNTIME_ROOT}/wechat-home" "Fresh Runtime WeChat HOME" 1 || return 1
+  runtime_assert_fresh_runtime_tree "$RUNTIME_ROOT" "Fresh runtime" ||
+    return 1
+}
+
+remove_temporary_candidate_runtime() {
+  local path
+
+  [ "$CANDIDATE_TEMP_RUNTIME" -eq 1 ] || return 0
+  for path in "$RUNTIME_ROOT" "${RUNTIME_ROOT}/data" \
+    "${RUNTIME_ROOT}/wechat-home"; do
+    runtime_validate_approved_runtime_directory \
+      "$path" "Temporary candidate Runtime" 1 || return 1
+  done
+  for path in "${RUNTIME_ROOT}/data" "${RUNTIME_ROOT}/wechat-home" \
+    "$RUNTIME_ROOT"; do
+    if ! runtime_privileged rmdir -- "$path"; then
+      LAST_ERROR="Temporary candidate Runtime is not empty or could not be removed safely."
+      return 1
+    fi
+  done
+  CANDIDATE_TEMP_RUNTIME=0
+}
+
+prepare_agent_candidate_before_archive() {
+  local runtime_parent
+
+  if ! runtime_parent="$(dirname -- "$RUNTIME_ROOT")"; then
+    LAST_ERROR="Runtime parent could not be resolved before container preflight."
+    return 1
+  fi
+  runtime_validate_directory_without_extended_attributes "$runtime_parent" "Runtime parent" ||
+    return 1
+  if ! capture_runtime_metadata; then
+    LAST_ERROR="Previous runtime metadata could not be captured before container preflight."
+    return 1
+  fi
+  case "$SOURCE_LAYOUT" in
+    runtime)
+      runtime_validate_approved_runtime_directory \
+        "$RUNTIME_ROOT" "Runtime root" 1 || return 1
+      runtime_validate_approved_runtime_directory \
+        "${RUNTIME_ROOT}/data" "Runtime data" 1 || return 1
+      runtime_validate_approved_runtime_directory \
+        "${RUNTIME_ROOT}/wechat-home" "Runtime WeChat HOME" 1 || return 1
+      ;;
+    legacy)
+      [ "$DATA_EXISTS" != true ] ||
+        runtime_validate_approved_runtime_directory \
+          "$LEGACY_DATA_ROOT" "Legacy data" 1 || return 1
+      [ "$HOME_EXISTS" != true ] ||
+        runtime_validate_approved_runtime_directory \
+          "$LEGACY_WECHAT_HOME_ROOT" "Legacy WeChat HOME" 1 || return 1
+      ;;
+    none) ;;
+    *)
+      LAST_ERROR="Runtime source layout is invalid before container preflight."
+      return 1
+      ;;
+  esac
+
+  if [ "$SOURCE_LAYOUT" != "runtime" ]; then
+    if runtime_path_exists "$RUNTIME_ROOT"; then
+      LAST_ERROR="Temporary candidate Runtime path is unexpectedly occupied."
+      return 1
+    fi
+    CANDIDATE_TEMP_RUNTIME=1
+    if ! create_fresh_runtime; then
+      return 1
+    fi
+  fi
+
+  runtime_revalidate_start_gate || return 1
+  create_agent_container_candidate || return 1
+
+  if [ "$CANDIDATE_TEMP_RUNTIME" -eq 1 ]; then
+    remove_temporary_candidate_runtime || return 1
+  fi
+  # This is the last live policy check before Archive mutation. The candidate
+  # remains stopped and the exact same container ID is started afterwards.
+  runtime_revalidate_start_gate || return 1
+  runtime_attest_actual_agent_container \
+    created "$ATTESTED_AGENT_CONTAINER_ID" || return 1
 }
 
 wait_for_clean_auth() {
@@ -1156,8 +1349,30 @@ raise SystemExit(2)
 }
 
 
+guard_gateway_worker_and_generation_pending() {
+  guard_gateway_worker_stopped &&
+    runtime_gateway_gate_assert_pending
+}
+
 run_forced_login() {
-  local attempt login_response
+  local attempt login_response login_pid login_status=0
+  local worker_guard_error="" worker_guard_poll_interval=1
+  local -a login_arguments=(
+    "${SCRIPT_DIR}/qr_login.py"
+    --listen
+    --url "$WS_URL"
+    --session-id "$SESSION_ID"
+    --timeout-ms "$LOGIN_TIMEOUT_MS"
+    --new-account
+    --require-qr
+  )
+
+  if [ "$CF_AGENT_WECHAT_TESTING" = "1" ]; then
+    worker_guard_poll_interval=0.1
+  fi
+  if ! guard_gateway_worker_and_generation_pending; then
+    return 1
+  fi
 
   if ! login_response="$(api_request POST '/api/status/login?newAccount=true' 2>/dev/null)"; then
     LAST_ERROR="Fresh QR login API request failed."
@@ -1169,20 +1384,44 @@ run_forced_login() {
     return 1
   fi
   unset login_response
-  if ! printf '%s' "$AUTH_TOKEN" | run_login_python \
-    "${SCRIPT_DIR}/qr_login.py" \
-    --listen \
-    --url "$WS_URL" \
-    --session-id "$SESSION_ID" \
-    --timeout-ms "$LOGIN_TIMEOUT_MS" \
-    --new-account \
-    --require-qr; then
+  if ! guard_gateway_worker_and_generation_pending; then
+    return 1
+  fi
+  if ! prepare_login_python_command; then
+    LAST_ERROR="Fresh QR login helper command could not be isolated."
+    return 1
+  fi
+
+  printf '%s' "$AUTH_TOKEN" | \
+    "${LOGIN_PYTHON_COMMAND[@]}" "${login_arguments[@]}" &
+  login_pid=$!
+  QR_LOGIN_HELPER_PID="$login_pid"
+  while kill -0 "$login_pid" 2>/dev/null; do
+    if ! guard_gateway_worker_and_generation_pending; then
+      worker_guard_error="$LAST_ERROR"
+      kill "$login_pid" 2>/dev/null || :
+      wait "$login_pid" 2>/dev/null || :
+      QR_LOGIN_HELPER_PID=""
+      LAST_ERROR="$worker_guard_error"
+      return 1
+    fi
+    sleep "$worker_guard_poll_interval"
+  done
+  wait "$login_pid" || login_status=$?
+  QR_LOGIN_HELPER_PID=""
+  if [ "$login_status" -ne 0 ]; then
     LAST_ERROR="Fresh QR WebSocket login did not complete."
+    return 1
+  fi
+  if ! guard_gateway_worker_and_generation_pending; then
     return 1
   fi
 
   printf '%s\n' 'Confirming authenticated state...'
   for ((attempt = 1; attempt <= LOGIN_CONFIRM_RETRIES; attempt++)); do
+    if ! guard_gateway_worker_and_generation_pending; then
+      return 1
+    fi
     if fetch_auth_status && [ "$AUTH_STATUS" = "logged_in" ]; then
       printf '%s\n' 'Authenticated state confirmed.'
       return 0
@@ -1273,6 +1512,12 @@ main() {
     return 1
   fi
 
+  FLOW_PHASE="begin_gateway_generation"
+  if ! runtime_gateway_gate_begin; then
+    error "$LAST_ERROR"
+    return 1
+  fi
+
   FLOW_PHASE="archive_preflight"
   if ! runtime_check_archive_capacity; then
     error "$LAST_ERROR"
@@ -1329,6 +1574,29 @@ main() {
     return 1
   fi
 
+  FLOW_PHASE="attest_stopped_agent_candidate"
+  if ! prepare_agent_candidate_before_archive; then
+    error "$LAST_ERROR"
+    return 1
+  fi
+
+  FLOW_PHASE="guard_worker_before_archive"
+  if ! guard_gateway_worker_and_generation_pending; then
+    error "$LAST_ERROR"
+    return 1
+  fi
+
+  FLOW_PHASE="archive_capacity_commit_gate"
+  if ! runtime_check_archive_capacity; then
+    error "$LAST_ERROR"
+    return 1
+  fi
+  FLOW_PHASE="gateway_generation_archive_commit_gate"
+  if ! guard_gateway_worker_and_generation_pending; then
+    error "$LAST_ERROR"
+    return 1
+  fi
+
   FLOW_PHASE="archive_runtime"
   if ! archive_current_runtime; then
     error "$LAST_ERROR"
@@ -1337,6 +1605,12 @@ main() {
 
   FLOW_PHASE="create_runtime"
   if ! create_fresh_runtime; then
+    error "$LAST_ERROR"
+    return 1
+  fi
+
+  FLOW_PHASE="guard_worker_before_agent_start"
+  if ! guard_gateway_worker_and_generation_pending; then
     error "$LAST_ERROR"
     return 1
   fi
@@ -1371,8 +1645,20 @@ main() {
     return 1
   fi
 
+  FLOW_PHASE="guard_worker_before_qr"
+  if ! guard_gateway_worker_and_generation_pending; then
+    error "$LAST_ERROR"
+    return 1
+  fi
+
   FLOW_PHASE="force_qr_login"
   if ! run_forced_login; then
+    error "$LAST_ERROR"
+    return 1
+  fi
+
+  FLOW_PHASE="guard_worker_before_runtime_validation"
+  if ! guard_gateway_worker_and_generation_pending; then
     error "$LAST_ERROR"
     return 1
   fi
@@ -1390,10 +1676,37 @@ main() {
     return 1
   fi
 
+  FLOW_PHASE="guard_worker_before_final_attestation"
+  if ! guard_gateway_worker_and_generation_pending; then
+    error "$LAST_ERROR"
+    return 1
+  fi
+
   FLOW_PHASE="verify_final_wechat_process"
   if ! current_wechat_identity="$(runtime_wechat_process_identity)" ||
     [ "$current_wechat_identity" != "$verified_wechat_identity" ]; then
     error "The verified /usr/bin/wechat process exited or was replaced."
+    return 1
+  fi
+
+  FLOW_PHASE="revalidate_final_runtime_contract"
+  if ! runtime_revalidate_start_gate; then
+    error "$LAST_ERROR"
+    return 1
+  fi
+  if ! wait_for_verified_runtime "$verified_wechat_identity"; then
+    error "$LAST_ERROR"
+    return 1
+  fi
+  if ! runtime_attest_actual_agent_container \
+    running "$ATTESTED_AGENT_CONTAINER_ID"; then
+    error "$LAST_ERROR"
+    return 1
+  fi
+
+  FLOW_PHASE="guard_worker_before_gateway_release"
+  if ! guard_gateway_worker_and_generation_pending; then
+    error "$LAST_ERROR"
     return 1
   fi
 
@@ -1405,6 +1718,38 @@ main() {
     error "$LAST_ERROR"
     return 1
   fi
+  FLOW_PHASE="guard_worker_at_release"
+  if ! guard_gateway_worker_and_generation_pending; then
+    error "$LAST_ERROR"
+    return 1
+  fi
+
+  FLOW_PHASE="create_gateway_worker_candidate"
+  if ! prepare_gateway_worker_candidate; then
+    error "$LAST_ERROR"
+    return 1
+  fi
+
+  FLOW_PHASE="revalidate_gateway_release_bindings"
+  if ! guard_gateway_worker_and_generation_pending; then
+    error "$LAST_ERROR"
+    return 1
+  fi
+  if ! runtime_attest_actual_agent_container running "$ATTESTED_AGENT_CONTAINER_ID"; then
+    error "$LAST_ERROR"
+    return 1
+  fi
+  if ! runtime_attest_gateway_worker_container created "$GATEWAY_WORKER_CONTAINER_ID"; then
+    error "$LAST_ERROR"
+    return 1
+  fi
+
+  FLOW_PHASE="release_gateway_generation"
+  if ! runtime_gateway_gate_release; then
+    error "$LAST_ERROR"
+    return 1
+  fi
+
   FLOW_PHASE="start_gateway_worker"
   if ! start_gateway_worker; then
     error "$LAST_ERROR"

@@ -31,6 +31,7 @@ _MANAGEMENT_OVERRIDE_NAMES=(
   CF_AGENT_WECHAT_TEST_ROOT
   CF_AGENT_WECHAT_TEST_GATEWAY_VERIFIER_REPLACEMENT
   CF_AGENT_WECHAT_TEST_GATEWAY_CHECKER_REPLACEMENT
+  CF_AGENT_WECHAT_TEST_GATEWAY_GATE_REPLACEMENT
   CF_AGENT_WECHAT_TOKEN CF_AGENT_WECHAT_TOKEN_FILE AUTH_TOKEN
   CF_GATEWAY_API_TOKEN CF_AGENT_GATEWAY_ADMIN_TOKEN HERMES_API_KEY
   CF_AGENT_WECHAT_TEST_PIP_INSTALL_TIMEOUT
@@ -76,7 +77,7 @@ if [ "$CF_AGENT_WECHAT_TESTING" != "1" ]; then
   done
 else
   for _override_name in "${_MANAGEMENT_OVERRIDE_NAMES[@]}"; do
-    export -n "$_override_name" 2>/dev/null || :
+    export -n "${_override_name?}" 2>/dev/null || :
     case "$_override_name" in
       AUTH_TOKEN|CF_AGENT_WECHAT_TOKEN|CF_GATEWAY_API_TOKEN|CF_AGENT_GATEWAY_ADMIN_TOKEN|HERMES_API_KEY|PROXY|HTTP_PROXY|HTTPS_PROXY|ALL_PROXY|http_proxy|https_proxy|all_proxy|NO_PROXY|no_proxy)
         unset "$_override_name"
@@ -106,7 +107,7 @@ else
     return 1
   fi
   case "$_scripts_dir_declaration" in
-    'declare -r '*|'declare -r -- '*) ;;
+    'declare -r '*) ;;
     *)
       printf '%s\n' 'Production management scripts directory is not immutable.' >&2
       return 1
@@ -213,7 +214,7 @@ configure_agent_endpoints() {
 
 testing_canonical_path() {
   local path="$1"
-  local component canonical="/" index
+  local component canonical="/"
   local -a components path_stack=()
 
   case "$path" in
@@ -233,8 +234,7 @@ testing_canonical_path() {
       ''|.) ;;
       ..)
         if [ "${#path_stack[@]}" -gt 0 ]; then
-          index=$((${#path_stack[@]} - 1))
-          unset 'path_stack[index]'
+          unset "path_stack[${#path_stack[@]} - 1]"
         fi
         ;;
       *) path_stack+=("$component") ;;
@@ -943,19 +943,28 @@ run_agent_curl() {
     "$CURL_BIN" "$@"
 }
 
-run_login_python() {
+declare -a LOGIN_PYTHON_COMMAND=()
+
+prepare_login_python_command() {
   validate_testing_token_isolation || return 1
   validate_testing_endpoint_isolation || return 1
   if [ "$CF_AGENT_WECHAT_TESTING" = "1" ]; then
-    "$LOGIN_PYTHON" "$@"
+    LOGIN_PYTHON_COMMAND=("$LOGIN_PYTHON")
   else
-    /usr/bin/env -i \
-      HOME=/nonexistent \
-      PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
-      LANG=C.UTF-8 LC_ALL=C.UTF-8 \
-      PYTHONDONTWRITEBYTECODE=1 PYTHONNOUSERSITE=1 \
-      "$LOGIN_PYTHON" -I -B "$@"
+    LOGIN_PYTHON_COMMAND=(
+      /usr/bin/env -i
+      HOME=/nonexistent
+      PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+      LANG=C.UTF-8 LC_ALL=C.UTF-8
+      PYTHONDONTWRITEBYTECODE=1 PYTHONNOUSERSITE=1
+      "$LOGIN_PYTHON" -I -B
+    )
   fi
+}
+
+run_login_python() {
+  prepare_login_python_command || return 1
+  "${LOGIN_PYTHON_COMMAND[@]}" "$@"
 }
 
 
@@ -1164,8 +1173,13 @@ docker_readonly_capture() {
   local output status output_lower docker_bin timeout_bin
   local -a clean_env
 
-  docker_bin="${DOCKER_BIN:-docker}"
-  timeout_bin="${TIMEOUT_BIN:-timeout}"
+  if [ "$CF_AGENT_WECHAT_TESTING" = "1" ]; then
+    docker_bin="${DOCKER_BIN:-${CF_AGENT_WECHAT_DOCKER_BIN:-}}"
+    timeout_bin="${TIMEOUT_BIN:-/usr/bin/timeout}"
+  else
+    docker_bin="/usr/bin/docker"
+    timeout_bin="/usr/bin/timeout"
+  fi
   validate_testing_docker_isolation || return 1
 
   if [ "$CF_AGENT_WECHAT_TESTING" = "1" ]; then
@@ -1376,6 +1390,8 @@ ensure_login_environment() {
   case "$selected_python" in
     "${VENV_DIR}/bin/python"|"${VENV_DIR}/Scripts/python.exe") ;;
     *)
+      # Read by the entrypoint that sources this shared library.
+      # shellcheck disable=SC2034
       LAST_ERROR="The dependency helper returned an unexpected Python path."
       LOGIN_PYTHON=""
       return 1
@@ -1385,4 +1401,6 @@ ensure_login_environment() {
 }
 
 CF_AGENT_WECHAT_COMMON_LOADED=1
+# Read by scripts that source this shared library.
+# shellcheck disable=SC2034
 readonly CF_AGENT_WECHAT_COMMON_LOADED

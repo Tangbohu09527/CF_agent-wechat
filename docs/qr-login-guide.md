@@ -42,7 +42,7 @@ cd /opt/cf-agent-wechat
    `live-restore=false`、auto-start unit、`cf-internal`、Gateway contract 和 clean
    Compose 精确 attestation。
 3. 精确校验现有 Runtime/legacy UID/GID/mode，并完成 no-follow、no-cross-filesystem、
-   有界特殊文件/Token 树扫描。
+   有界特殊文件/Token 树扫描；目录项名称也检查 Token，任何 xattr/POSIX ACL 都拒绝。
 4. 获取 owner/group/mode/link 合规的 `0640` 独占管理锁。
 5. 停止并确认 Gateway `worker`。
 6. 校验 Archive bytes/percent/inode 并输出 inventory；失败时 Worker 保持停止。

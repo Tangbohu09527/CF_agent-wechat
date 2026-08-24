@@ -214,6 +214,7 @@ print(json.dumps({
     "name": project_name,
     "services": {
         "worker": {
+            "restart": "no",
             "environment": {
                 "CF_AGENT_WECHAT_TOKEN_FILE": token_worker_path,
             },

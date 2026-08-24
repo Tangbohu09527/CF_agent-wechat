@@ -15,6 +15,8 @@ from typing import NamedTuple
 READ_CHUNK_BYTES = 1024 * 1024
 MAX_DIRECTORY_DEPTH = 128
 MAX_MOUNTINFO_BYTES = 4 * 1024 * 1024
+MAX_ATTESTATION_PATH_BYTES = 64 * 1024 * 1024
+MAX_ATTESTATION_ENTRIES = 200_000
 MOUNTINFO_PATH = Path("/proc/self/mountinfo")
 TOKEN_PATTERN = re.compile(rb"[0-9a-f]{64}")
 MOUNTINFO_ESCAPE = re.compile(rb"\x5c([0-7]{3})")
@@ -34,6 +36,21 @@ class TreeAttestation(NamedTuple):
     entries: tuple[EntryAttestation, ...]
 
 
+def validate_empty_runtime_layout(attestation: TreeAttestation) -> None:
+    """Require exactly the two empty directories used by a fresh runtime."""
+    expected_paths = {"data", "wechat-home"}
+    observed_paths = {
+        entry.relative_path for entry in attestation.entries
+    }
+    if observed_paths != expected_paths or len(attestation.entries) != 2:
+        raise ScanError("fresh runtime layout is not empty and exact")
+    if any(
+        not stat.S_ISDIR(entry.identity[2])
+        for entry in attestation.entries
+    ):
+        raise ScanError("fresh runtime layout is not empty and exact")
+
+
 def stable_identity(metadata: os.stat_result) -> tuple[int, ...]:
     return (
         metadata.st_dev,
@@ -45,6 +62,34 @@ def stable_identity(metadata: os.stat_result) -> tuple[int, ...]:
         metadata.st_size,
         metadata.st_ctime_ns,
     )
+
+
+def reject_extended_attributes(descriptor: int) -> None:
+    """Reject xattrs, including POSIX ACLs, without exposing their contents."""
+    try:
+        attributes = os.listxattr(descriptor)
+    except OSError as exc:
+        raise ScanError(
+            "runtime entry extended attributes could not be inspected"
+        ) from exc
+    if attributes:
+        raise ScanError("runtime tree contains extended attributes or ACLs")
+
+
+def reject_token_in_entry_name(name: str, token: bytes) -> None:
+    try:
+        encoded_name = os.fsencode(name)
+    except (UnicodeError, ValueError) as exc:
+        raise ScanError("runtime entry name could not be inspected") from exc
+    if token in encoded_name:
+        raise ScanError("runtime entry name contains protected Token bytes")
+
+
+def attestation_path_size(relative_path: str) -> int:
+    try:
+        return len(os.fsencode(relative_path))
+    except (UnicodeError, ValueError) as exc:
+        raise ScanError("runtime attestation path could not be inspected") from exc
 
 
 def read_mountinfo() -> bytes:
@@ -201,6 +246,7 @@ def scan_file(
             or opened.st_nlink != 1
         ):
             raise ScanError("runtime entry changed during inspection")
+        reject_extended_attributes(descriptor)
         if opened.st_size > max_bytes:
             raise ScanError("runtime scan exceeded its byte limit")
         overlap = b""
@@ -222,6 +268,7 @@ def scan_file(
             if token in candidate:
                 raise ScanError("runtime payload contains protected Token bytes")
             overlap = candidate[-overlap_size:] if overlap_size else b""
+        reject_extended_attributes(descriptor)
         final = os.fstat(descriptor)
         if stable_identity(final) != stable_identity(opened):
             raise ScanError("runtime entry changed during inspection")
@@ -237,7 +284,9 @@ def scan_tree(
     max_bytes: int,
     deadline: float,
 ) -> TreeAttestation:
-    if max_files <= 0 or max_bytes <= 0:
+    if max_files <= 0 or max_files > MAX_ATTESTATION_ENTRIES:
+        raise ScanError("runtime scan file-count limit is invalid")
+    if max_bytes <= 0:
         raise ScanError("runtime scan limits are invalid")
     validate_mount_boundaries(root)
     root_metadata = root.lstat()
@@ -253,6 +302,7 @@ def scan_tree(
         os.close(root_fd)
         raise ScanError("runtime root changed during inspection")
     try:
+        reject_extended_attributes(root_fd)
         root_entries = os.scandir(root_fd)
     except BaseException:
         os.close(root_fd)
@@ -262,6 +312,7 @@ def scan_tree(
     attestations: list[EntryAttestation] = []
     entries_seen = 0
     total_bytes = 0
+    total_path_bytes = 0
     final_root_identity: tuple[int, ...] | None = None
 
     try:
@@ -320,6 +371,10 @@ def scan_tree(
                 if not directory_path
                 else f"{directory_path}/{entry.name}"
             )
+            total_path_bytes += attestation_path_size(relative_path)
+            if total_path_bytes > MAX_ATTESTATION_PATH_BYTES:
+                raise ScanError("runtime scan exceeded its path-byte limit")
+            reject_token_in_entry_name(entry.name, token)
             if stat.S_ISLNK(mode):
                 raise ScanError("runtime tree contains a symbolic link")
             if metadata.st_dev != root_device:
@@ -343,6 +398,7 @@ def scan_tree(
                         raise ScanError(
                             "runtime directory changed during inspection"
                         )
+                    reject_extended_attributes(child_fd)
                     child_entries = os.scandir(child_fd)
                 except BaseException:
                     os.close(child_fd)
@@ -409,11 +465,20 @@ def verify_tree_attestation(
     max_files: int,
     deadline: float,
 ) -> None:
-    if max_files <= 0 or len(attestation.entries) > max_files:
+    if max_files <= 0 or max_files > MAX_ATTESTATION_ENTRIES:
+        raise ScanError("runtime attestation file-count limit is invalid")
+    if (
+        len(attestation.entries) > max_files
+        or len(attestation.entries) > MAX_ATTESTATION_ENTRIES
+    ):
         raise ScanError("runtime attestation exceeds its file-count limit")
     expected: dict[str, tuple[int, ...]] = {}
+    expected_path_bytes = 0
     for entry in attestation.entries:
         validate_attestation_path(entry.relative_path)
+        expected_path_bytes += attestation_path_size(entry.relative_path)
+        if expected_path_bytes > MAX_ATTESTATION_PATH_BYTES:
+            raise ScanError("runtime attestation exceeds its path-byte limit")
         if entry.relative_path in expected:
             raise ScanError("runtime attestation contains a duplicate path")
         expected[entry.relative_path] = entry.identity
@@ -438,12 +503,14 @@ def verify_tree_attestation(
         os.close(root_fd)
         raise ScanError("runtime root changed after inspection")
     try:
+        reject_extended_attributes(root_fd)
         root_entries = os.scandir(root_fd)
     except BaseException:
         os.close(root_fd)
         raise
     stack = [(root_fd, root_entries, 0, opened_root, "")]
     observed: set[str] = set()
+    observed_path_bytes = 0
 
     try:
         while stack:
@@ -477,6 +544,9 @@ def verify_tree_attestation(
                 if not directory_path
                 else f"{directory_path}/{entry.name}"
             )
+            observed_path_bytes += attestation_path_size(relative_path)
+            if observed_path_bytes > MAX_ATTESTATION_PATH_BYTES:
+                raise ScanError("runtime tree exceeds its path-byte limit")
             expected_identity = expected.get(relative_path)
             if expected_identity is None or relative_path in observed:
                 raise ScanError("runtime tree changed after inspection")
@@ -504,6 +574,7 @@ def verify_tree_attestation(
                     child = os.fstat(child_fd)
                     if stable_identity(child) != expected_identity:
                         raise ScanError("runtime tree changed after inspection")
+                    reject_extended_attributes(child_fd)
                     child_entries = os.scandir(child_fd)
                 except BaseException:
                     os.close(child_fd)
@@ -526,7 +597,12 @@ def verify_tree_attestation(
                 dir_fd=directory_fd,
             )
             try:
-                if stable_identity(os.fstat(descriptor)) != expected_identity:
+                opened_file = os.fstat(descriptor)
+                if stable_identity(opened_file) != expected_identity:
+                    raise ScanError("runtime tree changed after inspection")
+                reject_extended_attributes(descriptor)
+                after_xattrs = os.fstat(descriptor)
+                if stable_identity(after_xattrs) != expected_identity:
                     raise ScanError("runtime tree changed after inspection")
             finally:
                 os.close(descriptor)
@@ -571,7 +647,15 @@ def open_protected_parent(path: Path) -> tuple[int, os.stat_result]:
     if stable_identity(opened) != stable_identity(metadata):
         os.close(descriptor)
         raise ScanError("runtime move parent changed during inspection")
-    return descriptor, opened
+    try:
+        reject_extended_attributes(descriptor)
+        after_xattrs = os.fstat(descriptor)
+        if stable_identity(after_xattrs) != stable_identity(opened):
+            raise ScanError("runtime move parent changed during inspection")
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return descriptor, after_xattrs
 
 
 def assert_destination_absent(directory_fd: int, name: str) -> None:
@@ -798,6 +882,7 @@ def main() -> int:
     parser.add_argument("--max-bytes", type=int, required=True)
     parser.add_argument("--timeout-seconds", type=int, required=True)
     parser.add_argument("--move-to")
+    parser.add_argument("--require-empty-runtime-layout", action="store_true")
     parser.add_argument("--testing", action="store_true")
     parser.add_argument("--testing-move-barrier-marker")
     parser.add_argument("--testing-move-barrier-release")
@@ -810,6 +895,8 @@ def main() -> int:
     if min(arguments.max_files, arguments.max_bytes, arguments.timeout_seconds) <= 0:
         return 2
     if arguments.move_to is None and arguments.reserved_top_level_name:
+        return 2
+    if arguments.move_to is not None and arguments.require_empty_runtime_layout:
         return 2
     barrier_values = (
         arguments.testing_move_barrier_marker,
@@ -839,13 +926,15 @@ def main() -> int:
         deadline = time.monotonic() + arguments.timeout_seconds
         root = Path(arguments.root)
         if arguments.move_to is None:
-            scan_tree(
+            attestation = scan_tree(
                 root,
                 token,
                 arguments.max_files,
                 arguments.max_bytes,
                 deadline,
             )
+            if arguments.require_empty_runtime_layout:
+                validate_empty_runtime_layout(attestation)
         else:
             scan_and_move_tree(
                 root,

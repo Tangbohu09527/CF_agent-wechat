@@ -39,6 +39,12 @@ checker 必须无输出，并在 10 秒内确认当前 `worker` running/healthy�
 最新 Poll Cycle 成功且 auth 为 `logged_in`。Gateway PR #4 尚无兼容 producer，
 当前长期目标仍为 **BLOCKED BY GATEWAY CONTRACT**。
 
+`start-qr-login.sh` 会在 Archive、Agent start、QR、验证和最终 release 边界重复确认
+Worker stopped，并在 QR 等待期间轮询；若中途出现 Worker，会停止它、终止登录并失败。
+这不构成跨仓原子锁。Gateway compatible producer 仍须提供 deny-by-default、绑定当前
+fresh runtime generation 的 release gate，使任何外部 `compose up`、supervisor 或旧
+release 都不能在验证前启动 Worker。
+
 `docker/docker-compose.yml` 是实验或验证配置，不得用于 CFserver。生产环境不再恢复旧
 微信登录会话；每次 Debian 重启、容器重建或人工重新启动都需要 SSH 人工扫码。
 CFserver Host 使用 `Asia/Shanghai`，容器和原始日志使用 UTC；显示时可以转换，
@@ -110,8 +116,10 @@ cd /opt/cf-agent-wechat
 
 脚本先重新校验 systemd/docker.service、本机 rootful default Docker、
 `live-restore=false`、未启用的 Agent auto-start unit、精确 Compose `restart=no`、
-Gateway contract/Token、现有 Runtime 精确权限和受限 no-follow 树扫描；随后获取管理锁，
-停止并确认 Gateway `worker`，再检查 Archive bytes/percent/inode、输出 inventory，并
+Gateway contract/Token、现有 Runtime 精确权限和受限 no-follow 树扫描（包含路径名 Token
+检查及 xattr/POSIX ACL 拒绝）；扫描最多接受 200,000 个 entry，attestation 累计编码
+相对路径另有不可配置的 64 MiB 上限。随后获取管理锁，停止并确认 Gateway `worker`，
+再检查 Archive bytes/percent/inode、输出 inventory，并
 验证 Hash 锁定的 QR Python 环境。容量、inventory 或 venv 失败时 Worker 保持停止，
 但不会移动 Archive、变更 Agent 容器或显示二维码。
 
@@ -121,6 +129,15 @@ UID/GID/mode 创建全新目录。容器创建后还会以 Docker inspect
 alias 和环境，再等待 running/healthy、Agent API 与 WeChat process 稳定。SSH 终端实际
 渲染 QR 且 auth/chats/messages 全部通过后才启动 `worker`；checker 在稳定窗口内持续
 通过才放行，否则撤销 Worker 启动并保留 Agent/Archive 现场。
+
+scanner 的最终重验依赖容器已停止且部署 principal 受信；同权限或 root 写入者若在最后
+检查后继续修改 Runtime，超出该工具能证明的边界。systemd inventory 同样只证明已枚举
+unit、直接 timer/path/socket target 和 target 的一跳 `Wants`/`Requires`；任意深度依赖、
+cron、Swarm、Kubernetes、外部配置管理及人工 Docker 操作必须在 CFserver 另行审计。
+
+QR venv helper 会快照 Python、venv、requirements 和 verifier 全部现存祖先的
+device/inode/owner/group/mode/type，并在 venv、pip、验证、stamp、cleanup 与 rollback
+阶段重验。祖先漂移时 fail closed，不再通过已漂移路径写入或删除。
 
 生产只接受能在渲染前检查 Token 的文本 QR payload。PNG-only `qrDataUrl` 必须
 fail closed；不得为了兼容 PNG 绕过检查、写文件或接受未实际显示二维码的成功事件。

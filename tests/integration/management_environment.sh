@@ -21,6 +21,8 @@ COMPOSE_ENV="${TEST_ROOT}/compose.env"
 CURL_ARGS="${TEST_ROOT}/curl.args"
 CURL_ENV="${TEST_ROOT}/curl.env"
 REQUEST_MARKER="${TEST_ROOT}/network-requested"
+AGENT_CURL_MARKER="${TEST_ROOT}/agent-curl-requested"
+LOGIN_PYTHON_MARKER="${TEST_ROOT}/login-python-requested"
 TOKEN_FILE="${TEST_ROOT}/secrets/auth-token"
 TOKEN_VALUE='0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'
 STORAGE_ROOT="${TEST_ROOT}/storage"
@@ -89,10 +91,14 @@ read_contract() {
         printf "%s" "$RUNTIME_MANAGEMENT_ENV_ERROR" >&2
         exit 1
       fi
-      printf "%s|%s|%s|%s|%s|%s|%s" \
+      printf "%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s" \
         "$STORAGE_ROOT" "$RUNTIME_ROOT" "$ARCHIVE_ROOT" \
         "$CONTAINER_NAME" "$APPROVED_AGENT_IMAGE" \
-        "$APPROVED_PROXY" "$APPROVED_RUST_LOG"
+        "$APPROVED_PROXY" "$APPROVED_RUST_LOG" \
+        "$RUNTIME_DEFAULT_UID" "$RUNTIME_DEFAULT_GID" \
+        "$RUNTIME_MANAGEMENT_GID" "$MIN_FREE_BYTES" \
+        "$MIN_FREE_PERCENT" "$MIN_FREE_INODES" \
+        "$TOKEN_SCAN_MAX_FILES" "$TOKEN_SCAN_MAX_BYTES"
     ' management-environment "$REPO_ROOT"
 }
 
@@ -112,6 +118,30 @@ assert_rejected() {
       printf 'FAIL expected %s, got: %s\n' "$expected" "$output" >&2
       exit 1
       ;;
+  esac
+}
+
+replace_env_value() {
+  local key="$1" value="$2"
+
+  sed -i "s|^${key}=.*|${key}=${value}|" "$ENV_FILE"
+}
+
+assert_contract_value_rejected() {
+  local key="$1" value="$2" expected="$3"
+  local output
+
+  write_valid_env
+  replace_env_value "$key" "$value"
+  if output="$(read_contract 2>&1)"; then
+    fail "$key unsafe numeric value was accepted"
+  fi
+  case "$output" in
+    *"$expected"*) ;;
+    *) fail "$key rejection returned unexpected error: $output" ;;
+  esac
+  case "$output" in
+    *"$value"*) fail "$key rejection disclosed its hostile value" ;;
   esac
 }
 
@@ -137,7 +167,7 @@ assert_production_override_rejected() {
   local value="$2"
   local output status
 
-  rm -f -- "$REQUEST_MARKER"
+  rm -f -- "$AGENT_CURL_MARKER" "$LOGIN_PYTHON_MARKER"
   set +e
   output="$(/usr/bin/env -i \
     HOME="$TEST_ROOT" \
@@ -148,17 +178,30 @@ assert_production_override_rejected() {
     /bin/bash -p -c '
       readonly _CF_AGENT_WECHAT_INTERNAL_SCRIPTS_DIR="$1/scripts"
       source "$1/scripts/common.sh"
+      agent_curl_marker="$2"
+      login_python_marker="$3"
+      run_agent_curl() {
+        : > "$agent_curl_marker"
+      }
+      run_login_python() {
+        : > "$login_python_marker"
+      }
       if validate_configuration; then
-        : > "$2"
+        run_agent_curl
+        run_login_python
         exit 0
       fi
       printf "%s" "$LAST_ERROR" >&2
       exit 1
-    ' production-override "$REPO_ROOT" "$REQUEST_MARKER" 2>&1)"
+    ' production-override "$REPO_ROOT" "$AGENT_CURL_MARKER" \
+      "$LOGIN_PYTHON_MARKER" 2>&1)"
   status=$?
   set -e
 
-  [ ! -e "$REQUEST_MARKER" ] || fail "$name reached an Agent network request"
+  [ ! -e "$AGENT_CURL_MARKER" ] ||
+    fail "$name reached the Agent API transport"
+  [ ! -e "$LOGIN_PYTHON_MARKER" ] ||
+    fail "$name reached the QR WebSocket transport"
   [ "$status" -ne 0 ] || fail "$name production override was accepted"
   case "$output" in
     *'Production management environment overrides are forbidden:'*"$name"*) ;;
@@ -355,11 +398,70 @@ printf '%s\n' 'PASS testing path isolation is lexical before sudo authorization'
 
 write_valid_env
 [ "$(read_contract)" = \
-  "${STORAGE_ROOT}|${RUNTIME_ROOT}|${ARCHIVE_ROOT}|${TEST_CONTAINER}|ghcr.io/example/agent-wechat@sha256:${DIGEST}|http://proxy.example:8080|info" ] || {
+  "${STORAGE_ROOT}|${RUNTIME_ROOT}|${ARCHIVE_ROOT}|${TEST_CONTAINER}|ghcr.io/example/agent-wechat@sha256:${DIGEST}|http://proxy.example:8080|info|1000|1000|1000|1073741824|10|1024|200000|21474836480" ] || {
   printf '%s\n' 'FAIL valid docker/.env was not authoritative' >&2
   exit 1
 }
 printf '%s\n' 'PASS safe docker/.env is authoritative'
+
+sed -i \
+  -e 's/^CF_AGENT_WECHAT_RUNTIME_UID=.*/CF_AGENT_WECHAT_RUNTIME_UID=21001/' \
+  -e 's/^CF_AGENT_WECHAT_RUNTIME_GID=.*/CF_AGENT_WECHAT_RUNTIME_GID=21002/' \
+  -e 's/^CF_AGENT_WECHAT_MANAGEMENT_GID=.*/CF_AGENT_WECHAT_MANAGEMENT_GID=21003/' \
+  -e 's/^CF_AGENT_WECHAT_MIN_FREE_BYTES=.*/CF_AGENT_WECHAT_MIN_FREE_BYTES=536870912/' \
+  -e 's/^CF_AGENT_WECHAT_MIN_FREE_PERCENT=.*/CF_AGENT_WECHAT_MIN_FREE_PERCENT=17/' \
+  -e 's/^CF_AGENT_WECHAT_MIN_FREE_INODES=.*/CF_AGENT_WECHAT_MIN_FREE_INODES=2048/' \
+  -e 's/^CF_AGENT_WECHAT_TOKEN_SCAN_MAX_FILES=.*/CF_AGENT_WECHAT_TOKEN_SCAN_MAX_FILES=12345/' \
+  -e 's/^CF_AGENT_WECHAT_TOKEN_SCAN_MAX_BYTES=.*/CF_AGENT_WECHAT_TOKEN_SCAN_MAX_BYTES=987654321/' \
+  "$ENV_FILE"
+[ "$(read_contract)" = \
+  "${STORAGE_ROOT}|${RUNTIME_ROOT}|${ARCHIVE_ROOT}|${TEST_CONTAINER}|ghcr.io/example/agent-wechat@sha256:${DIGEST}|http://proxy.example:8080|info|21001|21002|21003|536870912|17|2048|12345|987654321" ] ||
+  fail 'valid non-default management values were validated but not assigned'
+printf '%s\n' 'PASS valid non-default management values are assigned'
+
+INT64_MAX=9223372036854775807
+INT64_OVERFLOW=9223372036854775808
+OVERSIZED_DECIMAL="$(printf '9%.0s' {1..128})"
+write_valid_env
+replace_env_value CF_AGENT_WECHAT_MIN_FREE_BYTES "$INT64_MAX"
+replace_env_value CF_AGENT_WECHAT_MIN_FREE_PERCENT 100
+replace_env_value CF_AGENT_WECHAT_MIN_FREE_INODES "$INT64_MAX"
+replace_env_value CF_AGENT_WECHAT_TOKEN_SCAN_MAX_FILES 200000
+replace_env_value CF_AGENT_WECHAT_TOKEN_SCAN_MAX_BYTES "$INT64_MAX"
+numeric_boundary_contract="$(read_contract)" ||
+  fail 'exact signed 64-bit numeric boundaries were rejected'
+case "$numeric_boundary_contract" in
+  *"|${INT64_MAX}|100|${INT64_MAX}|200000|${INT64_MAX}") ;;
+  *) fail 'exact signed 64-bit numeric boundaries were not assigned' ;;
+esac
+for numeric_key in \
+  CF_AGENT_WECHAT_MIN_FREE_BYTES \
+  CF_AGENT_WECHAT_MIN_FREE_INODES \
+  CF_AGENT_WECHAT_TOKEN_SCAN_MAX_BYTES; do
+  assert_contract_value_rejected \
+    "$numeric_key" "$INT64_OVERFLOW" 'failed byte-safe validation'
+  assert_contract_value_rejected \
+    "$numeric_key" "$OVERSIZED_DECIMAL" 'failed byte-safe validation'
+done
+assert_contract_value_rejected \
+  AGENT_WECHAT_PORT 65536 'failed byte-safe validation'
+for numeric_key in \
+  CF_AGENT_WECHAT_RUNTIME_UID \
+  CF_AGENT_WECHAT_RUNTIME_GID \
+  CF_AGENT_WECHAT_MANAGEMENT_GID; do
+  assert_contract_value_rejected \
+    "$numeric_key" 4294967295 'failed byte-safe validation'
+done
+assert_contract_value_rejected \
+  CF_AGENT_WECHAT_TOKEN_SCAN_MAX_FILES 200001 \
+  'must not exceed the compiled scanner limit'
+assert_contract_value_rejected \
+  CF_AGENT_WECHAT_MIN_FREE_PERCENT 000 \
+  'failed byte-safe validation'
+assert_contract_value_rejected \
+  CF_AGENT_WECHAT_MIN_FREE_PERCENT "$INT64_OVERFLOW" \
+  'failed byte-safe validation'
+printf '%s\n' 'PASS ports, IDs, and management numeric values are bounded before Bash arithmetic'
 
 write_valid_env http://proxy.example:8080 info \
   /srv/storage/cf-agent-wechat \
@@ -402,7 +504,7 @@ printf '%s\n' 'PASS unsafe proxy forms are rejected without credential disclosur
 
 assert_production_override_rejected API_URL 'https://attacker.example'
 assert_production_override_rejected WS_URL \
-  'wss://attacker.example/api/ws/login'
+  'wss://attacker.example'
 assert_production_override_rejected TOKEN_FILE /tmp/attacker-token
 assert_production_override_rejected SESSION_ID attacker-session
 assert_production_override_rejected CONTAINER_NAME attacker-legacy-container
@@ -462,6 +564,9 @@ assert_production_override_rejected CF_AGENT_WECHAT_SYSTEMCTL_BIN \
   /tmp/attacker-systemctl
 assert_production_override_rejected CF_AGENT_WECHAT_DF_BIN \
   /tmp/attacker-df
+assert_production_override_rejected \
+  CF_AGENT_WECHAT_TEST_GATEWAY_GATE_REPLACEMENT \
+  /tmp/attacker-release-gate
 printf '%s\n' 'PASS production overrides fail before Agent network access'
 assert_testing_transport_rejected API_URL https://attacker.example "Testing API endpoint"
 assert_testing_transport_rejected WS_URL wss://attacker.example/api/ws/login "Testing WebSocket endpoint"

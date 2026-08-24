@@ -41,6 +41,7 @@ for _management_env_name in \
     CF_AGENT_WECHAT_TEST_ROOT \
     CF_AGENT_WECHAT_TEST_GATEWAY_VERIFIER_REPLACEMENT \
     CF_AGENT_WECHAT_TEST_GATEWAY_CHECKER_REPLACEMENT \
+    CF_AGENT_WECHAT_TEST_GATEWAY_GATE_REPLACEMENT \
     CF_AGENT_WECHAT_TOKEN CF_AGENT_WECHAT_TOKEN_FILE AUTH_TOKEN \
     CF_AGENT_WECHAT_TEST_PIP_INSTALL_TIMEOUT \
     CF_AGENT_WECHAT_TEST_PIP_NETWORK_TIMEOUT \
@@ -62,7 +63,7 @@ for _management_env_name in \
     if [ "${CF_AGENT_WECHAT_TESTING:-0}" != "1" ]; then
       unset "$_management_env_name"
     else
-      export -n "$_management_env_name" 2>/dev/null || :
+      export -n "${_management_env_name?}" 2>/dev/null || :
       case "$_management_env_name" in
         AUTH_TOKEN|CF_AGENT_WECHAT_TOKEN|PROXY|HTTP_PROXY|HTTPS_PROXY|ALL_PROXY|http_proxy|https_proxy|all_proxy|NO_PROXY|no_proxy)
           unset "$_management_env_name"
@@ -333,6 +334,7 @@ prepare_status_management_configuration() {
   for protected_path in "$STORAGE_ROOT" "$RUNTIME_ROOT" "$ARCHIVE_ROOT" \
     "$TOKEN_FILE" "$GATEWAY_PROJECT_DIR" "$GATEWAY_COMPOSE_FILE" \
     "$GATEWAY_ENV_FILE" "$GATEWAY_HEARTBEAT_COMMAND" \
+    "$GATEWAY_RELEASE_GATE_COMMAND" \
     "$GATEWAY_CONTRACT_VERIFIER" \
     "$MANAGEMENT_SOURCE_SECRET_VERIFIER"; do
     runtime_validate_no_symlink_ancestors \
@@ -347,7 +349,10 @@ prepare_status_management_configuration() {
     return 1
   runtime_validate_management_file \
     "$GATEWAY_HEARTBEAT_COMMAND" "Gateway heartbeat checker" || return 1
-  [ -x "$GATEWAY_HEARTBEAT_COMMAND" ] || return 1
+  runtime_validate_management_file \
+    "$GATEWAY_RELEASE_GATE_COMMAND" "Gateway runtime release gate" || return 1
+  [ -x "$GATEWAY_HEARTBEAT_COMMAND" ] &&
+    [ -x "$GATEWAY_RELEASE_GATE_COMMAND" ] || return 1
   runtime_validate_management_file \
     "$GATEWAY_CONTRACT_VERIFIER" "Gateway contract verifier" \
     "755 0755" || return 1
@@ -427,9 +432,11 @@ main() {
         "$GATEWAY_SERVICE" 2>/dev/null)" &&
       [ -n "$worker_container_id" ]; then
       worker_health="$(container_health_status "$worker_container_id" 2>/dev/null || printf unavailable)"
-      if [ "$worker_health" = "healthy" ] &&
-        gateway_worker_heartbeat_is_healthy; then
-        worker_heartbeat="verified"
+      if [ "$worker_health" = "healthy" ]; then
+        # A standalone status process has no authenticated release-generation
+        # receipt. Calling the checker without its exact triple would weaken
+        # the v1 contract and could validate a stale Worker release.
+        worker_heartbeat="unavailable_without_release_binding"
       fi
     fi
   fi
@@ -512,9 +519,12 @@ main() {
     error "Chats or messages API is not readable."
     return 1
   fi
-  if [ "$worker_status" != "running" ] || [ "$worker_health" != "healthy" ] ||
-    [ "$worker_heartbeat" != "verified" ]; then
-    error "Gateway wechat-worker is not running, healthy, and heartbeat-verified."
+  if [ "$worker_status" != "running" ] || [ "$worker_health" != "healthy" ]; then
+    error "Gateway wechat-worker is not running and Docker-healthy."
+    return 1
+  fi
+  if [ "$worker_heartbeat" != "verified" ]; then
+    error "Gateway heartbeat is unavailable without an exact released runtime-generation binding."
     return 1
   fi
   return 0

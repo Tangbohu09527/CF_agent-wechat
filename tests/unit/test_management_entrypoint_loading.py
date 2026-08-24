@@ -71,9 +71,12 @@ class ProductionEntrypointLoadingTests(unittest.TestCase):
                     "CF_AGENT_WECHAT_MIN_FREE_INODES",
                     "CF_AGENT_WECHAT_TOKEN_SCAN_MAX_FILES",
                     "CF_AGENT_WECHAT_TOKEN_SCAN_MAX_BYTES",
+                    "CF_AGENT_WECHAT_TEST_GATEWAY_GATE_REPLACEMENT",
                 ):
                     self.assertIn(variable, content[:first_child])
-                self.assertIn('export -n "$_management_env_name"', content[:first_child])
+                self.assertIn(
+                    'export -n "${_management_env_name?}"', content[:first_child]
+                )
                 for secret_name in (
                     "AUTH_TOKEN",
                     "CF_AGENT_WECHAT_TOKEN",
@@ -135,7 +138,7 @@ class ProductionEntrypointLoadingTests(unittest.TestCase):
         self.assertLess(immutable, first_child)
         self.assertGreater(rejection, first_child)
         self.assertIn(
-            'export -n "$_bootstrap_early_override_name"',
+            'export -n "${_bootstrap_early_override_name?}"',
             BOOTSTRAP[:first_child],
         )
         for variable in (
@@ -145,8 +148,20 @@ class ProductionEntrypointLoadingTests(unittest.TestCase):
             "API_URL",
             "CF_AGENT_WECHAT_ROOT",
             "CF_BOOTSTRAP_DOCKER_BIN",
+            "CF_AGENT_WECHAT_TEST_GATEWAY_GATE_REPLACEMENT",
         ):
             self.assertIn(variable, BOOTSTRAP[:first_child])
+
+    def test_gateway_release_gate_test_hook_has_a_uniform_boundary(self) -> None:
+        hook = "CF_AGENT_WECHAT_TEST_GATEWAY_GATE_REPLACEMENT"
+        for name, content in {
+            **ENTRYPOINTS,
+            "login.sh": LOGIN,
+            "common.sh": COMMON,
+            "bootstrap-cfserver.sh": BOOTSTRAP,
+        }.items():
+            with self.subTest(entrypoint=name):
+                self.assertIn(hook, content)
 
     def test_libraries_are_snapshotted_from_verified_fds(
         self,

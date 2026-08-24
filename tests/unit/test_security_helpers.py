@@ -10,7 +10,9 @@ import io
 import json
 import logging
 import os
+import shutil
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -273,6 +275,34 @@ class RuntimeTreeScannerTests(unittest.TestCase):
             (root / "wechat-home").mkdir()
             self.scan(root)
 
+    def test_fresh_runtime_layout_requires_two_empty_directories(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "runtime"
+            (root / "data").mkdir(parents=True)
+            (root / "wechat-home").mkdir()
+            attestation = SCAN.scan_tree(
+                root,
+                TOKEN,
+                100,
+                4 * 1024 * 1024,
+                time.monotonic() + 10,
+            )
+            SCAN.validate_empty_runtime_layout(attestation)
+
+            (root / "data" / "unexpected.db").write_bytes(b"public")
+            changed = SCAN.scan_tree(
+                root,
+                TOKEN,
+                100,
+                4 * 1024 * 1024,
+                time.monotonic() + 10,
+            )
+            with self.assertRaisesRegex(
+                SCAN.ScanError,
+                "not empty and exact",
+            ):
+                SCAN.validate_empty_runtime_layout(changed)
+
     def test_same_filesystem_bind_mount_record_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / "runtime"
@@ -338,6 +368,150 @@ class RuntimeTreeScannerTests(unittest.TestCase):
             with self.assertRaises(SCAN.ScanError) as raised:
                 self.scan(root, max_bytes=len(payload) + 1)
             self.assertNotIn(TOKEN.decode(), str(raised.exception))
+
+    def test_token_in_file_or_directory_name_is_rejected_without_disclosure(
+        self,
+    ) -> None:
+        for kind in ("file", "directory"):
+            with (
+                self.subTest(kind=kind),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                root = Path(temporary) / "runtime"
+                root.mkdir()
+                protected_name = f"prefix-{TOKEN.decode()}-suffix"
+                if kind == "file":
+                    (root / protected_name).write_bytes(b"public")
+                else:
+                    (root / protected_name).mkdir()
+                with self.assertRaises(SCAN.ScanError) as raised:
+                    self.scan(root)
+                self.assertNotIn(TOKEN.decode(), str(raised.exception))
+
+    def test_extended_attributes_are_rejected(self) -> None:
+        if not hasattr(os, "setxattr"):
+            self.skipTest("extended attributes are unavailable")
+        for target_kind in ("root", "directory", "file"):
+            with (
+                self.subTest(target=target_kind),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                root = Path(temporary) / "runtime"
+                nested = root / "data"
+                nested.mkdir(parents=True)
+                payload = nested / "payload.db"
+                payload.write_bytes(b"public")
+                target = {"root": root, "directory": nested, "file": payload}[
+                    target_kind
+                ]
+                try:
+                    os.setxattr(target, b"user.cf-agent-test", b"public")
+                except OSError as exc:
+                    self.skipTest(
+                        f"test filesystem does not support xattrs: {exc}"
+                    )
+                with self.assertRaisesRegex(
+                    SCAN.ScanError,
+                    "extended attributes or ACLs",
+                ):
+                    self.scan(root)
+
+    def test_real_posix_acl_storage_is_rejected(self) -> None:
+        setfacl = shutil.which("setfacl")
+        if setfacl is None:
+            self.skipTest("setfacl is unavailable")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "runtime"
+            root.mkdir()
+            payload = root / "payload.db"
+            payload.write_bytes(b"public")
+            subprocess.run(
+                [setfacl, "-m", "u:65534:r--", os.fspath(payload)],
+                check=True,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env={"LANG": "C.UTF-8", "LC_ALL": "C.UTF-8"},
+                timeout=5,
+            )
+            attributes = os.listxattr(payload)
+            self.assertTrue(
+                any("posix_acl" in os.fsdecode(name) for name in attributes),
+                attributes,
+            )
+            with self.assertRaisesRegex(
+                SCAN.ScanError,
+                "extended attributes or ACLs",
+            ):
+                self.scan(root)
+
+    def test_inherited_default_posix_acl_is_rejected(self) -> None:
+        setfacl = shutil.which("setfacl")
+        if setfacl is None:
+            self.skipTest("setfacl is unavailable")
+        with tempfile.TemporaryDirectory() as temporary:
+            parent = Path(temporary) / "storage"
+            parent.mkdir()
+            subprocess.run(
+                [setfacl, "-m", "d:u:65534:rwx", os.fspath(parent)],
+                check=True,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env={"LANG": "C.UTF-8", "LC_ALL": "C.UTF-8"},
+                timeout=5,
+            )
+            root = parent / "runtime"
+            (root / "data").mkdir(parents=True)
+            (root / "wechat-home").mkdir()
+            subprocess.run(
+                [setfacl, "-k", os.fspath(parent)],
+                check=True,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env={"LANG": "C.UTF-8", "LC_ALL": "C.UTF-8"},
+                timeout=5,
+            )
+            attributes = os.listxattr(root)
+            self.assertTrue(
+                any("posix_acl" in os.fsdecode(name) for name in attributes),
+                attributes,
+            )
+            with self.assertRaisesRegex(
+                SCAN.ScanError,
+                "extended attributes or ACLs",
+            ):
+                self.scan(root)
+
+    def test_archive_move_rejects_parent_default_acl_before_rename(
+        self,
+    ) -> None:
+        setfacl = shutil.which("setfacl")
+        if setfacl is None:
+            self.skipTest("setfacl is unavailable")
+        with tempfile.TemporaryDirectory() as temporary:
+            parent = Path(temporary) / "storage"
+            root = parent / "runtime"
+            (root / "data").mkdir(parents=True)
+            (root / "wechat-home").mkdir()
+            destination = parent / "archive-staging"
+            subprocess.run(
+                [setfacl, "-m", "d:u:65534:rwx", os.fspath(parent)],
+                check=True,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env={"LANG": "C.UTF-8", "LC_ALL": "C.UTF-8"},
+                timeout=5,
+            )
+            with self.assertRaisesRegex(
+                SCAN.ScanError,
+                "extended attributes or ACLs",
+            ):
+                self.scan_and_move(root, destination)
+            self.assertTrue(root.is_dir())
+            self.assertFalse(destination.exists())
 
     def test_external_symlink_and_symlink_loop_are_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -433,6 +607,61 @@ class RuntimeTreeScannerTests(unittest.TestCase):
             with self.assertRaisesRegex(SCAN.ScanError, "file-count limit"):
                 self.scan(root, max_files=1)
 
+    def test_compiled_entry_ceiling_rejects_unsafe_configuration(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "runtime"
+            root.mkdir()
+            with self.assertRaisesRegex(SCAN.ScanError, "file-count limit"):
+                SCAN.scan_tree(
+                    root,
+                    TOKEN,
+                    SCAN.MAX_ATTESTATION_ENTRIES + 1,
+                    4 * 1024 * 1024,
+                    time.monotonic() + 10,
+                )
+
+    def test_attestation_path_bytes_are_bounded_before_accumulation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "runtime"
+            root.mkdir()
+            (root / "long-entry-name").write_bytes(b"public")
+            with mock.patch.object(SCAN, "MAX_ATTESTATION_PATH_BYTES", 8):
+                with self.assertRaisesRegex(SCAN.ScanError, "path-byte limit"):
+                    self.scan(root)
+
+    def test_verify_rejects_attestation_over_path_byte_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "runtime"
+            root.mkdir()
+            (root / "long-entry-name").write_bytes(b"public")
+            attestation = SCAN.scan_tree(
+                root,
+                TOKEN,
+                100,
+                4 * 1024 * 1024,
+                time.monotonic() + 10,
+            )
+            with mock.patch.object(SCAN, "MAX_ATTESTATION_PATH_BYTES", 8):
+                with self.assertRaisesRegex(SCAN.ScanError, "path-byte limit"):
+                    SCAN.verify_tree_attestation(
+                        root,
+                        attestation,
+                        100,
+                        time.monotonic() + 10,
+                    )
+
+    def test_surrogateescaped_entry_name_respects_path_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "runtime"
+            root.mkdir()
+            raw_name = os.fsencode(root) + b"/entry-\xff"
+            descriptor = os.open(raw_name, os.O_WRONLY | os.O_CREAT, 0o600)
+            os.close(descriptor)
+            self.scan(root)
+            with mock.patch.object(SCAN, "MAX_ATTESTATION_PATH_BYTES", 4):
+                with self.assertRaisesRegex(SCAN.ScanError, "path-byte limit"):
+                    self.scan(root)
+
     def test_file_open_is_fd_relative_and_no_follow(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / "runtime"
@@ -489,6 +718,107 @@ class RuntimeTreeScannerTests(unittest.TestCase):
             finally:
                 os.close(directory_fd)
 
+    def test_file_xattr_drift_during_final_scan_check_is_rejected(self) -> None:
+        if not hasattr(os, "setxattr"):
+            self.skipTest("extended attributes are unavailable")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "runtime"
+            root.mkdir()
+            payload = root / "payload.db"
+            payload.write_bytes(b"public")
+            try:
+                os.setxattr(payload, b"user.cf-agent-probe", b"public")
+                os.removexattr(payload, b"user.cf-agent-probe")
+            except OSError as exc:
+                self.skipTest(
+                    f"test filesystem does not support xattrs: {exc}"
+                )
+            payload_inode = payload.stat().st_ino
+            real_listxattr = os.listxattr
+            file_calls = 0
+
+            def mutate_on_second_file_check(descriptor):
+                nonlocal file_calls
+                metadata = os.fstat(descriptor)
+                if stat.S_ISREG(metadata.st_mode) and (
+                    metadata.st_ino == payload_inode
+                ):
+                    file_calls += 1
+                    if file_calls == 2:
+                        time.sleep(0.002)
+                        os.setxattr(
+                            descriptor,
+                            b"user.cf-agent-race",
+                            b"public",
+                        )
+                        os.removexattr(descriptor, b"user.cf-agent-race")
+                return real_listxattr(descriptor)
+
+            with mock.patch.object(
+                SCAN.os,
+                "listxattr",
+                side_effect=mutate_on_second_file_check,
+            ):
+                with self.assertRaisesRegex(SCAN.ScanError, "changed"):
+                    self.scan(root)
+            self.assertEqual(file_calls, 2)
+
+    def test_file_xattr_drift_during_attestation_is_rejected(self) -> None:
+        if not hasattr(os, "setxattr"):
+            self.skipTest("extended attributes are unavailable")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "runtime"
+            root.mkdir()
+            payload = root / "payload.db"
+            payload.write_bytes(b"public")
+            try:
+                os.setxattr(payload, b"user.cf-agent-probe", b"public")
+                os.removexattr(payload, b"user.cf-agent-probe")
+            except OSError as exc:
+                self.skipTest(
+                    f"test filesystem does not support xattrs: {exc}"
+                )
+            attestation = SCAN.scan_tree(
+                root,
+                TOKEN,
+                100,
+                4 * 1024 * 1024,
+                time.monotonic() + 10,
+            )
+            payload_inode = payload.stat().st_ino
+            real_listxattr = os.listxattr
+            file_calls = 0
+
+            def mutate_during_file_check(descriptor):
+                nonlocal file_calls
+                metadata = os.fstat(descriptor)
+                if stat.S_ISREG(metadata.st_mode) and (
+                    metadata.st_ino == payload_inode
+                ):
+                    file_calls += 1
+                    time.sleep(0.002)
+                    os.setxattr(
+                        descriptor,
+                        b"user.cf-agent-race",
+                        b"public",
+                    )
+                    os.removexattr(descriptor, b"user.cf-agent-race")
+                return real_listxattr(descriptor)
+
+            with mock.patch.object(
+                SCAN.os,
+                "listxattr",
+                side_effect=mutate_during_file_check,
+            ):
+                with self.assertRaisesRegex(SCAN.ScanError, "changed"):
+                    SCAN.verify_tree_attestation(
+                        root,
+                        attestation,
+                        100,
+                        time.monotonic() + 10,
+                    )
+            self.assertEqual(file_calls, 1)
+
     def test_attested_scan_and_move_preserves_the_verified_tree(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary)
@@ -533,7 +863,7 @@ class RuntimeTreeScannerTests(unittest.TestCase):
             )
 
     def test_post_scan_entry_injections_are_rejected_before_move(self) -> None:
-        for kind in ("symlink", "hardlink", "fifo", "token"):
+        for kind in ("symlink", "hardlink", "fifo", "token", "xattr"):
             with self.subTest(kind=kind), tempfile.TemporaryDirectory() as temporary:
                 base = Path(temporary)
                 root = base / "runtime"
@@ -551,8 +881,19 @@ class RuntimeTreeScannerTests(unittest.TestCase):
                         os.link(payload, root / "injected")
                     elif kind == "fifo":
                         os.mkfifo(root / "injected")
-                    else:
+                    elif kind == "token":
                         payload.write_bytes(TOKEN)
+                    else:
+                        if not hasattr(os, "setxattr"):
+                            self.skipTest("extended attributes are unavailable")
+                        try:
+                            os.setxattr(
+                                payload, b"user.cf-agent-test", b"public"
+                            )
+                        except OSError as exc:
+                            self.skipTest(
+                                f"test filesystem does not support xattrs: {exc}"
+                            )
 
                 with self.assertRaises(SCAN.ScanError):
                     self.scan_and_move(
@@ -711,13 +1052,17 @@ class GatewayContractVerifierTests(unittest.TestCase):
         self.gateway_env = self.base / "gateway.env"
         self.contract_file = self.base / "wechat-runtime-contract.json"
         self.checker = self.base / "check-wechat-worker-heartbeat"
+        self.gate = self.base / "wechat-runtime-release-gate"
         self.checker_sha256 = "c" * 64
+        self.gate_sha256 = "d" * 64
         self.arguments = argparse.Namespace(
             alias="cf-agent-wechat",
             port=6174,
             token_file=str(self.token_file),
             checker=str(self.checker),
+            gate=str(self.gate),
             checker_sha256=self.checker_sha256,
+            gate_sha256=self.gate_sha256,
             producer_repository="Tangbohu09527/CF_agent-gateway",
             service="worker",
             project="cf-agent-gateway",
@@ -876,6 +1221,8 @@ class GatewayContractVerifierTests(unittest.TestCase):
             str(self.token_file),
             "--checker",
             str(self.checker),
+            "--gate",
+            str(self.gate),
             "--service",
             self.arguments.service,
             "--project",
@@ -890,6 +1237,8 @@ class GatewayContractVerifierTests(unittest.TestCase):
             self.arguments.producer_repository,
             "--checker-sha256",
             self.arguments.checker_sha256,
+            "--gate-sha256",
+            self.arguments.gate_sha256,
             "--attestation-kind",
             self.arguments.attestation_kind,
         ]
@@ -1732,6 +2081,7 @@ class GatewayContractVerifierTests(unittest.TestCase):
             {
                 "repository": "Tangbohu09527/CF_agent-gateway",
                 "checkerSha256": self.checker_sha256,
+                "releaseGateSha256": self.gate_sha256,
             },
         )
         self.assertNotIn(
@@ -1745,6 +2095,91 @@ class GatewayContractVerifierTests(unittest.TestCase):
                 "sudo": False,
                 "dockerSocketAccess": False,
                 "producerLinuxProof": "required",
+            },
+        )
+        self.assertEqual(
+            expected["gateway"]["checkerRequest"],
+            {
+                "inputTransport": "stdin-json",
+                "inputSchemaVersion": 1,
+                "maxInputBytes": 4096,
+                "hardTimeoutSeconds": 10,
+                "requestFields": [
+                    "schemaVersion",
+                    "generationId",
+                    "agentContainerId",
+                    "workerContainerId",
+                ],
+                "binding": {
+                    "generationId": "lowercase-hex-64",
+                    "agentContainerId": "lowercase-hex-64",
+                    "workerContainerId": "lowercase-hex-64",
+                },
+            },
+        )
+        self.assertEqual(
+            expected["gateway"]["releaseGate"],
+            {
+                "command": str(self.gate),
+                "interfaceVersion": 1,
+                "inputTransport": "stdin-json",
+                "inputSchemaVersion": 1,
+                "maxInputBytes": 4096,
+                "hardTimeoutSeconds": 10,
+                "silentOutput": True,
+                "execution": {
+                    "caller": "management-user",
+                    "sudo": False,
+                    "dockerSocketAccess": False,
+                    "producerLinuxProof": "required",
+                },
+                "identifierFormats": {
+                    "generationId": "lowercase-hex-64",
+                    "agentContainerId": "lowercase-hex-64",
+                    "workerContainerId": "lowercase-hex-64",
+                },
+                "operations": {
+                    "begin": {
+                        "requestFields": [
+                            "schemaVersion",
+                            "operation",
+                            "generationId",
+                        ],
+                        "invalidatesPreviousReleases": True,
+                    },
+                    "assert-pending": {
+                        "requestFields": [
+                            "schemaVersion",
+                            "operation",
+                            "generationId",
+                        ],
+                        "requiresCurrentUnreleasedGeneration": True,
+                    },
+                    "release": {
+                        "requestFields": [
+                            "schemaVersion",
+                            "operation",
+                            "generationId",
+                            "agentContainerId",
+                            "workerContainerId",
+                        ],
+                        "requiresCurrentUnreleasedGeneration": True,
+                        "agentContainerBinding": "exact",
+                        "workerContainerBinding": "exact-stopped-candidate",
+                    },
+                    "abort": {
+                        "requestFields": [
+                            "schemaVersion",
+                            "operation",
+                            "generationId",
+                        ],
+                        "revokesGeneration": True,
+                    },
+                },
+                "workerAuthorization": {
+                    "default": "deny",
+                    "requiresExactCurrentRelease": True,
+                },
             },
         )
         self.assertEqual(
@@ -1764,9 +2199,14 @@ class GatewayContractVerifierTests(unittest.TestCase):
             ("float-for-int", ("agent", "port"), 6174.0),
             ("int-for-bool", ("gateway", "requiresDockerHealth"), 1),
             (
-                "producer-digest",
+                "producer-checker-digest",
                 ("producer", "checkerSha256"),
-                "d" * 64,
+                "e" * 64,
+            ),
+            (
+                "producer-release-gate-digest",
+                ("producer", "releaseGateSha256"),
+                "e" * 64,
             ),
         )
         for name, path, replacement in mutations:
@@ -1824,8 +2264,12 @@ class GatewayContractVerifierTests(unittest.TestCase):
             ("max_age", 0),
             ("alias", "bad alias"),
             ("checker", "relative/checker"),
+            ("gate", "relative/gate"),
+            ("gate", str(self.gate) + chr(10) + "attacker"),
             ("producer_repository", "missing-owner"),
             ("checker_sha256", "A" * 64),
+            ("gate_sha256", "A" * 64),
+            ("gate_sha256", "d" * 63),
         ):
             with self.subTest(attribute=attribute):
                 arguments = argparse.Namespace(**vars(self.arguments))
@@ -1835,6 +2279,22 @@ class GatewayContractVerifierTests(unittest.TestCase):
                     "arguments are invalid",
                 ):
                     CONTRACT.expected_contract(arguments)
+
+    def test_release_gate_cli_arguments_are_required(self) -> None:
+        for flag in ("--gate", "--gate-sha256"):
+            with self.subTest(flag=flag):
+                command = self.command()
+                index = command.index(flag)
+                del command[index:index + 2]
+                stderr = io.StringIO()
+                with (
+                    mock.patch.object(sys, "argv", command),
+                    contextlib.redirect_stderr(stderr),
+                    self.assertRaises(SystemExit) as raised,
+                ):
+                    CONTRACT.parse_arguments()
+                self.assertEqual(raised.exception.code, 2)
+                self.assertIn("required", stderr.getvalue())
 
     def test_os_error_does_not_echo_a_sensitive_path_component(self) -> None:
         self.write_valid_inputs()

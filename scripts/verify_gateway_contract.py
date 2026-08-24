@@ -817,13 +817,14 @@ def require_exact_contract(path: Path, expected: dict[str, object]) -> None:
 
 def expected_contract(arguments: argparse.Namespace) -> dict[str, object]:
     identifiers = (arguments.alias, arguments.service, arguments.project)
-    paths = (arguments.token_file, arguments.checker)
+    paths = (arguments.token_file, arguments.checker, arguments.gate)
     if (
         not 1 <= arguments.port <= 65535
         or arguments.max_age <= 0
         or any(CONTRACT_IDENTIFIER.fullmatch(value) is None for value in identifiers)
         or PRODUCER_REPOSITORY.fullmatch(arguments.producer_repository) is None
         or SHA256_PATTERN.fullmatch(arguments.checker_sha256) is None
+        or SHA256_PATTERN.fullmatch(arguments.gate_sha256) is None
         or any(not Path(value).is_absolute() for value in paths)
         or any(
             any(
@@ -836,6 +837,7 @@ def expected_contract(arguments: argparse.Namespace) -> dict[str, object]:
                 *paths,
                 arguments.producer_repository,
                 arguments.checker_sha256,
+                arguments.gate_sha256,
             )
         )
     ):
@@ -845,6 +847,7 @@ def expected_contract(arguments: argparse.Namespace) -> dict[str, object]:
         "producer": {
             "repository": arguments.producer_repository,
             "checkerSha256": arguments.checker_sha256,
+            "releaseGateSha256": arguments.gate_sha256,
         },
         "agent": {
             "networkAlias": arguments.alias,
@@ -860,6 +863,23 @@ def expected_contract(arguments: argparse.Namespace) -> dict[str, object]:
             "composeProject": arguments.project,
             "checker": arguments.checker,
             "checkerInterfaceVersion": 1,
+            "checkerRequest": {
+                "inputTransport": "stdin-json",
+                "inputSchemaVersion": 1,
+                "maxInputBytes": 4096,
+                "hardTimeoutSeconds": 10,
+                "requestFields": [
+                    "schemaVersion",
+                    "generationId",
+                    "agentContainerId",
+                    "workerContainerId",
+                ],
+                "binding": {
+                    "generationId": "lowercase-hex-64",
+                    "agentContainerId": "lowercase-hex-64",
+                    "workerContainerId": "lowercase-hex-64",
+                },
+            },
             "heartbeatMaxAgeSeconds": arguments.max_age,
             "requiresDockerHealth": True,
             "requiresSuccessfulPoll": True,
@@ -870,6 +890,68 @@ def expected_contract(arguments: argparse.Namespace) -> dict[str, object]:
                 "sudo": False,
                 "dockerSocketAccess": False,
                 "producerLinuxProof": "required",
+            },
+            "releaseGate": {
+                "command": arguments.gate,
+                "interfaceVersion": 1,
+                "inputTransport": "stdin-json",
+                "inputSchemaVersion": 1,
+                "maxInputBytes": 4096,
+                "hardTimeoutSeconds": 10,
+                "silentOutput": True,
+                "execution": {
+                    "caller": "management-user",
+                    "sudo": False,
+                    "dockerSocketAccess": False,
+                    "producerLinuxProof": "required",
+                },
+                "identifierFormats": {
+                    "generationId": "lowercase-hex-64",
+                    "agentContainerId": "lowercase-hex-64",
+                    "workerContainerId": "lowercase-hex-64",
+                },
+                "operations": {
+                    "begin": {
+                        "requestFields": [
+                            "schemaVersion",
+                            "operation",
+                            "generationId",
+                        ],
+                        "invalidatesPreviousReleases": True,
+                    },
+                    "assert-pending": {
+                        "requestFields": [
+                            "schemaVersion",
+                            "operation",
+                            "generationId",
+                        ],
+                        "requiresCurrentUnreleasedGeneration": True,
+                    },
+                    "release": {
+                        "requestFields": [
+                            "schemaVersion",
+                            "operation",
+                            "generationId",
+                            "agentContainerId",
+                            "workerContainerId",
+                        ],
+                        "requiresCurrentUnreleasedGeneration": True,
+                        "agentContainerBinding": "exact",
+                        "workerContainerBinding": "exact-stopped-candidate",
+                    },
+                    "abort": {
+                        "requestFields": [
+                            "schemaVersion",
+                            "operation",
+                            "generationId",
+                        ],
+                        "revokesGeneration": True,
+                    },
+                },
+                "workerAuthorization": {
+                    "default": "deny",
+                    "requiresExactCurrentRelease": True,
+                },
             },
             "lifecycle": {
                 "restartPolicy": "no",
@@ -894,6 +976,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--gateway-env", required=True)
     parser.add_argument("--token-file", required=True)
     parser.add_argument("--checker", required=True)
+    parser.add_argument("--gate", required=True)
     parser.add_argument("--service", required=True)
     parser.add_argument("--project", required=True)
     parser.add_argument("--alias", required=True)
@@ -901,6 +984,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--max-age", required=True, type=int)
     parser.add_argument("--producer-repository", required=True)
     parser.add_argument("--checker-sha256", required=True)
+    parser.add_argument("--gate-sha256", required=True)
     parser.add_argument(
         "--attestation-kind",
         choices=("compose", "worker-inspect"),

@@ -22,6 +22,8 @@ sys.modules[SPEC.name] = PARSER
 SPEC.loader.exec_module(PARSER)
 
 DIGEST = "a" * 64
+INT64_MAX = (1 << 63) - 1
+UID_GID_MAX = (1 << 32) - 2
 
 
 def valid_values() -> dict[str, str]:
@@ -151,6 +153,76 @@ class ManagementEnvParserTests(unittest.TestCase):
                 PARSER.ManagementEnvError
             ):
                 PARSER.parse_management_env(replace_value(encode_values(), key, value))
+
+    def test_numeric_contracts_bind_before_shell_arithmetic(self) -> None:
+        shell_integer_keys = (
+            "CF_AGENT_WECHAT_MIN_FREE_BYTES",
+            "CF_AGENT_WECHAT_MIN_FREE_INODES",
+            "CF_AGENT_WECHAT_TOKEN_SCAN_MAX_FILES",
+            "CF_AGENT_WECHAT_TOKEN_SCAN_MAX_BYTES",
+        )
+        for key in shell_integer_keys:
+            with self.subTest(key=key, boundary="INT64_MAX"):
+                parsed = PARSER.parse_management_env(
+                    replace_value(encode_values(), key, str(INT64_MAX))
+                )
+                self.assertEqual(parsed[key], str(INT64_MAX))
+            for value in (str(INT64_MAX + 1), "9" * 5000):
+                with (
+                    self.subTest(key=key, rejected_length=len(value)),
+                    self.assertRaisesRegex(
+                        PARSER.ManagementEnvError,
+                        "approved numeric range",
+                    ),
+                ):
+                    PARSER.parse_management_env(
+                        replace_value(encode_values(), key, value)
+                    )
+
+        for key in (
+            "CF_AGENT_WECHAT_RUNTIME_UID",
+            "CF_AGENT_WECHAT_RUNTIME_GID",
+            "CF_AGENT_WECHAT_MANAGEMENT_GID",
+        ):
+            with self.subTest(key=key, boundary="UID_GID_MAX"):
+                parsed = PARSER.parse_management_env(
+                    replace_value(encode_values(), key, str(UID_GID_MAX))
+                )
+                self.assertEqual(parsed[key], str(UID_GID_MAX))
+            with (
+                self.subTest(key=key, rejected="UID_GID_MAX+1"),
+                self.assertRaisesRegex(
+                    PARSER.ManagementEnvError,
+                    "approved numeric range",
+                ),
+            ):
+                PARSER.parse_management_env(
+                    replace_value(encode_values(), key, str(UID_GID_MAX + 1))
+                )
+
+        for value in (
+            "00",
+            "010",
+            "101",
+            str(INT64_MAX + 1),
+            "9" * 5000,
+        ):
+            with (
+                self.subTest(
+                    key="CF_AGENT_WECHAT_MIN_FREE_PERCENT", value=value[:20]
+                ),
+                self.assertRaisesRegex(
+                    PARSER.ManagementEnvError,
+                    "between 0 and 100",
+                ),
+            ):
+                PARSER.parse_management_env(
+                    replace_value(
+                        encode_values(),
+                        "CF_AGENT_WECHAT_MIN_FREE_PERCENT",
+                        value,
+                    )
+                )
 
     def test_proxy_accepts_only_credential_free_scheme_host_and_port(self) -> None:
         accepted = (

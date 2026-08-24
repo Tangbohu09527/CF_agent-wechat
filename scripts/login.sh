@@ -40,6 +40,7 @@ _management_test_passthrough_names=(
   CF_AGENT_WECHAT_TEST_ROOT
   CF_AGENT_WECHAT_TEST_GATEWAY_VERIFIER_REPLACEMENT
   CF_AGENT_WECHAT_TEST_GATEWAY_CHECKER_REPLACEMENT
+  CF_AGENT_WECHAT_TEST_GATEWAY_GATE_REPLACEMENT
   CF_AGENT_WECHAT_TOKEN_FILE CF_AGENT_WECHAT_TEST_PIP_INSTALL_TIMEOUT
   CF_AGENT_WECHAT_TEST_PIP_NETWORK_TIMEOUT CF_AGENT_WECHAT_TEST_PIP_RETRIES
   CF_AGENT_WECHAT_TEST_VENV_CREATE_TIMEOUT TMPDIR HTTP_CONNECT_TIMEOUT
@@ -72,6 +73,7 @@ if [ "${CF_AGENT_WECHAT_TESTING:-0}" != "1" ]; then
     CF_AGENT_WECHAT_TEST_ROOT \
     CF_AGENT_WECHAT_TEST_GATEWAY_VERIFIER_REPLACEMENT \
     CF_AGENT_WECHAT_TEST_GATEWAY_CHECKER_REPLACEMENT \
+    CF_AGENT_WECHAT_TEST_GATEWAY_GATE_REPLACEMENT \
     CF_AGENT_WECHAT_TOKEN CF_AGENT_WECHAT_TOKEN_FILE AUTH_TOKEN \
     CF_AGENT_WECHAT_TEST_PIP_INSTALL_TIMEOUT \
     CF_AGENT_WECHAT_TEST_PIP_NETWORK_TIMEOUT \
@@ -93,7 +95,7 @@ if [ "${CF_AGENT_WECHAT_TESTING:-0}" != "1" ]; then
   done
 else
   for _management_env_name in "${_management_test_passthrough_names[@]}"; do
-    export -n "$_management_env_name" 2>/dev/null || :
+    export -n "${_management_env_name?}" 2>/dev/null || :
   done
 fi
 for _management_sensitive_name in \
@@ -250,7 +252,7 @@ if [ "${CF_AGENT_WECHAT_TESTING:-0}" = "1" ]; then
   esac
   export PATH
   for _management_env_name in "${_management_test_passthrough_names[@]}"; do
-    [[ -v $_management_env_name ]] && export "$_management_env_name"
+    [[ -v $_management_env_name ]] && export "${_management_env_name?}"
   done
 fi
 
