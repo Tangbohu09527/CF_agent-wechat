@@ -6,6 +6,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shlex
 import shutil
 import socket
@@ -104,6 +105,8 @@ class RuntimeFixture:
         self.login_log = self.root / "login.log"
         self.server: subprocess.Popen[bytes] | None = None
         self.background: list[subprocess.Popen[str]] = []
+        self.last_result: subprocess.CompletedProcess[str] | None = None
+        self.last_elapsed_seconds = 0.0
 
         self.token = hashlib.sha256(
             f"{SENSITIVE_TOKEN_PREFIX}{name}".encode()
@@ -811,16 +814,23 @@ class RuntimeFixture:
             command.append("-x")
         command.extend([str(SCRIPTS / script), *arguments])
         command = ["script", "-qefc", shlex.join(command), "/dev/null"]
-        return subprocess.run(
-            command,
-            cwd=REPO_ROOT,
-            env=self.env,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            timeout=timeout,
-            check=False,
-        )
+        self.last_result = None
+        started = time.monotonic()
+        try:
+            result = subprocess.run(
+                command,
+                cwd=REPO_ROOT,
+                env=self.env,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                timeout=timeout,
+                check=False,
+            )
+            self.last_result = result
+            return result
+        finally:
+            self.last_elapsed_seconds = time.monotonic() - started
 
     def popen(self, script: str, *arguments: str) -> subprocess.Popen[str]:
         command = ["bash", str(SCRIPTS / script), *arguments]
@@ -864,6 +874,97 @@ class RuntimeFixture:
             for line in self.audit_log.read_text(encoding="utf-8").splitlines()
             if line
         ]
+
+    def sanitized_diagnostics(self, test_name: str) -> str:
+        result = self.last_result
+        output = result.stdout if result is not None else ""
+        phase_match = re.search(
+            r"failed during phase:\s*([A-Za-z0-9_-]{1,64})",
+            output,
+            flags=re.IGNORECASE,
+        )
+        phase = phase_match.group(1) if phase_match else "unavailable"
+
+        def safe_state(name: str, allowed: set[str]) -> str:
+            try:
+                value = self.read_state(name)
+            except OSError:
+                return "missing"
+            return value if value in allowed else "redacted-invalid"
+
+        mutation_actions = []
+        for line in self.mutation_lines()[-50:]:
+            if re.fullmatch(r"[a-z][a-z0-9 -]{0,80}", line):
+                mutation_actions.append(line)
+            else:
+                mutation_actions.append("redacted-invalid")
+        gateway_gate_actions = [
+            line if line in {"begin", "assert-pending", "release", "abort"}
+            else "redacted-invalid"
+            for line in self.gate_lines()[-50:]
+        ]
+
+        audit_categories: dict[str, int] = {}
+        for line in self.audit_lines()[-50:]:
+            category = "other"
+            for prefix, candidate in (
+                ("GET ", "agent-api-get"),
+                ("gateway gate ", "gateway-gate"),
+                ("gateway worker ", "gateway-worker"),
+                ("agent compose ", "agent-compose"),
+                ("gateway compose ", "gateway-compose"),
+                ("agent container ", "agent-container"),
+                ("docker ", "docker"),
+            ):
+                if line.startswith(prefix):
+                    category = candidate
+                    break
+            audit_categories[category] = audit_categories.get(category, 0) + 1
+
+        root = self.root.resolve(strict=False)
+        confinement = {}
+        for label, candidate in (
+            ("tmp", self.tmp),
+            ("storage", self.storage),
+            ("runtime", self.runtime),
+            ("archive", self.archive),
+            ("secrets", self.secrets),
+            ("lock", Path(self.env["CF_AGENT_WECHAT_LOCK_FILE"])),
+            ("fake_bin", self.fake_bin),
+            ("docker_socket", self.docker_socket_path),
+            ("docker_state", self.docker_state),
+            ("gateway", self.gateway_dir),
+        ):
+            resolved = candidate.resolve(strict=False)
+            confinement[label] = (
+                resolved != root
+                and os.path.commonpath((root, resolved)) == os.fspath(root)
+            )
+
+        return "\n".join(
+            (
+                "SANITIZED LIFECYCLE FIXTURE DIAGNOSTICS",
+                f"test={test_name}",
+                "return_code="
+                + (str(result.returncode) if result is not None else "unavailable"),
+                f"elapsed_seconds={self.last_elapsed_seconds:.3f}",
+                f"failure_phase={phase}",
+                "gateway_running="
+                + safe_state("gateway_running", {"0", "1"}),
+                "gateway_gate_state="
+                + safe_state(
+                    "gateway_gate_state",
+                    {"inactive", "pending", "released", "aborted"},
+                ),
+                "agent_running=" + safe_state("agent_running", {"0", "1"}),
+                "mutation_actions=" + json.dumps(mutation_actions),
+                "gateway_gate_actions=" + json.dumps(gateway_gate_actions),
+                "audit_categories=" + json.dumps(
+                    audit_categories, sort_keys=True
+                ),
+                "paths_confined=" + json.dumps(confinement, sort_keys=True),
+            )
+        )
 
     def assert_no_sensitive_text(
         self, testcase: unittest.TestCase, *values: str
@@ -931,6 +1032,34 @@ class ForcedQrRuntimeTests(unittest.TestCase):
         self.fixture = RuntimeFixture(self._testMethodName)
 
     def tearDown(self) -> None:
+        outcome = getattr(self, "_outcome", None)
+        result = getattr(outcome, "result", None)
+        failed = False
+        if result is not None:
+            for collection_name in ("failures", "errors"):
+                for failed_test, _traceback in getattr(
+                    result, collection_name, ()
+                ):
+                    if failed_test is self or getattr(
+                        failed_test, "test_case", None
+                    ) is self:
+                        failed = True
+                        break
+                if failed:
+                    break
+        if failed:
+            try:
+                print(
+                    self.fixture.sanitized_diagnostics(self._testMethodName),
+                    file=sys.stderr,
+                    flush=True,
+                )
+            except Exception:
+                print(
+                    "SANITIZED LIFECYCLE FIXTURE DIAGNOSTICS unavailable",
+                    file=sys.stderr,
+                    flush=True,
+                )
         self.fixture.close()
 
     def test_fixture_temporary_paths_are_strictly_confined(self) -> None:

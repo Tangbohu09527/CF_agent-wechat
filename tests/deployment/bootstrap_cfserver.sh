@@ -549,7 +549,7 @@ pass "Bootstrap rejects overflow, overlong, scanner-limit, and non-canonical per
 prepare_fixture inherited-storage-default-acl
 sudo -n -- rm -rf -- "$STORAGE_ROOT"
 setfacl -m d:u:65534:rwx "$SCENARIO_ROOT"
-expect_failure +  'storage root must be a stable no-follow directory without extended attributes or ACLs'
+expect_failure 'storage root must be a stable no-follow directory without extended attributes or ACLs'
 sudo -n -- test -d "$STORAGE_ROOT" ||
   fail "default-ACL fixture did not reach managed storage creation"
 sudo -n -- test ! -e "$TOKEN_FILE" ||
@@ -559,12 +559,12 @@ pass "Bootstrap rejects a default ACL inherited during managed storage creation"
 prepare_fixture archive-default-acl
 sudo -n -- install -d -o 0 -g 0 -m 700 -- "$ARCHIVE_ROOT"
 sudo -n -- setfacl -m d:u:65534:rwx "$ARCHIVE_ROOT"
-expect_failure +  'archive root must be a stable no-follow directory without extended attributes or ACLs'
+expect_failure 'archive root must be a stable no-follow directory without extended attributes or ACLs'
 pass "Bootstrap rejects default ACLs on the Archive root"
 
 prepare_fixture secrets-default-acl
 sudo -n -- setfacl -m d:u:65534:rwx "$STORAGE_ROOT/secrets"
-expect_failure +  'secrets directory must be a stable no-follow directory without extended attributes or ACLs'
+expect_failure 'secrets directory must be a stable no-follow directory without extended attributes or ACLs'
 pass "Bootstrap rejects default ACLs on the secrets directory"
 
 prepare_fixture retry

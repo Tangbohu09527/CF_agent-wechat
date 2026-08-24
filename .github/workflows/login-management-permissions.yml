@@ -48,7 +48,25 @@ jobs:
         run: python3 -m unittest discover -s tests/unit -p "test_*.py" -v
 
       - name: Run isolated forced fresh QR lifecycle tests
-        run: python3 tests/integration/test_qr_runtime.py
+        shell: bash
+        run: |
+          status=0
+          for lifecycle_test in \
+            ForcedQrRuntimeTests.test_agent_env_validation_fails_before_any_mutation \
+            ForcedQrRuntimeTests.test_agent_server_failure_cleans_and_worker_failure_preserves_agent \
+            ForcedQrRuntimeTests.test_archive_capacity_and_inode_gates_stop_worker_before_qr \
+            ForcedQrRuntimeTests.test_empty_chats_and_unreadable_messages_both_block_worker \
+            ForcedQrRuntimeTests.test_exact_actual_container_attestation_rejects_drift \
+            ForcedQrRuntimeTests.test_success_archives_atomically_preserves_permissions_and_gates_worker
+          do
+            echo "::group::Lifecycle diagnostic: $lifecycle_test"
+            if ! python3 tests/integration/test_qr_runtime.py \
+              -v -f "$lifecycle_test"; then
+              status=1
+            fi
+            echo "::endgroup::"
+          done
+          exit "$status"
 
       - name: Run safe management environment tests
         run: bash tests/integration/management_environment.sh
