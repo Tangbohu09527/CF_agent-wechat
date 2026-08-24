@@ -242,6 +242,21 @@ printf '%s\n' \
   'exec /usr/bin/mktemp "$@"' > "${AUDIT_BIN}/mktemp"
 chown root:root "${AUDIT_BIN}/mktemp"
 chmod 755 "${AUDIT_BIN}/mktemp"
+printf '%s\n' \
+  '#!/bin/sh' \
+  'set -eu' \
+  'if [ "${1:-}" = -I ] && [ "${2:-}" = -c ] && [ "${4:-}" = execute ]; then' \
+  '  case "${3:-}" in' \
+  '    *"Gateway verifier snapshot validation failed."*)' \
+  "      printf 'verifier\\tprotected-input\\trequested\\n' >> '$AUDIT_LOG'" \
+  "      CF_AUDIT_LOG='$AUDIT_LOG' CF_AUDIT_REAL_SUDO='$REAL_SUDO' \\" \
+  "        exec '${AUDIT_BIN}/sudo' -n -- /usr/bin/python3 \"\$@\"" \
+  '      ;;' \
+  '  esac' \
+  'fi' \
+  'exec /usr/bin/python3 "$@"' > "${AUDIT_BIN}/python3"
+chown root:root "${AUDIT_BIN}/python3"
+chmod 755 "${AUDIT_BIN}/python3"
 python3 - "$DOCKER_SOCKET" <<'PY'
 import socket
 import sys
@@ -332,7 +347,7 @@ install -d -o root -g root -m 700 -- "${NO_SUDO_HOME}/secrets"
 install -o root -g root -m 600 -- "$TOKEN_FILE" "$NO_SUDO_TOKEN_FILE"
 python3 - "${REPO_ROOT}/scripts/verify_gateway_contract.py" \
   "$GATEWAY_CONTRACT_FILE" "$GATEWAY_HEARTBEAT_COMMAND" \
-  "$GATEWAY_RELEASE_GATE_COMMAND" "$TOKEN_FILE" "$TEST_AGENT_PORT" <<'PY'
+  "$GATEWAY_RELEASE_GATE_COMMAND" "$TOKEN_FILE" <<'PY'
 import argparse
 import hashlib
 import importlib.util
@@ -341,9 +356,8 @@ import sys
 from pathlib import Path
 
 verifier_path, contract_path, checker_path, gate_path, token_path = map(
-    Path, sys.argv[1:6]
+    Path, sys.argv[1:]
 )
-agent_port = int(sys.argv[6])
 spec = importlib.util.spec_from_file_location(
     "permission_fixture_gateway_contract", verifier_path
 )
@@ -354,7 +368,7 @@ spec.loader.exec_module(verifier)
 contract = verifier.expected_contract(
     argparse.Namespace(
         alias="cf-agent-wechat",
-        port=agent_port,
+        port=6174,
         token_file=str(token_path),
         checker=str(checker_path),
         gate=str(gate_path),
@@ -480,6 +494,16 @@ assert_status_docker_paths() {
     [ "$(audit_count docker image)" -lt 1 ]; then
     fail "status.sh did not attest the approved image and network"
   fi
+  grep -Fqx 'gateway compose config' "$MOCK_DOCKER_LOG" ||
+    fail "status.sh did not render the Gateway credential contract"
+  grep -Fqx 'agent compose config' "$MOCK_DOCKER_LOG" ||
+    fail "status.sh did not render the Agent runtime contract"
+  grep -Fqx 'agent compose ps' "$MOCK_DOCKER_LOG" ||
+    fail "status.sh did not query the Agent Compose state"
+  grep -Fqx 'gateway compose ps' "$MOCK_DOCKER_LOG" ||
+    fail "status.sh did not query the Gateway Compose state"
+  [ "$(audit_count verifier protected-input)" -eq 1 ] ||
+    fail "status.sh did not verify protected Gateway inputs through one sudo -n execution"
   assert_no_sudo_docker "status.sh"
   assert_token_read_once "status.sh"
   assert_sudo_contract "status.sh"
@@ -554,6 +578,50 @@ for sensitive, replacement in (
     content = content.replace(sensitive, replacement)
 sys.stderr.buffer.write(content)
 PY
+}
+
+status_fixture_reason_code() {
+  local status_output="$1"
+  local code=unclassified
+
+  if grep -Fq 'gateway compose invocation invalid' "$MOCK_DOCKER_LOG"; then
+    code=gateway-compose-invocation
+  elif ! grep -Fqx 'gateway compose config' "$MOCK_DOCKER_LOG"; then
+    code=gateway-compose-config
+  elif [ "$(audit_count docker info)" -eq 0 ]; then
+    code=gateway-contract-verifier
+  elif [ "$(audit_count docker info)" -lt 3 ]; then
+    code=docker-info
+  elif [ "$(audit_count docker context)" -lt 2 ]; then
+    code=docker-context
+  elif ! grep -Fqx 'agent compose ps' "$MOCK_DOCKER_LOG"; then
+    code=agent-compose-ps
+  elif ! grep -Fqx 'agent compose config' "$MOCK_DOCKER_LOG"; then
+    code=agent-compose-config
+  elif [ "$(audit_count docker inspect)" -eq 0 ]; then
+    code=agent-container-inspect
+  elif [ "$(audit_count docker image)" -eq 0 ]; then
+    code=agent-image-inspect
+  elif ! grep -Fqx 'gateway compose ps' "$MOCK_DOCKER_LOG"; then
+    code=gateway-compose-ps
+  elif [ "$(audit_count docker inspect)" -lt 4 ]; then
+    code=container-health-or-runtime-inspect
+  elif [ "$(audit_count docker exec)" -lt 2 ]; then
+    code=wechat-process-attestation
+  elif ! grep -Fqx 'GET /health' "$LOG_FILE"; then
+    code=agent-api-health
+  elif ! grep -Fqx 'GET /api/status/auth' "$LOG_FILE"; then
+    code=agent-api-auth
+  elif ! grep -Fqx 'GET /api/chats' "$LOG_FILE"; then
+    code=agent-api-chats
+  elif ! grep -Fqx 'GET /api/messages/<redacted>' "$LOG_FILE"; then
+    code=agent-api-messages
+  elif grep -Fq \
+      'Gateway heartbeat is unavailable without an exact released runtime-generation binding.' \
+      "$status_output"; then
+    code=gateway-heartbeat-unbound
+  fi
+  printf 'status-fixture-reason=%s\n' "$code" >&2
 }
 
 assert_user_processes_have_no_token() {
@@ -635,7 +703,7 @@ run_script_as() {
     CF_AGENT_WECHAT_TESTING=1 \
     "${TEST_DOCKER_ENV[@]}" \
     "${TEST_MANAGEMENT_ENV[@]}" \
-    API_URL="http://127.0.0.1:${HTTP_PORT}" \
+    API_URL="$STATUS_API_URL" \
     WS_URL="ws://127.0.0.1:${WS_PORT}/api/ws/login" \
     TOKEN_FILE="$TOKEN_FILE" \
     PYTHON_BIN=python3 \
@@ -967,7 +1035,8 @@ python3 "${REPO_ROOT}/tests/helpers/mock_agent_wechat.py" \
   --ready-file "$READY_FILE" \
   --pause-file "$PAUSE_FILE" \
   --continue-file "$CONTINUE_FILE" \
-  --scenario-file "$SCENARIO_FILE" &
+  --scenario-file "$SCENARIO_FILE" \
+  --http-port "$TEST_AGENT_PORT" &
 MOCK_PID=$!
 for _attempt in $(seq 1 100); do
   [ -s "$READY_FILE" ] && break
@@ -977,15 +1046,30 @@ done
 [ -s "$READY_FILE" ] || fail "mock server did not become ready"
 HTTP_PORT="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["http_port"])' "$READY_FILE")"
 WS_PORT="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["ws_port"])' "$READY_FILE")"
+[ "$HTTP_PORT" = "$TEST_AGENT_PORT" ] ||
+  fail "status fixture did not bind the approved published Agent port"
+STATUS_API_URL="http://127.0.0.1:${TEST_AGENT_PORT}"
+[ "$STATUS_API_URL" = "http://127.0.0.1:${HTTP_PORT}" ] ||
+  fail "status fixture API URL does not use the approved published Agent port"
 
 reset_audit
 STATUS_OUTPUT="${TEST_ROOT}/status.out"
-if ! run_script_as "$TEST_USER" status.sh > "$STATUS_OUTPUT" 2>&1; then
+if run_script_as "$TEST_USER" status.sh > "$STATUS_OUTPUT" 2>&1; then
+  STATUS_RESULT=0
+else
+  STATUS_RESULT=$?
+fi
+if [ "$STATUS_RESULT" -ne 1 ] ||
+  ! grep -Fq 'unavailable_without_release_binding' "$STATUS_OUTPUT" ||
+  ! grep -Fq \
+    'Gateway heartbeat is unavailable without an exact released runtime-generation binding.' \
+    "$STATUS_OUTPUT"; then
   printf '%s\n' 'status.sh failure output (token redacted):' >&2
   print_redacted_file "$STATUS_OUTPUT"
+  status_fixture_reason_code "$STATUS_OUTPUT"
   printf '%s\n' 'status.sh audit log:' >&2
   print_redacted_file "$AUDIT_LOG"
-  fail "ordinary-user status.sh failed"
+  fail "ordinary-user status.sh did not reach its fail-closed heartbeat boundary"
 fi
 grep -q 'logged_in' "$STATUS_OUTPUT" || fail "status.sh did not report logged_in"
 if grep -q 'account-fixture-not-for-output' "$STATUS_OUTPUT"; then
@@ -1008,7 +1092,7 @@ if sudo -u "$TEST_USER" -H env \
   CF_AGENT_WECHAT_TESTING=1 \
   "${TEST_DOCKER_ENV[@]}" \
   "${TEST_MANAGEMENT_ENV[@]}" \
-  API_URL="http://127.0.0.1:${HTTP_PORT}" \
+  API_URL="$STATUS_API_URL" \
   WS_URL="ws://127.0.0.1:${WS_PORT}/api/ws/login" \
   TOKEN_FILE="$TOKEN_FILE" \
   PYTHON_BIN=python3 \
@@ -1029,11 +1113,18 @@ if sudo -u "$TEST_USER" -H env \
   CF_AGENT_GATEWAY_HEARTBEAT_COMMAND="$GATEWAY_HEARTBEAT_COMMAND" \
   NO_PROXY=127.0.0.1,localhost \
   /bin/bash -x "${TEST_REPO}/scripts/status.sh" > "$TRACE_OUTPUT" 2>&1; then
-  :
+  TRACE_RESULT=0
 else
+  TRACE_RESULT=$?
+fi
+if [ "$TRACE_RESULT" -ne 1 ] ||
+  ! grep -Fq \
+    'Gateway heartbeat is unavailable without an exact released runtime-generation binding.' \
+    "$TRACE_OUTPUT"; then
   printf '%s\n' 'traced status.sh failure output (token redacted):' >&2
   print_redacted_file "$TRACE_OUTPUT"
-  fail "traced ordinary-user status.sh failed"
+  status_fixture_reason_code "$TRACE_OUTPUT"
+  fail "traced ordinary-user status.sh did not preserve the heartbeat boundary"
 fi
 assert_file_has_no_token "$TRACE_OUTPUT"
 if grep -q 'Authorization: Bearer' "$TRACE_OUTPUT"; then

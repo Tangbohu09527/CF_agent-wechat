@@ -16,8 +16,31 @@ via_sudo="${CF_BOOTSTRAP_DOCKER_VIA_SUDO:-0}"
 
 hang_forever() {
   printf '%s\n' "$BASHPID" > "${STATE_DIR}/hang.pid"
+  /usr/bin/python3 -I - "$BASHPID" "${STATE_DIR}/hang.process" <<'PY'
+import pathlib
+import sys
+
+
+def process_identity(pid: int) -> tuple[int, int]:
+    raw = pathlib.Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
+    fields = raw[raw.rfind(")") + 2 :].split()
+    return int(fields[2]), int(fields[19])
+
+
+pid = int(sys.argv[1])
+pgid, pid_start = process_identity(pid)
+leader_pgid, pgid_start = process_identity(pgid)
+if leader_pgid != pgid:
+    raise SystemExit(1)
+pathlib.Path(sys.argv[2]).write_text(
+    f"{pid} {pid_start} {pgid} {pgid_start}\n",
+    encoding="ascii",
+)
+PY
+  /usr/bin/python3 -c 'import time; print(time.monotonic_ns())' \
+    > "${STATE_DIR}/hang.started"
   trap '' TERM
-  while :; do sleep 1; done
+  exec /usr/bin/sleep 300
 }
 
 read_env_value() {

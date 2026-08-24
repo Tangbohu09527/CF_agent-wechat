@@ -368,6 +368,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pause-file", type=Path, required=True)
     parser.add_argument("--continue-file", type=Path, required=True)
     parser.add_argument("--scenario-file", type=Path)
+    parser.add_argument("--http-port", type=int, default=0)
     return parser.parse_args()
 
 
@@ -383,7 +384,7 @@ def main() -> int:
     )
     stop = threading.Event()
 
-    http_server = MockHttpServer(("127.0.0.1", 0), state)
+    http_server = MockHttpServer(("127.0.0.1", args.http_port), state)
     http_thread = threading.Thread(target=http_server.serve_forever, daemon=True)
     http_thread.start()
 

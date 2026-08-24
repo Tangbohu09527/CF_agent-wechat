@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import re
+import signal
 import shlex
 import shutil
 import socket
@@ -30,6 +31,154 @@ SENSITIVE_ACCOUNT_PREFIX = "account-fixture-sensitive-"
 SENSITIVE_CHAT_PREFIX = "chat fixture/sensitive?"
 SENSITIVE_AGENT_ENV_PREFIX = "agent-env-fixture-sensitive-"
 SENSITIVE_GATEWAY_ENV_PREFIX = "gateway-env-fixture-sensitive-"
+EXACT_ACTUAL_CONTAINER_ATTESTATION_CASES = (
+    ("previously-started-exited", "actual_status", "exited"),
+    ("restarting", "actual_restarting", "true"),
+    ("paused", "actual_paused", "true"),
+    ("dead", "actual_dead", "true"),
+    ("oom-killed", "actual_oom_killed", "true"),
+    ("nonzero-exit", "actual_exit_code", "1"),
+    ("restart-count", "actual_restart_count", "1"),
+    ("restart", "actual_restart", "unless-stopped"),
+    (
+        "image",
+        "actual_image",
+        "ghcr.io/example/agent-wechat@sha256:" + ("1" * 64),
+    ),
+    ("project", "actual_project", "wrong-project"),
+    ("container", "actual_container", "wrong-container"),
+    (
+        "container-image-id",
+        "actual_container_image_id",
+        "sha256:" + ("c" * 64),
+    ),
+    (
+        "approved-repo-digest",
+        "actual_repo_digest",
+        "ghcr.io/example/agent-wechat@sha256:" + ("d" * 64),
+    ),
+    ("environment", "actual_extra_environment", "1"),
+    ("published-port", "actual_extra_port", "1"),
+    ("network-alias", "actual_network_alias", "attacker-alias"),
+    ("restart-retry", "actual_restart_retry", "1"),
+    ("entrypoint", "actual_entrypoint", '["/bin/sh"]'),
+    ("command", "actual_command", '["sleep","infinity"]'),
+    ("user", "actual_user", "root"),
+    ("working-dir", "actual_working_dir", "/tmp"),
+    ("stop-signal", "actual_stop_signal", "SIGKILL"),
+    ("stop-timeout", "actual_stop_timeout", "5"),
+    ("healthcheck-test", "actual_healthcheck_test", '["NONE"]'),
+    ("healthcheck-interval", "actual_healthcheck_interval", "1"),
+    ("data-bind-source", "actual_data_bind_source", "/tmp/attacker"),
+    ("token-bind-mode", "actual_token_bind_mode", "rw"),
+    ("extra-bind", "actual_extra_bind", "1"),
+    ("network-mode", "actual_network_mode", "bridge"),
+    ("extra-network", "actual_extra_network", "1"),
+    ("log-driver", "actual_log_driver", "local"),
+    ("log-options", "actual_log_max_size", "200m"),
+    ("data-mount-source", "actual_data_mount_source", "/tmp/attacker"),
+    ("token-mount-writable", "actual_token_mount_rw", "true"),
+    ("mount-propagation", "actual_propagation", "shared"),
+    ("bind-ip", "actual_bind_ip", "0.0.0.0"),
+    ("host-port", "actual_port", "9999"),
+    ("proxy", "actual_proxy", "http://attacker.invalid:8080"),
+    ("rust-log", "actual_rust", "trace"),
+    ("privileged", "actual_privileged", "true"),
+    ("cap-add", "actual_cap_add", "[]"),
+    ("security-opt", "actual_security_opt", "[]"),
+    ("devices", "actual_devices", '[{"PathOnHost":"/dev/null"}]'),
+    ("device-requests", "actual_device_requests", "[{}]"),
+    ("pid-mode", "actual_pid_mode", "host"),
+    ("ipc-mode", "actual_ipc_mode", "host"),
+    ("uts-mode", "actual_uts_mode", "host"),
+    ("userns-mode", "actual_userns_mode", "host"),
+    ("cgroupns-mode", "actual_cgroupns_mode", "host"),
+    ("readonly-rootfs", "actual_readonly_rootfs", "true"),
+    ("auto-remove", "actual_auto_remove", "true"),
+)
+LIFECYCLE_SHARD_ESTIMATE_VERSION = 1
+LIFECYCLE_SHARD_DEFAULT_SECONDS = 12
+LIFECYCLE_SHARD_ATTESTATION_SECONDS = 10
+# Fixed estimates are coarse wall-clock budgets based on fixture scenario
+# multiplicity and Linux CI watchdog evidence. New tests receive the safe
+# default above until an observed duration justifies an explicit override.
+LIFECYCLE_SHARD_ESTIMATED_SECONDS = {
+    "test_each_start_rejects_startup_and_rendered_policy_drift": 114,
+    "test_agent_env_validation_fails_before_any_mutation": 72,
+    "test_gateway_contract_gate_stops_worker_and_fails_closed": 60,
+    "test_gateway_gate_release_failures_abort_without_worker_start": 56,
+    "test_worker_checker_failure_timeout_and_output_revoke_release": 56,
+    "test_login_start_error_envelopes_block_websocket_and_worker": 48,
+    "test_archive_capacity_rejects_unsafe_df_numbers_before_archive": 40,
+    "test_launcher_and_executable_mismatches_fail_closed": 36,
+    "test_empty_chats_and_unreadable_messages_both_block_worker": 36,
+    "test_gateway_env_missing_or_symlink_fails_before_any_mutation": 32,
+    "test_management_numeric_boundaries_fail_before_lifecycle_mutation": 32,
+    "test_runtime_permission_drift_is_rejected_before_mutation": 32,
+    "test_agent_server_failure_cleans_and_worker_failure_preserves_agent": 28,
+    "test_missing_or_unstable_wechat_process_fails_before_login": 24,
+    "test_process_identity_change_after_api_validation_blocks_worker": 24,
+    "test_repeated_start_never_overwrites_an_archive": 24,
+    "test_archive_capacity_and_inode_gates_stop_worker_before_qr": 20,
+    "test_archive_capacity_is_rechecked_at_archive_commit_boundary": 20,
+    "test_archive_capacity_rejects_available_greater_than_total": 20,
+    "test_gateway_gate_begin_failure_and_sensitive_output_fail_closed": 20,
+    "test_raw_inspect_token_is_rejected_without_transport_leak": 20,
+}
+ALLOWED_FLOW_PHASES = frozenset(
+    {
+        "initializing",
+        "validation",
+        "stop_gateway_worker",
+        "verify_gateway_contract",
+        "begin_gateway_generation",
+        "archive_preflight",
+        "prepare_login_environment",
+        "load_auth_token",
+        "remove_agent_container",
+        "attest_stopped_agent_candidate",
+        "guard_worker_before_archive",
+        "archive_capacity_commit_gate",
+        "gateway_generation_archive_commit_gate",
+        "archive_runtime",
+        "create_runtime",
+        "guard_worker_before_agent_start",
+        "start_agent_container",
+        "wait_docker_health",
+        "wait_agent_server",
+        "wait_wechat_process",
+        "wait_clean_auth",
+        "guard_worker_before_qr",
+        "force_qr_login",
+        "guard_worker_before_runtime_validation",
+        "verify_wechat_process",
+        "verify_runtime_apis",
+        "guard_worker_before_final_attestation",
+        "verify_final_wechat_process",
+        "revalidate_final_runtime_contract",
+        "guard_worker_before_gateway_release",
+        "revalidate_gateway_contract",
+        "guard_worker_at_release",
+        "create_gateway_worker_candidate",
+        "revalidate_gateway_release_bindings",
+        "release_gateway_generation",
+        "start_gateway_worker",
+        "complete",
+    }
+)
+ALLOWED_MUTATION_ACTIONS = frozenset(
+    {
+        "agent container start attested candidate",
+        "gateway worker direct stop",
+        "gateway worker stop failed",
+        "gateway worker stop",
+        "agent container stop",
+        "agent container remove",
+        "gateway worker start",
+        "agent container create stopped",
+        "forbidden compose down",
+    }
+)
 
 
 def tree_digest(path: Path) -> str:
@@ -108,6 +257,7 @@ class RuntimeFixture:
         self.background: list[subprocess.Popen[str]] = []
         self.last_result: subprocess.CompletedProcess[str] | None = None
         self.last_elapsed_seconds = 0.0
+        self.diagnostics_emitted = False
 
         self.token = hashlib.sha256(
             f"{SENSITIVE_TOKEN_PREFIX}{name}".encode()
@@ -741,9 +891,16 @@ class RuntimeFixture:
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline and not self.ready_file.exists():
             if self.server.poll() is not None:
+                self.server.wait()
                 raise RuntimeError("mock agent server exited before ready")
             time.sleep(0.02)
         if not self.ready_file.exists():
+            self.server.terminate()
+            try:
+                self.server.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                self.server.kill()
+                self.server.wait(timeout=3)
             raise RuntimeError("mock agent server did not become ready")
         ports = json.loads(self.ready_file.read_text(encoding="utf-8"))
         self.env["API_URL"] = f"http://127.0.0.1:{ports['http_port']}"
@@ -817,20 +974,35 @@ class RuntimeFixture:
         command = ["script", "-qefc", shlex.join(command), "/dev/null"]
         self.last_result = None
         started = time.monotonic()
+        process = subprocess.Popen(
+            command,
+            cwd=REPO_ROOT,
+            env=self.env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
         try:
-            result = subprocess.run(
-                command,
-                cwd=REPO_ROOT,
-                env=self.env,
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
+            output, _ = self.communicate_with_timeout(
+                process,
                 timeout=timeout,
-                check=False,
+                label=f"{script} completion",
+            )
+            result = subprocess.CompletedProcess(
+                process.args,
+                process.returncode,
+                output,
             )
             self.last_result = result
             return result
+        except BaseException:
+            if process.poll() is None:
+                self.terminate_process_group_and_reap(process)
+            raise
         finally:
+            if process.stdout is not None and not process.stdout.closed:
+                process.stdout.close()
             self.last_elapsed_seconds = time.monotonic() - started
 
     def popen(self, script: str, *arguments: str) -> subprocess.Popen[str]:
@@ -842,9 +1014,135 @@ class RuntimeFixture:
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
+            start_new_session=True,
         )
         self.background.append(process)
         return process
+
+    def wait_for_marker_or_process_exit(
+        self,
+        marker: Path,
+        process: subprocess.Popen[str],
+        *,
+        timeout: float,
+        label: str,
+    ) -> None:
+        started = time.monotonic()
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if marker.exists():
+                if marker.is_symlink() or not marker.is_file():
+                    self.terminate_process_group_and_reap(process)
+                    self.record_marker_wait_failure(
+                        label, "unsafe-marker", process, started
+                    )
+                    raise AssertionError(f"{label} marker is not a regular file")
+                return
+            return_code = process.poll()
+            if return_code is not None:
+                process.wait()
+                self.terminate_process_group_and_reap(process)
+                self.record_marker_wait_failure(
+                    label, "early-exit", process, started
+                )
+                raise AssertionError(
+                    f"{label} process exited before marker: {return_code}"
+                )
+            time.sleep(0.05)
+        self.terminate_process_group_and_reap(process)
+        self.record_marker_wait_failure(
+            label, "marker-timeout", process, started
+        )
+        raise AssertionError(f"timed out waiting for {label} marker")
+
+    def record_marker_wait_failure(
+        self,
+        label: str,
+        outcome: str,
+        process: subprocess.Popen[str],
+        started: float,
+        captured_output: str | None = None,
+    ) -> None:
+        if captured_output is None:
+            captured_output = ""
+            if process.stdout is not None and not process.stdout.closed:
+                try:
+                    captured_output += process.stdout.read()
+                except (OSError, UnicodeError, ValueError):
+                    pass
+        if process.stdout is not None and not process.stdout.closed:
+            process.stdout.close()
+        return_code = process.returncode
+        self.last_result = subprocess.CompletedProcess(
+            process.args,
+            return_code if return_code is not None else 1,
+            captured_output,
+        )
+        self.last_elapsed_seconds = time.monotonic() - started
+        self.emit_sanitized_diagnostics(f"{label}:{outcome}")
+
+    def communicate_with_timeout(
+        self,
+        process: subprocess.Popen[str],
+        *,
+        timeout: float,
+        label: str,
+    ) -> tuple[str, None]:
+        started = time.monotonic()
+        try:
+            return process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired as error:
+            self.terminate_process_group_and_reap(process)
+            if isinstance(error.output, bytes):
+                captured_output = error.output.decode(
+                    "utf-8", errors="replace"
+                )
+            elif isinstance(error.output, str):
+                captured_output = error.output
+            else:
+                captured_output = ""
+            try:
+                captured_output, _ = process.communicate(timeout=3)
+            except (OSError, subprocess.TimeoutExpired, ValueError):
+                pass
+            self.record_marker_wait_failure(
+                label,
+                "communicate-timeout",
+                process,
+                started,
+                captured_output,
+            )
+            raise
+
+    @staticmethod
+    def terminate_process_group_and_reap(
+        process: subprocess.Popen[str], timeout: float = 3
+    ) -> None:
+        group_id = process.pid
+        try:
+            os.killpg(group_id, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            process.poll()
+            try:
+                os.killpg(group_id, 0)
+            except ProcessLookupError:
+                if process.poll() is None:
+                    process.wait(timeout=max(0.1, deadline - time.monotonic()))
+                else:
+                    process.wait()
+                return
+            time.sleep(0.05)
+        try:
+            os.killpg(group_id, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        if process.poll() is None:
+            process.wait(timeout=timeout)
+        else:
+            process.wait()
 
     def archive_dirs(self) -> list[Path]:
         if not self.archive.exists():
@@ -880,11 +1178,16 @@ class RuntimeFixture:
         result = self.last_result
         output = result.stdout if result is not None else ""
         phase_match = re.search(
-            r"failed during phase:\s*([A-Za-z0-9_-]{1,64})",
+            r"^.*failed during phase:\s*([a-z0-9_]{1,64})\s*$",
             output,
-            flags=re.IGNORECASE,
+            flags=re.MULTILINE,
         )
-        phase = phase_match.group(1) if phase_match else "unavailable"
+        phase_candidate = phase_match.group(1) if phase_match else ""
+        phase = (
+            phase_candidate
+            if phase_candidate in ALLOWED_FLOW_PHASES
+            else "unavailable"
+        )
 
         def safe_state(name: str, allowed: set[str]) -> str:
             try:
@@ -893,12 +1196,10 @@ class RuntimeFixture:
                 return "missing"
             return value if value in allowed else "redacted-invalid"
 
-        mutation_actions = []
-        for line in self.mutation_lines()[-50:]:
-            if re.fullmatch(r"[a-z][a-z0-9 -]{0,80}", line):
-                mutation_actions.append(line)
-            else:
-                mutation_actions.append("redacted-invalid")
+        mutation_actions = [
+            line if line in ALLOWED_MUTATION_ACTIONS else "redacted-invalid"
+            for line in self.mutation_lines()[-50:]
+        ]
         gateway_gate_actions = [
             line if line in {"begin", "assert-pending", "release", "abort"}
             else "redacted-invalid"
@@ -967,6 +1268,18 @@ class RuntimeFixture:
             )
         )
 
+    def emit_sanitized_diagnostics(self, test_name: str) -> None:
+        if self.diagnostics_emitted:
+            return
+        try:
+            diagnostic_text = self.sanitized_diagnostics(test_name)
+        except Exception:
+            diagnostic_text = (
+                "SANITIZED LIFECYCLE FIXTURE DIAGNOSTICS unavailable"
+            )
+        print(diagnostic_text, file=sys.stderr, flush=True)
+        self.diagnostics_emitted = True
+
     def assert_no_sensitive_text(
         self, testcase: unittest.TestCase, *values: str
     ) -> None:
@@ -999,13 +1312,7 @@ class RuntimeFixture:
 
     def close(self) -> None:
         for process in self.background:
-            if process.poll() is None:
-                process.terminate()
-                try:
-                    process.wait(timeout=2)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    process.wait(timeout=2)
+            self.terminate_process_group_and_reap(process)
         if self.server is not None and self.server.poll() is None:
             self.server.terminate()
             try:
@@ -1049,18 +1356,7 @@ class ForcedQrRuntimeTests(unittest.TestCase):
                 if failed:
                     break
         if failed:
-            try:
-                print(
-                    self.fixture.sanitized_diagnostics(self._testMethodName),
-                    file=sys.stderr,
-                    flush=True,
-                )
-            except Exception:
-                print(
-                    "SANITIZED LIFECYCLE FIXTURE DIAGNOSTICS unavailable",
-                    file=sys.stderr,
-                    flush=True,
-                )
+            self.fixture.emit_sanitized_diagnostics(self._testMethodName)
         self.fixture.close()
 
     def test_fixture_temporary_paths_are_strictly_confined(self) -> None:
@@ -1486,7 +1782,8 @@ class ForcedQrRuntimeTests(unittest.TestCase):
             self.fixture.read_state("gateway_gate_agent_id"), "a" * 64
         )
         self.assertEqual(
-            self.fixture.read_state("gateway_gate_worker_id"), "c" * 64
+            self.fixture.read_state("gateway_gate_worker_id"),
+            self.fixture.read_state("gateway_compose_id"),
         )
         self.assertLess(
             audit.index("gateway worker stop"),
@@ -1787,90 +2084,20 @@ class ForcedQrRuntimeTests(unittest.TestCase):
                 )
                 self.assertNotIn("扫描二维码", result.stdout)
 
-    def test_exact_actual_container_attestation_rejects_drift(self) -> None:
-        cases = (
-            ("previously-started-exited", "actual_status", "exited"),
-            ("restarting", "actual_restarting", "true"),
-            ("paused", "actual_paused", "true"),
-            ("dead", "actual_dead", "true"),
-            ("oom-killed", "actual_oom_killed", "true"),
-            ("nonzero-exit", "actual_exit_code", "1"),
-            ("restart-count", "actual_restart_count", "1"),
-            ("restart", "actual_restart", "unless-stopped"),
-            (
-                "image",
-                "actual_image",
-                "ghcr.io/example/agent-wechat@sha256:" + ("1" * 64),
-            ),
-            ("project", "actual_project", "wrong-project"),
-            ("container", "actual_container", "wrong-container"),
-            (
-                "container-image-id",
-                "actual_container_image_id",
-                "sha256:" + ("c" * 64),
-            ),
-            (
-                "approved-repo-digest",
-                "actual_repo_digest",
-                "ghcr.io/example/agent-wechat@sha256:" + ("d" * 64),
-            ),
-            ("environment", "actual_extra_environment", "1"),
-            ("published-port", "actual_extra_port", "1"),
-            ("network-alias", "actual_network_alias", "attacker-alias"),
-            ("restart-retry", "actual_restart_retry", "1"),
-            ("entrypoint", "actual_entrypoint", '["/bin/sh"]'),
-            ("command", "actual_command", '["sleep","infinity"]'),
-            ("user", "actual_user", "root"),
-            ("working-dir", "actual_working_dir", "/tmp"),
-            ("stop-signal", "actual_stop_signal", "SIGKILL"),
-            ("stop-timeout", "actual_stop_timeout", "5"),
-            ("healthcheck-test", "actual_healthcheck_test", '["NONE"]'),
-            ("healthcheck-interval", "actual_healthcheck_interval", "1"),
-            ("data-bind-source", "actual_data_bind_source", "/tmp/attacker"),
-            ("token-bind-mode", "actual_token_bind_mode", "rw"),
-            ("extra-bind", "actual_extra_bind", "1"),
-            ("network-mode", "actual_network_mode", "bridge"),
-            ("extra-network", "actual_extra_network", "1"),
-            ("log-driver", "actual_log_driver", "local"),
-            ("log-options", "actual_log_max_size", "200m"),
-            ("data-mount-source", "actual_data_mount_source", "/tmp/attacker"),
-            ("token-mount-writable", "actual_token_mount_rw", "true"),
-            ("mount-propagation", "actual_propagation", "shared"),
-            ("bind-ip", "actual_bind_ip", "0.0.0.0"),
-            ("host-port", "actual_port", "9999"),
-            ("proxy", "actual_proxy", "http://attacker.invalid:8080"),
-            ("rust-log", "actual_rust", "trace"),
-            ("privileged", "actual_privileged", "true"),
-            ("cap-add", "actual_cap_add", "[]"),
-            ("security-opt", "actual_security_opt", "[]"),
-            ("devices", "actual_devices", '[{"PathOnHost":"/dev/null"}]'),
-            ("device-requests", "actual_device_requests", '[{}]'),
-            ("pid-mode", "actual_pid_mode", "host"),
-            ("ipc-mode", "actual_ipc_mode", "host"),
-            ("uts-mode", "actual_uts_mode", "host"),
-            ("userns-mode", "actual_userns_mode", "host"),
-            ("cgroupns-mode", "actual_cgroupns_mode", "host"),
-            ("readonly-rootfs", "actual_readonly_rootfs", "true"),
-            ("auto-remove", "actual_auto_remove", "true"),
+    def _assert_exact_actual_container_attestation_rejects_drift(
+        self, state_name: str, value: str
+    ) -> None:
+        self.fixture.write_state(state_name, value)
+        storage_before = tree_digest(self.fixture.storage)
+
+        result = self.fixture.run("start-qr-login.sh")
+
+        self.assert_candidate_rejected_before_archive(
+            result, storage_before
         )
-        for index, (label, state_name, value) in enumerate(cases):
-            if index:
-                self.fixture.close()
-                self.fixture = RuntimeFixture(
-                    f"{self._testMethodName}-{label}"
-                )
-            with self.subTest(case=label):
-                self.fixture.write_state(state_name, value)
-                storage_before = tree_digest(self.fixture.storage)
-                result = self.fixture.run("start-qr-login.sh")
-                self.assert_candidate_rejected_before_archive(
-                    result, storage_before
-                )
-                self.assertIn(
-                    "exact production runtime contract", result.stdout
-                )
-                self.assertEqual(self.fixture.login_log.read_text(), "")
-                self.assertNotIn("扫描二维码", result.stdout)
+        self.assertIn("exact production runtime contract", result.stdout)
+        self.assertEqual(self.fixture.login_log.read_text(), "")
+        self.assertNotIn("扫描二维码", result.stdout)
 
     def test_raw_inspect_token_is_rejected_without_transport_leak(self) -> None:
         cases = (
@@ -3372,26 +3599,31 @@ class ForcedQrRuntimeTests(unittest.TestCase):
     def test_concurrent_start_allows_only_one_lock_holder(self) -> None:
         self.fixture.env["MOCK_LOGIN_MODE"] = "block"
         first = self.fixture.popen("start-qr-login.sh")
-        deadline = time.monotonic() + 8
-        while (
-            time.monotonic() < deadline
-            and not self.fixture.login_pause_file.exists()
-        ):
-            if first.poll() is not None:
-                self.fail(first.stdout.read() if first.stdout else "first start exited")
-            time.sleep(0.05)
-        self.assertTrue(self.fixture.login_pause_file.exists())
-        mutations_before = list(self.fixture.mutation_lines())
-        archives_before = list(self.fixture.archive_dirs())
+        try:
+            self.fixture.wait_for_marker_or_process_exit(
+                self.fixture.login_pause_file,
+                first,
+                timeout=10,
+                label="concurrent-start QR pause",
+            )
+            mutations_before = list(self.fixture.mutation_lines())
+            archives_before = list(self.fixture.archive_dirs())
 
-        second = self.fixture.run("start-qr-login.sh")
-        self.assert_failed(second)
-        self.assertIn("Another QR runtime operation", second.stdout)
-        self.assertEqual(self.fixture.mutation_lines(), mutations_before)
-        self.assertEqual(self.fixture.archive_dirs(), archives_before)
+            second = self.fixture.run("start-qr-login.sh")
+            self.assert_failed(second)
+            self.assertIn("Another QR runtime operation", second.stdout)
+            self.assertEqual(self.fixture.mutation_lines(), mutations_before)
+            self.assertEqual(self.fixture.archive_dirs(), archives_before)
 
-        self.fixture.login_continue_file.touch()
-        output, _ = first.communicate(timeout=10)
+            self.fixture.login_continue_file.touch()
+            output, _ = self.fixture.communicate_with_timeout(
+                first,
+                timeout=30,
+                label="concurrent-start completion",
+            )
+        except BaseException:
+            self.fixture.terminate_process_group_and_reap(first)
+            raise
         self.assertEqual(first.returncode, 0, output)
         self.fixture.assert_no_sensitive_text(
             self,
@@ -3681,6 +3913,9 @@ class ForcedQrRuntimeTests(unittest.TestCase):
     ) -> None:
         replacement = self.fixture.root / "replacement-heartbeat-checker"
         marker = self.fixture.root / "replacement-executed"
+        checker_pause = self.fixture.root / "checker-execute.pause"
+        checker_continue = self.fixture.root / "checker-execute.continue"
+        python_wrapper = self.fixture.root / "checker-python-wrapper"
         replacement.write_text(
             "#!/bin/sh\n"
             + f"printf '%s\\n' {shlex.quote(self.fixture.token)}\n"
@@ -3689,11 +3924,47 @@ class ForcedQrRuntimeTests(unittest.TestCase):
             encoding="utf-8",
         )
         replacement.chmod(0o755)
+        python_wrapper.write_text(
+            "#!/bin/sh\n"
+            "set -eu\n"
+            "if [ \"${4:-}\" = execute ] && "
+            f"[ \"${{5:-}}\" = {shlex.quote(str(self.fixture.gateway_heartbeat))} ]; then\n"
+            f"  : > {shlex.quote(str(checker_pause))}\n"
+            f"  while [ ! -f {shlex.quote(str(checker_continue))} ]; do\n"
+            "    sleep 0.02\n"
+            "  done\n"
+            "fi\n"
+            f"exec {shlex.quote(sys.executable)} \"$@\"\n",
+            encoding="utf-8",
+        )
+        python_wrapper.chmod(0o755)
+        self.fixture.env["PYTHON_BIN"] = str(python_wrapper)
         self.fixture.env[
             "CF_AGENT_WECHAT_TEST_GATEWAY_CHECKER_REPLACEMENT"
         ] = str(replacement)
 
-        result = self.fixture.run("start-qr-login.sh", timeout=30)
+        process = self.fixture.popen("start-qr-login.sh")
+        try:
+            self.fixture.wait_for_marker_or_process_exit(
+                checker_pause,
+                process,
+                timeout=12,
+                label="checker execute",
+            )
+            checker_continue.touch()
+            output, _ = self.fixture.communicate_with_timeout(
+                process,
+                timeout=30,
+                label="checker replacement completion",
+            )
+        except BaseException:
+            self.fixture.terminate_process_group_and_reap(process)
+            raise
+        result = subprocess.CompletedProcess(
+            process.args,
+            process.returncode,
+            output,
+        )
 
         self.assert_failed_worker_release_preserves_agent(
             result, "start_gateway_worker", worker_started=True
@@ -3701,6 +3972,47 @@ class ForcedQrRuntimeTests(unittest.TestCase):
         self.assertFalse(marker.exists())
         self.assertNotIn(self.fixture.token, result.stdout)
         self.assertEqual(self.fixture.read_state("gateway_running"), "0")
+
+
+def _make_exact_actual_container_attestation_test(
+    state_name: str, value: str
+) -> Any:
+    def test_case(self: ForcedQrRuntimeTests) -> None:
+        self._assert_exact_actual_container_attestation_rejects_drift(
+            state_name, value
+        )
+
+    return test_case
+
+
+for (
+    _attestation_label,
+    _attestation_state_name,
+    _attestation_value,
+) in EXACT_ACTUAL_CONTAINER_ATTESTATION_CASES:
+    _attestation_suffix = re.sub(
+        r"[^a-z0-9]+", "_", _attestation_label
+    ).strip("_")
+    _attestation_test_name = (
+        "test_exact_actual_container_attestation_rejects_drift_"
+        + _attestation_suffix
+    )
+    if hasattr(ForcedQrRuntimeTests, _attestation_test_name):
+        raise RuntimeError(
+            f"duplicate attestation test ID: {_attestation_test_name}"
+        )
+    _attestation_test = _make_exact_actual_container_attestation_test(
+        _attestation_state_name, _attestation_value
+    )
+    _attestation_test.__name__ = _attestation_test_name
+    _attestation_test.__qualname__ = (
+        f"{ForcedQrRuntimeTests.__qualname__}.{_attestation_test_name}"
+    )
+    setattr(
+        ForcedQrRuntimeTests,
+        _attestation_test_name,
+        _attestation_test,
+    )
 
 
 def _flatten_test_suite(suite: unittest.TestSuite) -> list[unittest.TestCase]:
@@ -3713,6 +4025,117 @@ def _flatten_test_suite(suite: unittest.TestSuite) -> list[unittest.TestCase]:
         else:
             raise TypeError(f"Unsupported unittest item: {type(item).__name__}")
     return tests
+
+
+def _lifecycle_test_method_name(test: unittest.TestCase) -> str:
+    return test.id().rsplit(".", 1)[-1]
+
+
+def _lifecycle_test_estimated_seconds(test: unittest.TestCase) -> int:
+    method_name = _lifecycle_test_method_name(test)
+    if method_name.startswith(
+        "test_exact_actual_container_attestation_rejects_drift_"
+    ):
+        return LIFECYCLE_SHARD_ATTESTATION_SECONDS
+    return LIFECYCLE_SHARD_ESTIMATED_SECONDS.get(
+        method_name, LIFECYCLE_SHARD_DEFAULT_SECONDS
+    )
+
+
+def _partition_lifecycle_tests(
+    all_tests: list[unittest.TestCase],
+    shard_count: int,
+) -> tuple[list[list[unittest.TestCase]], list[int], dict[str, int]]:
+    if type(LIFECYCLE_SHARD_DEFAULT_SECONDS) is not int or (
+        LIFECYCLE_SHARD_DEFAULT_SECONDS <= 0
+    ):
+        raise RuntimeError("Lifecycle default duration estimate is invalid")
+    if type(LIFECYCLE_SHARD_ATTESTATION_SECONDS) is not int or (
+        LIFECYCLE_SHARD_ATTESTATION_SECONDS <= 0
+    ):
+        raise RuntimeError(
+            "Lifecycle attestation duration estimate is invalid"
+        )
+    if any(
+        type(value) is not int or value <= 0
+        for value in LIFECYCLE_SHARD_ESTIMATED_SECONDS.values()
+    ):
+        raise RuntimeError("Lifecycle duration estimate table is invalid")
+
+    discovered_method_names = {
+        _lifecycle_test_method_name(test) for test in all_tests
+    }
+    if len(discovered_method_names) != len(all_tests):
+        raise RuntimeError(
+            "Lifecycle sharding requires unique test method names"
+        )
+    stale_estimates = (
+        set(LIFECYCLE_SHARD_ESTIMATED_SECONDS)
+        - discovered_method_names
+    )
+    if stale_estimates:
+        raise RuntimeError(
+            "Lifecycle duration estimates reference missing tests: "
+            + ",".join(sorted(stale_estimates))
+        )
+
+    estimated_by_id = {
+        test.id(): _lifecycle_test_estimated_seconds(test)
+        for test in all_tests
+    }
+    ordered_tests = sorted(
+        all_tests,
+        key=lambda test: (
+            -estimated_by_id[test.id()],
+            hashlib.sha256(
+                _lifecycle_test_method_name(test).encode("utf-8")
+            ).hexdigest(),
+        ),
+    )
+    minimum_size, larger_shard_count = divmod(
+        len(all_tests), shard_count
+    )
+    capacities = [
+        minimum_size + (1 if index < larger_shard_count else 0)
+        for index in range(shard_count)
+    ]
+    partitions: list[list[unittest.TestCase]] = [
+        [] for _ in range(shard_count)
+    ]
+    partition_estimated_seconds = [0 for _ in range(shard_count)]
+
+    for test in ordered_tests:
+        test_id = test.id()
+        method_name = _lifecycle_test_method_name(test)
+        eligible = [
+            index
+            for index in range(shard_count)
+            if len(partitions[index]) < capacities[index]
+        ]
+        if not eligible:
+            raise RuntimeError(
+                "Lifecycle duration partition exhausted shard capacity"
+            )
+        target = min(
+            eligible,
+            key=lambda index: (
+                partition_estimated_seconds[index],
+                len(partitions[index]),
+                hashlib.sha256(
+                    f"{method_name}\0{index}".encode("utf-8")
+                ).hexdigest(),
+            ),
+        )
+        partitions[target].append(test)
+        partition_estimated_seconds[target] += estimated_by_id[test_id]
+
+    for partition in partitions:
+        partition.sort(key=lambda test: test.id())
+    if sum(partition_estimated_seconds) != sum(estimated_by_id.values()):
+        raise RuntimeError(
+            "Lifecycle duration partition estimate accounting failed"
+        )
+    return partitions, partition_estimated_seconds, estimated_by_id
 
 
 def _run_lifecycle_shard(shard_index: int, shard_count: int) -> int:
@@ -3729,13 +4152,11 @@ def _run_lifecycle_shard(shard_index: int, shard_count: int) -> int:
     if len(all_ids) != len(set(all_ids)):
         raise RuntimeError("Lifecycle test discovery produced duplicate IDs")
 
-    partitions: list[list[unittest.TestCase]] = [
-        [] for _ in range(shard_count)
-    ]
-    for test in all_tests:
-        test_id = test.id()
-        target = int(hashlib.sha256(test_id.encode("utf-8")).hexdigest(), 16)
-        partitions[target % shard_count].append(test)
+    (
+        partitions,
+        partition_estimated_seconds,
+        estimated_by_id,
+    ) = _partition_lifecycle_tests(all_tests, shard_count)
 
     partition_ids = [
         test.id() for partition in partitions for test in partition
@@ -3752,10 +4173,17 @@ def _run_lifecycle_shard(shard_index: int, shard_count: int) -> int:
     selected = partitions[shard_index]
     selected_ids = [test.id() for test in selected]
     partition_sizes = ",".join(str(len(partition)) for partition in partitions)
+    partition_seconds = ",".join(
+        str(seconds) for seconds in partition_estimated_seconds
+    )
     print(
         "Lifecycle shard inventory: "
         f"index={shard_index} count={shard_count} total={len(all_tests)} "
-        f"selected={len(selected)} partition_sizes={partition_sizes}",
+        f"selected={len(selected)} partition_sizes={partition_sizes} "
+        f"estimate_version={LIFECYCLE_SHARD_ESTIMATE_VERSION} "
+        "selected_estimated_seconds="
+        f"{partition_estimated_seconds[shard_index]} "
+        f"partition_estimated_seconds={partition_seconds}",
         flush=True,
     )
     print(
@@ -3764,7 +4192,10 @@ def _run_lifecycle_shard(shard_index: int, shard_count: int) -> int:
     )
     print("Lifecycle shard test IDs:", flush=True)
     for test_id in selected_ids:
-        print(test_id, flush=True)
+        print(
+            f"{test_id} estimated_seconds={estimated_by_id[test_id]}",
+            flush=True,
+        )
 
     result = unittest.TextTestRunner(verbosity=2, failfast=True).run(
         unittest.TestSuite(selected)

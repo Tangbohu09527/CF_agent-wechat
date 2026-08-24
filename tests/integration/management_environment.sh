@@ -121,6 +121,33 @@ assert_rejected() {
   esac
 }
 
+assert_parser_rejected() {
+  local expected="$1"
+
+  /usr/bin/python3 -I - \
+    "$REPO_ROOT/scripts/parse_management_env.py" "$ENV_FILE" "$expected" <<'PY'
+import importlib.util
+import pathlib
+import sys
+
+module_path = pathlib.Path(sys.argv[1])
+spec = importlib.util.spec_from_file_location("management_env_fixture", module_path)
+if spec is None or spec.loader is None:
+    raise SystemExit(1)
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+
+try:
+    module.parse_management_env(
+        pathlib.Path(sys.argv[2]).read_bytes(), path_contract="portable"
+    )
+except module.ManagementEnvError as error:
+    raise SystemExit(0 if sys.argv[3] in str(error) else 1)
+raise SystemExit(1)
+PY
+}
+
 replace_env_value() {
   local key="$1" value="$2"
 
@@ -480,9 +507,33 @@ case "$production_storage_output" in
 esac
 printf '%s\n' 'PASS parsed testing docker/.env cannot select production storage'
 
-assert_rejected 'duplicate' \
-  'AGENT_WECHAT_PORT=6174' \
-  'AGENT_WECHAT_PORT=6175'
+write_valid_env
+printf '%s\n' 'AGENT_WECHAT_PORT=6175' >> "$ENV_FILE"
+assert_parser_rejected 'duplicate AGENT_WECHAT_PORT assignment' ||
+  fail 'complete byte-safe duplicate fixture did not reach duplicate-key validation'
+if duplicate_output="$(read_contract 2>&1)"; then
+  fail 'runtime loader accepted the complete duplicate fixture'
+fi
+case "$duplicate_output" in
+  *'failed byte-safe validation'*) ;;
+  *) fail 'runtime duplicate rejection was not safely redacted' ;;
+esac
+printf '%s\n' 'PASS complete byte-safe environment reaches duplicate-key validation'
+
+write_valid_env
+printf '%s\n' 'AGENT_WECHAT_PORT=6175' >> "$ENV_FILE"
+printf '\377\n' >> "$ENV_FILE"
+assert_parser_rejected 'strict UTF-8' ||
+  fail 'invalid UTF-8 did not take precedence over duplicate-key validation'
+if invalid_byte_output="$(read_contract 2>&1)"; then
+  fail 'runtime loader accepted invalid UTF-8 before a duplicate key'
+fi
+case "$invalid_byte_output" in
+  *'failed byte-safe validation'*) ;;
+  *) fail 'runtime invalid-byte rejection was not safely redacted' ;;
+esac
+printf '%s\n' 'PASS invalid bytes take precedence and remain redacted at runtime'
+
 assert_rejected 'unsupported syntax' \
   'export AGENT_WECHAT_PORT=6174'
 assert_rejected 'safe absolute path' \

@@ -9,6 +9,8 @@ FIXTURE_TOKEN="$(printf 'c%.0s' {1..64})"
 CURRENT_UID="$(id -u)"
 CURRENT_GID="$(id -g)"
 REQUIRE_TEST="$(printenv CF_REQUIRE_BOOTSTRAP_DEPLOYMENT_TEST 2>/dev/null || printf 0)"
+# One-second fixtures use SIGKILL directly; allow bounded runner cleanup only.
+HARD_TIMEOUT_CLEANUP_MARGIN_MS=2000
 
 cleanup() {
   case "$TEST_ROOT" in
@@ -81,17 +83,96 @@ replace_agent_env_value() {
   sed -i "s|^${key}=.*|${key}=${value}|" "$AGENT_ENV"
 }
 
+recorded_process_group_present() {
+  local identity_file="$1"
+
+  /usr/bin/python3 -I - "$identity_file" <<'PY'
+import pathlib
+import sys
+
+
+def process_identity(pid: int) -> tuple[int, int] | None:
+    try:
+        raw = pathlib.Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
+    except OSError:
+        return None
+    fields = raw[raw.rfind(")") + 2 :].split()
+    if len(fields) <= 19:
+        return None
+    try:
+        return int(fields[2]), int(fields[19])
+    except ValueError:
+        return None
+
+
+try:
+    values = pathlib.Path(sys.argv[1]).read_text(encoding="ascii").split()
+    if len(values) != 4:
+        raise ValueError
+    pid, pid_start, pgid, pgid_start = map(int, values)
+except (OSError, ValueError):
+    raise SystemExit(2)
+
+pid_identity = process_identity(pid)
+if pid_identity is not None and pid_identity[1] == pid_start:
+    raise SystemExit(0)
+
+leader_identity = process_identity(pgid)
+if leader_identity is not None and leader_identity[1] == pgid_start:
+    raise SystemExit(0)
+if leader_identity is not None:
+    raise SystemExit(1)
+
+for candidate in pathlib.Path("/proc").glob("[0-9]*/stat"):
+    identity = process_identity(int(candidate.parent.name))
+    if identity is not None and identity[0] == pgid:
+        raise SystemExit(0)
+raise SystemExit(1)
+PY
+}
+
 assert_process_reaped() {
-  local pid_file="$1" label="$2" pid
+  local pid_file="$1" label="$2" status
+  local identity_file="${pid_file%.pid}.process"
+
   [ -s "$pid_file" ] || fail "$label did not record its PID"
-  pid="$(cat "$pid_file")"
+  [ -s "$identity_file" ] || fail "$label did not record its process group"
   for _ in {1..30}; do
-    if ! kill -0 "$pid" 2>/dev/null; then
-      return
+    if recorded_process_group_present "$identity_file"; then
+      sleep 0.1
+      continue
+    else
+      status=$?
     fi
-    sleep 0.1
+    [ "$status" -eq 1 ] && return
+    fail "$label process-group identity is invalid"
   done
-  fail "$label left timed-out process $pid running"
+  fail "$label left a timed-out process or process-group member running"
+}
+
+monotonic_nanoseconds() {
+  /usr/bin/python3 -c 'import time; print(time.monotonic_ns())'
+}
+
+assert_hard_timeout_bounded() {
+  local started_file="$1" label="$2" configured_seconds="$3"
+  local started_ns finished_ns elapsed_ms maximum_ms
+
+  [ -s "$started_file" ] || fail "$label did not record its monotonic start"
+  IFS= read -r started_ns < "$started_file" ||
+    fail "$label monotonic start could not be read"
+  [[ "$started_ns" =~ ^[0-9]+$ ]] ||
+    fail "$label monotonic start is invalid"
+  finished_ns="$(monotonic_nanoseconds)" ||
+    fail "$label monotonic finish could not be read"
+  [[ "$finished_ns" =~ ^[0-9]+$ ]] ||
+    fail "$label monotonic finish is invalid"
+  [ "$finished_ns" -ge "$started_ns" ] ||
+    fail "$label monotonic clock moved backwards"
+  elapsed_ms=$(( (finished_ns - started_ns) / 1000000 ))
+  maximum_ms=$(( configured_seconds * 1000 + HARD_TIMEOUT_CLEANUP_MARGIN_MS ))
+  [ "$elapsed_ms" -le "$maximum_ms" ] ||
+    fail "$label took ${elapsed_ms}ms; configured timeout plus cleanup limit is ${maximum_ms}ms"
 }
 
 case "$REQUIRE_TEST" in
@@ -900,22 +981,23 @@ pass "docker.service is included in enabled-unit definition inspection"
 
 prepare_fixture docker-timeout
 touch "$MOCK_STATE/hang-info-once"
-STARTED=$SECONDS
+DOCKER_HARD_TIMEOUT_SECONDS=1
 expect_failure 'testing Docker mock failed without privilege; sudo fallback is forbidden' \
-  CF_BOOTSTRAP_DOCKER_TIMEOUT=1
-ELAPSED=$((SECONDS - STARTED))
-[ "$ELAPSED" -le 6 ] || fail "Docker hard timeout exceeded six seconds"
+  "CF_BOOTSTRAP_DOCKER_TIMEOUT=$DOCKER_HARD_TIMEOUT_SECONDS"
 assert_process_reaped "$MOCK_STATE/hang.pid" "Docker hard timeout"
+assert_hard_timeout_bounded "$MOCK_STATE/hang.started" \
+  "Docker hard timeout" "$DOCKER_HARD_TIMEOUT_SECONDS"
 assert_no_privileged_mock_docker
 pass "Docker commands have a hard timeout, reap children, and do not sudo after failure"
 
 prepare_fixture compose-timeout
 touch "$MOCK_STATE/hang-compose"
-STARTED=$SECONDS
-expect_failure 'production Compose validation failed' CF_BOOTSTRAP_COMPOSE_TIMEOUT=1
-ELAPSED=$((SECONDS - STARTED))
-[ "$ELAPSED" -le 4 ] || fail "Compose hard timeout exceeded four seconds"
+COMPOSE_HARD_TIMEOUT_SECONDS=1
+expect_failure 'production Compose validation failed' \
+  "CF_BOOTSTRAP_COMPOSE_TIMEOUT=$COMPOSE_HARD_TIMEOUT_SECONDS"
 assert_process_reaped "$MOCK_STATE/hang.pid" "Compose hard timeout"
+assert_hard_timeout_bounded "$MOCK_STATE/hang.started" \
+  "Compose hard timeout" "$COMPOSE_HARD_TIMEOUT_SECONDS"
 pass "Compose rendering has a hard timeout and timed-out children are reaped"
 
 prepare_fixture rendered-restart

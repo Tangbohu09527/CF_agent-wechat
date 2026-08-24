@@ -14,6 +14,9 @@ set -euo pipefail
 : "${MOCK_APPROVED_BIND_IP:?}"
 : "${MOCK_APPROVED_PORT:?}"
 
+GATEWAY_INITIAL_CONTAINER_ID=cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+GATEWAY_FIRST_CANDIDATE_ID=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+
 if [ -n "${MOCK_DOCKER_TRANSPORT_LOG:-}" ]; then
   {
     printf 'argv\0'
@@ -270,7 +273,7 @@ print_gateway_worker_inspect() {
   source="$(state_get gateway_actual_token_source "$MOCK_APPROVED_TOKEN_FILE")"
   destination="$(state_get gateway_actual_token_destination /run/secrets/cf-agent-wechat-auth-token)"
   read_write="$(state_get gateway_actual_token_rw false)"
-  identity="$(state_get gateway_compose_id cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc)"
+  identity="$(state_get gateway_compose_id "$GATEWAY_INITIAL_CONTAINER_ID")"
   running="$(state_get gateway_running 0)"
   if [ "$running" = 1 ]; then
     status=running
@@ -347,7 +350,7 @@ case "${1:-}" in
     docker_arguments=""
     [ "$(state_get gateway_direct_ps_error 0)" != 1 ] || exit 70
     if [ "$(state_get gateway_running 1)" = 1 ]; then
-      state_get gateway_direct_id cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+      state_get gateway_direct_id "$GATEWAY_INITIAL_CONTAINER_ID"
       printf '\n'
     fi
     exit 0
@@ -414,7 +417,7 @@ case "${1:-}" in
     case "$*" in
       *'{{.Id}}|{{.State.Status}}|{{.State.Running}}'*)
         target="${*: -1}"
-        [ "$target" = "$(state_get gateway_compose_id cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc)" ] || exit 65
+        [ "$target" = "$(state_get gateway_compose_id "$GATEWAY_INITIAL_CONTAINER_ID")" ] || exit 65
         if [ "$(state_get gateway_running 0)" = 1 ]; then
           printf '%s|running|true|false|false|false\n' "$target"
         else
@@ -423,7 +426,7 @@ case "${1:-}" in
         ;;
       *'com.docker.compose.project'*)
         target="${*: -1}"
-        [ "$target" = "$(state_get gateway_direct_id cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc)" ] || exit 65
+        [ "$target" = "$(state_get gateway_direct_id "$GATEWAY_INITIAL_CONTAINER_ID")" ] || exit 65
         printf '%s|%s|' \
           "$(state_get gateway_actual_project cf-agent-gateway)" \
           "$(state_get gateway_actual_service worker)"
@@ -435,7 +438,7 @@ case "${1:-}" in
         ;;
       *'.State.Health'*)
         target="${*: -1}"
-        if [ "$target" = "$(state_get gateway_compose_id cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc)" ]; then
+        if [ "$target" = "$(state_get gateway_compose_id "$GATEWAY_INITIAL_CONTAINER_ID")" ]; then
           state_get worker_health healthy
         else
           state_get container_health healthy
@@ -447,7 +450,7 @@ case "${1:-}" in
         ;;
       *)
         target="${*: -1}"
-        if [ "$target" = "$(state_get gateway_compose_id cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc)" ]; then
+        if [ "$target" = "$(state_get gateway_compose_id "$GATEWAY_INITIAL_CONTAINER_ID")" ]; then
           print_gateway_worker_inspect
         else
           print_container_inspect
@@ -614,7 +617,7 @@ case "$command_name" in
     record "$compose_kind compose ps"
     service="${*: -1}"
     if [ "$compose_kind" = gateway ]; then
-      gateway_compose_id="$(state_get gateway_compose_id cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc)"
+      gateway_compose_id="$(state_get gateway_compose_id "$GATEWAY_INITIAL_CONTAINER_ID")"
       [ "$service" = worker ] || exit 65
       if [ "$(state_get gateway_ps_error 0)" = 1 ]; then record 'gateway compose ps error'; exit 70; fi
       if { [[ " $* " == *" --all "* ]] && [ "$(state_get gateway_exists 1)" = 1 ]; } || [ "$(state_get gateway_running 1)" = 1 ]; then
@@ -675,20 +678,43 @@ case "$command_name" in
     state_set agent_running 0
     ;;
   create)
-    [ "$compose_kind" = gateway ] || exit 65
-    [ "${*: -1}" = worker ] || exit 65
-    case " $* " in
-      *' --force-recreate '*' --no-deps '*) ;;
-      *) record 'gateway candidate create flags invalid'; exit 65 ;;
+    if [ "$compose_kind" != gateway ] ||
+      [ "$#" -ne 3 ] ||
+      [ "$1" != --force-recreate ] ||
+      [ "$2" != --no-deps ] ||
+      [ "$3" != worker ]; then
+      record 'gateway candidate create flags invalid'
+      exit 65
+    fi
+    gateway_candidate_sequence="$(state_get gateway_candidate_sequence 0)"
+    case "$gateway_candidate_sequence" in
+      ''|*[!0-9]*)
+        record 'gateway candidate sequence invalid'
+        exit 65
+        ;;
     esac
+    [ "$gateway_candidate_sequence" -lt 2147483647 ] || {
+      record 'gateway candidate sequence exhausted'
+      exit 65
+    }
+    gateway_candidate_sequence=$((gateway_candidate_sequence + 1))
+    if [ "$gateway_candidate_sequence" -eq 1 ]; then
+      gateway_candidate_id="$GATEWAY_FIRST_CANDIDATE_ID"
+    else
+      printf -v gateway_candidate_id '%064x' "$gateway_candidate_sequence"
+    fi
     record 'gateway worker create stopped'
+    state_set gateway_candidate_sequence "$gateway_candidate_sequence"
+    state_set gateway_compose_id "$gateway_candidate_id"
+    state_set gateway_direct_id "$gateway_candidate_id"
     state_set gateway_exists 1
     state_set gateway_running 0
+    state_set gateway_started_once 0
     ;;
   start)
     [ "$compose_kind" = gateway ] || exit 65
     [ "${*: -1}" = worker ] || exit 65
-    gateway_compose_id="$(state_get gateway_compose_id cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc)"
+    gateway_compose_id="$(state_get gateway_compose_id "$GATEWAY_INITIAL_CONTAINER_ID")"
     if [ "$(state_get gateway_exists 0)" != 1 ] || [ "$(state_get gateway_gate_state inactive)" != released ] || [ "$(state_get gateway_gate_worker_id missing)" != "$gateway_compose_id" ]; then
       record 'gateway worker pre-release denied'
       exit 77
