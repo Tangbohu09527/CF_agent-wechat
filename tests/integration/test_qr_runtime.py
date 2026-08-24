@@ -66,6 +66,7 @@ class RuntimeFixture:
     def __init__(self, name: str) -> None:
         fixture_label = hashlib.sha256(name.encode("utf-8")).hexdigest()[:12]
         self.root = Path(tempfile.mkdtemp(prefix=f"cf-qr-{fixture_label}-"))
+        self.tmp = self.root / "tmp"
         self.storage = self.root / "storage"
         self.runtime = self.storage / "runtime"
         self.archive = self.storage / "session-archive"
@@ -120,6 +121,8 @@ class RuntimeFixture:
         self._start_server()
 
     def _create_layout(self) -> None:
+        self.tmp.mkdir()
+        os.chmod(self.tmp, 0o700)
         self.runtime.mkdir(parents=True)
         (self.runtime / "data").mkdir()
         (self.runtime / "wechat-home").mkdir()
@@ -550,6 +553,17 @@ class RuntimeFixture:
             destination = self.fake_bin / target
             shutil.copy2(HELPERS / source, destination)
             os.chmod(destination, 0o755)
+        fake_mktemp = self.fake_bin / "mktemp"
+        fake_mktemp.write_text(
+            "#!/bin/sh\n"
+            "set -eu\n"
+            ": \"${MOCK_TMPDIR:?}\"\n"
+            "TMPDIR=\"$MOCK_TMPDIR\"\n"
+            "export TMPDIR\n"
+            "exec /usr/bin/mktemp \"$@\"\n",
+            encoding="ascii",
+        )
+        os.chmod(fake_mktemp, 0o755)
 
         venv_dir = self.home / ".local" / "share" / "cf-agent-wechat" / "venv"
         (venv_dir / "bin").mkdir(parents=True)
@@ -588,7 +602,8 @@ class RuntimeFixture:
                 "PATH": f"{self.fake_bin}:{env['PATH']}",
                 "CF_AGENT_WECHAT_TESTING": "1",
                 "CF_AGENT_WECHAT_TEST_ROOT": str(self.root),
-                "TMPDIR": str(self.root),
+                "TMPDIR": str(self.tmp),
+                "MOCK_TMPDIR": str(self.tmp),
                 "HOME": str(self.home),
                 "API_URL": "http://127.0.0.1:1",
                 "WS_URL": "ws://127.0.0.1:1/api/ws/login?newAccount=false",
@@ -917,6 +932,51 @@ class ForcedQrRuntimeTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.fixture.close()
+
+    def test_fixture_temporary_paths_are_strictly_confined(self) -> None:
+        root = self.fixture.root.resolve(strict=True)
+        self.assertEqual(
+            Path(self.fixture.env["CF_AGENT_WECHAT_TEST_ROOT"]),
+            root,
+        )
+        self.assertEqual(Path(self.fixture.env["TMPDIR"]), self.fixture.tmp)
+        self.assertEqual(Path(self.fixture.env["MOCK_TMPDIR"]), self.fixture.tmp)
+        for label, candidate in (
+            ("temporary directory", self.fixture.tmp),
+            ("storage root", self.fixture.storage),
+            ("runtime root", self.fixture.runtime),
+            ("archive root", self.fixture.archive),
+        ):
+            with self.subTest(path=label):
+                resolved = candidate.resolve(strict=True)
+                self.assertNotEqual(resolved, root)
+                self.assertEqual(
+                    os.path.commonpath((root, resolved)),
+                    os.fspath(root),
+                )
+
+        metadata = self.fixture.tmp.lstat()
+        self.assertTrue(stat.S_ISDIR(metadata.st_mode))
+        self.assertFalse(self.fixture.tmp.is_symlink())
+        self.assertEqual(stat.S_IMODE(metadata.st_mode), 0o700)
+
+        child_environment = self.fixture.env.copy()
+        child_environment.pop("TMPDIR", None)
+        result = subprocess.run(
+            [os.fspath(self.fixture.fake_bin / "mktemp")],
+            env=child_environment,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=5,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        created = Path(result.stdout.strip())
+        try:
+            self.assertEqual(created.parent.resolve(strict=True), self.fixture.tmp)
+        finally:
+            created.unlink(missing_ok=True)
 
     def assert_failed(self, result: subprocess.CompletedProcess[str]) -> None:
         self.assertNotEqual(result.returncode, 0, result.stdout)
@@ -1747,9 +1807,6 @@ class ForcedQrRuntimeTests(unittest.TestCase):
             "AGENT_WECHAT_CONTAINER_NAME": "attacker-container",
             "PROXY": "http://attacker.invalid:8080",
             "RUST_LOG": "trace",
-            "CF_AGENT_WECHAT_STORAGE_ROOT": "/attacker/storage",
-            "CF_AGENT_WECHAT_RUNTIME_ROOT": "/attacker/storage/runtime",
-            "CF_AGENT_WECHAT_ARCHIVE_ROOT": "/attacker/storage/archive",
         }
         self.fixture.env.update(hostile)
 
@@ -1768,6 +1825,36 @@ class ForcedQrRuntimeTests(unittest.TestCase):
         )
         for value in hostile.values():
             self.assertNotIn(value, combined)
+        self.assertEqual(self.fixture.read_state("gateway_running"), "1")
+
+    def test_host_path_overrides_fail_closed_before_mutation(self) -> None:
+        hostile = {
+            "CF_AGENT_WECHAT_STORAGE_ROOT": "/attacker/storage",
+            "CF_AGENT_WECHAT_RUNTIME_ROOT": "/attacker/storage/runtime",
+            "CF_AGENT_WECHAT_ARCHIVE_ROOT": "/attacker/storage/archive",
+        }
+        self.fixture.env.update(hostile)
+        storage_before = tree_digest(self.fixture.storage)
+
+        result = self.fixture.run("start-qr-login.sh")
+
+        self.assert_failed(result)
+        self.assertIn(
+            "must remain within the isolated testing root",
+            result.stdout,
+        )
+        combined = "\n".join(
+            (
+                result.stdout,
+                self.fixture.audit_log.read_text(encoding="utf-8"),
+                self.fixture.mutation_log.read_text(encoding="utf-8"),
+            )
+        )
+        for value in hostile.values():
+            self.assertNotIn(value, combined)
+        self.assertEqual(tree_digest(self.fixture.storage), storage_before)
+        self.assertEqual(self.fixture.archive_dirs(), [])
+        self.assertEqual(self.fixture.mutation_lines(), [])
         self.assertEqual(self.fixture.read_state("gateway_running"), "1")
 
     def test_compose_path_swap_cannot_change_bound_runtime(self) -> None:

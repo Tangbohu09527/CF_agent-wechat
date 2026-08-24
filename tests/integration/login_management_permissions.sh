@@ -193,7 +193,7 @@ install -o root -g root -m 755 \
 install -o root -g root -m 644 \
   "${REPO_ROOT}/scripts/requirements.txt" \
   "${TEST_REPO}/scripts/requirements.txt"
-install -d -o root -g root -m 755 "$AUDIT_BIN"
+install -d -o "$TEST_USER" -g "$TEST_USER" -m 700 "$AUDIT_BIN"
 install -o root -g root -m 755 \
   "${REPO_ROOT}/tests/helpers/audit_docker.sh" "${AUDIT_BIN}/docker"
 install -o root -g root -m 755 \
@@ -361,10 +361,13 @@ assert_token_read_once() {
 }
 
 assert_sudo_contract() {
-  local label="$1" first_sudo
+  local label="$1" first_sudo validation_count total_sudo_count
 
-  [ "$(audit_count sudo validate)" -eq 1 ] || \
-    fail "$label did not perform exactly one sudo -v authorization"
+  validation_count="$(audit_count sudo validate)"
+  total_sudo_count="$(awk -F '\t' \
+    '$1 == "sudo" { count++ } END { print count + 0 }' "$AUDIT_LOG")"
+  [ "$validation_count" -eq 1 ] || \
+    fail "$label observed ${validation_count} sudo -v authorization calls; expected 1 (${total_sudo_count} total sudo calls)"
   first_sudo="$(awk -F '\t' '$1 == "sudo" { print $2 "\t" $3; exit }' \
     "$AUDIT_LOG")"
   [ "$first_sudo" = $'validate\tinteractive' ] || \
@@ -846,8 +849,14 @@ if ! CLEANUP_OUTPUT="$("$REAL_SUDO" -u "$TEST_USER" -H env \
   CF_AGENT_WECHAT_ENV_FILE="$AGENT_ENV_FILE" \
   /bin/bash -c '
 cd "$1"
+_cleanup_test_caller_path="$PATH"
 source scripts/common.sh
 source scripts/qr-runtime-common.sh
+if ! restore_testing_management_path "$_cleanup_test_caller_path"; then
+  printf "%s\n" "$LAST_ERROR" >&2
+  exit 1
+fi
+unset _cleanup_test_caller_path
 runtime_authorize_sudo
 runtime_load_management_environment
 runtime_prepare_compose_snapshots
@@ -1008,7 +1017,13 @@ TOKEN_PROCESS_READY="${TEST_HOME}/token-process.ready"
   TOKEN_FILE="$TOKEN_FILE" \
   /bin/bash -c '
 cd "$1"
+_token_test_caller_path="$PATH"
 source scripts/common.sh
+if ! restore_testing_management_path "$_token_test_caller_path"; then
+  error "$LAST_ERROR"
+  exit 1
+fi
+unset _token_test_caller_path
 if ! load_auth_token; then
   error "$LAST_ERROR"
   exit 1
@@ -1051,7 +1066,13 @@ if "$REAL_SUDO" -u "$TEST_USER" -H env \
   TOKEN_FILE="${TOKEN_ANCESTOR_LINK}/auth-token" \
   /bin/bash -c '
 cd "$1"
+_token_test_caller_path="$PATH"
 source scripts/common.sh
+if ! restore_testing_management_path "$_token_test_caller_path"; then
+  error "$LAST_ERROR"
+  exit 1
+fi
+unset _token_test_caller_path
 if ! load_auth_token; then
   error "$LAST_ERROR"
   exit 1
@@ -1127,7 +1148,13 @@ if "$REAL_SUDO" -u "$TEST_USER" -H env \
   TOKEN_FILE="$TOKEN_FILE" \
   /bin/bash -c '
 cd "$1"
+_token_test_caller_path="$PATH"
 source scripts/common.sh
+if ! restore_testing_management_path "$_token_test_caller_path"; then
+  error "$LAST_ERROR"
+  exit 1
+fi
+unset _token_test_caller_path
 if ! load_auth_token; then
   error "$LAST_ERROR"
   exit 1
@@ -1197,8 +1224,14 @@ if ! "$REAL_SUDO" -u "$TEST_USER" -H env \
   CF_AGENT_GATEWAY_ENV_FILE="$GATEWAY_ENV_FILE" \
   /bin/bash -c '
 cd "$1"
+_management_test_caller_path="$PATH"
 source scripts/common.sh
 source scripts/qr-runtime-common.sh
+if ! restore_testing_management_path "$_management_test_caller_path"; then
+  printf "%s\n" "$LAST_ERROR" >&2
+  exit 1
+fi
+unset _management_test_caller_path
 runtime_authorize_sudo
 runtime_validate_management_file "$AGENT_COMPOSE_FILE" "agent Compose" "600"
 runtime_validate_management_file "$AGENT_ENV_FILE" "agent env" "600"

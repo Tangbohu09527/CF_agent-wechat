@@ -340,7 +340,7 @@ run_bootstrap() {
     -u DOCKER_HOST -u DOCKER_CONTEXT -u DOCKER_TLS_VERIFY -u DOCKER_CERT_PATH \
     -u AGENT_WECHAT_IMAGE -u AGENT_WECHAT_BIND_IP -u AGENT_WECHAT_PORT \
     -u AGENT_WECHAT_CONTAINER_NAME -u COMPOSE_PROJECT_NAME -u PROXY -u RUST_LOG \
-    -u CF_AGENT_WECHAT_TOKEN_FILE -u SUDO_UID -u SUDO_GID \
+    -u CF_AGENT_WECHAT_TOKEN_FILE -u SUDO_UID -u SUDO_GID -u SUDO_USER \
     CF_BOOTSTRAP_TESTING=1 \
     CF_AGENT_WECHAT_TEST_ROOT="$SCENARIO_ROOT" \
     CF_BOOTSTRAP_DOCKER_BIN="$MOCK_BIN/docker" \
@@ -445,11 +445,30 @@ pass "Bootstrap test mode 0 follows the production contract"
 pass "internal management variables do not self-trigger and sudo metadata is not an authority"
 
 prepare_fixture sudo-identity-spoof
-run_bootstrap "$OUTPUT" SUDO_UID=0 SUDO_GID=0 || {
-  sed -n '1,200p' "$OUTPUT" >&2
-  fail "caller-controlled sudo identity changed the trusted management owner"
+run_identity_scenario() {
+  local label="$1"
+  shift
+
+  run_bootstrap "$OUTPUT" "$@" || {
+    sed -n '1,200p' "$OUTPUT" >&2
+    fail "$label changed the trusted management identity"
+  }
+  [ "$(sudo -n -- stat -c '%u:%g:%a:%h' "$TOKEN_FILE")" = '0:0:600:1' ] ||
+    fail "$label weakened the root-only Token contract"
+  pass "$label cannot change management identity approval"
 }
-pass "caller-controlled SUDO_UID/SUDO_GID cannot change management ownership approval"
+
+run_identity_scenario "ordinary-user execution through real test sudo"
+run_identity_scenario "combined SUDO identity spoofing" \
+  SUDO_UID=0 SUDO_GID=0 SUDO_USER=root
+run_identity_scenario "single SUDO_UID spoofing" SUDO_UID=0
+run_identity_scenario "single SUDO_GID spoofing" SUDO_GID=0
+run_identity_scenario "single SUDO_USER spoofing" SUDO_USER=root
+run_identity_scenario "invalid numeric SUDO identity metadata" \
+  SUDO_UID=not-a-number SUDO_GID=-1
+run_identity_scenario "mismatched SUDO username and numeric identity" \
+  SUDO_UID=0 SUDO_GID=0 SUDO_USER=nobody
+unset -f run_identity_scenario
 
 prepare_fixture docker-timeout-upper-bound
 expect_failure \

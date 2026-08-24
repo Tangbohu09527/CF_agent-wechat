@@ -2196,7 +2196,9 @@ bootstrap_gateway_verifier_snapshot() {
     clean_env+=(CF_AGENT_WECHAT_TESTING=1)
   fi
 
-  if [ "$TESTING" = 1 ]; then
+  # Contract execution must read the independent root-only Token. The digest
+  # probe only reads repository code and does not need elevation in tests.
+  if [ "$TESTING" = 1 ] && [ "$mode" = digest ]; then
     run_with_hard_timeout "$DOCKER_TIMEOUT" \
       /usr/bin/env "${clean_env[@]}" \
       /usr/bin/python3 -I -c "$GATEWAY_VERIFIER_SNAPSHOT_LOADER" \
