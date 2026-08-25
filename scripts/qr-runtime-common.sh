@@ -25,7 +25,10 @@ unset AGENT_WECHAT_CONTAINER_NAME COMPOSE_PROJECT_NAME
 unset CF_AGENT_WECHAT_STORAGE_ROOT CF_AGENT_WECHAT_RUNTIME_ROOT
 unset CF_AGENT_WECHAT_ARCHIVE_ROOT CF_AGENT_WECHAT_TOKEN_FILE
 unset PROXY RUST_LOG
+# These endpoint globals are consumed by scripts that source this file.
+# shellcheck disable=SC2034
 API_URL="http://127.0.0.1:6174"
+# shellcheck disable=SC2034
 WS_URL="ws://127.0.0.1:6174/api/ws/login"
 CONTAINER_NAME="cf-agent-wechat"
 
@@ -206,7 +209,10 @@ runtime_load_management_environment() {
 
   LEGACY_DATA_ROOT="${STORAGE_ROOT}/data"
   LEGACY_WECHAT_HOME_ROOT="${STORAGE_ROOT}/wechat-home"
+  # Updated endpoint globals are consumed by scripts that source this file.
+  # shellcheck disable=SC2034
   API_URL="http://127.0.0.1:${AGENT_WECHAT_PUBLISHED_PORT}"
+  # shellcheck disable=SC2034
   WS_URL="ws://127.0.0.1:${AGENT_WECHAT_PUBLISHED_PORT}/api/ws/login"
 }
 
@@ -701,6 +707,8 @@ is_current || exit 64
 printf "%s\n" "$action"
 ' cf-agent-wechat-token "$operation" "$TOKEN_FILE" "$SECRETS_ROOT" \
     /usr/bin/openssl "$PYTHON_BIN" "$fsync_code")"; then
+    # Consumed by start-qr-login.sh after sourcing this helper.
+    # shellcheck disable=SC2034
     TOKEN_FILE_ACTION="$result"
     return 0
   else
@@ -990,7 +998,7 @@ runtime_validate_configuration() {
   local lock_canonical
   local archive_parent runtime_parent lock_parent
   local archive_parent_device runtime_parent_device
-  local required_file required_path value_name
+  local required_path value_name
   local runtime_present=0 legacy_present=0
 
   gateway_validate_runtime_contract || return 1
@@ -1072,13 +1080,11 @@ runtime_validate_configuration() {
     esac
   done
 
-  for required_file in "$AGENT_COMPOSE_FILE"; do
-    if runtime_privileged test -L "$required_file" ||
-      ! runtime_privileged test -f "$required_file"; then
-      LAST_ERROR="Required Compose file is missing or is a symlink."
-      return 1
-    fi
-  done
+  if runtime_privileged test -L "$AGENT_COMPOSE_FILE" ||
+    ! runtime_privileged test -f "$AGENT_COMPOSE_FILE"; then
+    LAST_ERROR="Required Compose file is missing or is a symlink."
+    return 1
+  fi
   if [ "$TOKEN_FILE" != "/srv/storage/cf-agent-wechat/secrets/auth-token" ]; then
     LAST_ERROR="Token path must remain at the fixed production host path."
     return 1
@@ -1201,7 +1207,7 @@ runtime_validate_configuration() {
 }
 
 runtime_validate_stop_configuration() {
-  local command_name required_path required_file lock_parent
+  local command_name required_path lock_parent
 
   gateway_validate_runtime_contract || return 1
   if [ -n "$RUNTIME_MANAGEMENT_ENV_ERROR" ]; then
@@ -1259,13 +1265,11 @@ runtime_validate_stop_configuration() {
         ;;
     esac
   done
-  for required_file in "$AGENT_COMPOSE_FILE"; do
-    if runtime_privileged test -L "$required_file" ||
-      ! runtime_privileged test -f "$required_file"; then
-      LAST_ERROR="Required Compose file is missing or is a symlink."
-      return 1
-    fi
-  done
+  if runtime_privileged test -L "$AGENT_COMPOSE_FILE" ||
+    ! runtime_privileged test -f "$AGENT_COMPOSE_FILE"; then
+    LAST_ERROR="Required Compose file is missing or is a symlink."
+    return 1
+  fi
   if runtime_privileged test -L "$STORAGE_ROOT" ||
     ! runtime_privileged test -d "$STORAGE_ROOT"; then
     LAST_ERROR="Storage root must be an existing non-symlink directory."
