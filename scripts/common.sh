@@ -138,34 +138,24 @@ validate_token_file_content() {
   local token_path="$1"
 
   /usr/bin/od -An -v -t u1 -- "$token_path" | /usr/bin/awk '
-    BEGIN { bytes = 0; ended = 0; bad = 0; long = 0; control = 0 }
+    BEGIN { bytes = 0; bad = 0 }
     {
       for (field = 1; field <= NF; field++) {
         byte = $field + 0
-        if (byte == 10) {
-          if (bytes == 0 || ended) bad = 1
-          ended = 1
-        } else {
-          if (ended) bad = 1
-          bytes++
-          if (bytes > 8192) long = 1
-          if (byte < 32 || byte == 127) control = 1
-        }
+        bytes++
+        if (!((byte >= 48 && byte <= 57) || (byte >= 97 && byte <= 102)))
+          bad = 1
       }
     }
     END {
-      if (bytes == 0 || bad) exit 48
-      if (long) exit 49
-      if (control) exit 50
+      if (bytes != 64 || bad) exit 48
     }
   '
 }
 
 set_token_content_error() {
   case "$1" in
-    48) LAST_ERROR="token 文件必须只包含一行非空 token：${TOKEN_FILE}" ;;
-    49) LAST_ERROR="token 内容不能超过 8192 字节：${TOKEN_FILE}" ;;
-    50) LAST_ERROR="token 不能包含 C0 或 DEL 控制字符：${TOKEN_FILE}" ;;
+    48) LAST_ERROR="token 文件必须是 64 字节小写十六进制且无尾随换行：${TOKEN_FILE}" ;;
     *) LAST_ERROR="无法验证 token 文件内容：${TOKEN_FILE}" ;;
   esac
 }
@@ -196,8 +186,8 @@ load_auth_token() {
         return 1
       fi
       if ! metadata="$(stat -Lc '%u:%g:%a:%h' -- "$TOKEN_FILE")" ||
-        [ "$metadata" != "0:0:600:1" ]; then
-        LAST_ERROR="auth-token 必须保持 root:root 600 且无额外硬链接：${TOKEN_FILE}"
+        [ "$metadata" != "10001:10001:600:1" ]; then
+        LAST_ERROR="auth-token 必须保持 10001:10001、mode 0600 且无额外硬链接：${TOKEN_FILE}"
         return 1
       fi
     elif [ "$(uname -s)" = "Linux" ]; then
@@ -260,29 +250,21 @@ fi
 if [ "$(/usr/bin/stat -c "%u:%g:%a" "$secrets_dir")" != "0:0:700" ]; then
   exit 45
 fi
-if [ "$(/usr/bin/stat -Lc "%u:%g:%a:%h" "$token_file")" != "0:0:600:1" ]; then
+if [ "$(/usr/bin/stat -Lc "%u:%g:%a:%h" "$token_file")" != "10001:10001:600:1" ]; then
   exit 46
 fi
 /usr/bin/od -An -v -t u1 -- "$token_file" | /usr/bin/awk "
-  BEGIN { bytes = 0; ended = 0; bad = 0; long = 0; control = 0 }
+  BEGIN { bytes = 0; bad = 0 }
   {
     for (field = 1; field <= NF; field++) {
       byte = \$field + 0
-      if (byte == 10) {
-        if (bytes == 0 || ended) bad = 1
-        ended = 1
-      } else {
-        if (ended) bad = 1
-        bytes++
-        if (bytes > 8192) long = 1
-        if (byte < 32 || byte == 127) control = 1
-      }
+      bytes++
+      if (!((byte >= 48 && byte <= 57) || (byte >= 97 && byte <= 102)))
+        bad = 1
     }
   }
   END {
-    if (bytes == 0 || bad) exit 48
-    if (long) exit 49
-    if (control) exit 50
+    if (bytes != 64 || bad) exit 48
   }
 "
 token_status=$?
@@ -303,11 +285,9 @@ exec /bin/cat -- "$token_file"
       43) LAST_ERROR="token 路径不是普通文件：${TOKEN_FILE}" ;;
       44) LAST_ERROR="sudo 无法读取 token 文件：${TOKEN_FILE}" ;;
       45) LAST_ERROR="secrets 目录必须保持 root:root 700：/srv/storage/cf-agent-wechat/secrets" ;;
-      46) LAST_ERROR="auth-token 必须保持 root:root 600 且无额外硬链接：${TOKEN_FILE}" ;;
+      46) LAST_ERROR="auth-token 必须保持 10001:10001、mode 0600 且无额外硬链接：${TOKEN_FILE}" ;;
       47) LAST_ERROR="secrets 路径必须是非符号链接目录：/srv/storage/cf-agent-wechat/secrets" ;;
-      48) LAST_ERROR="token 文件必须只包含一行非空 token：${TOKEN_FILE}" ;;
-      49) LAST_ERROR="token 内容不能超过 8192 字节：${TOKEN_FILE}" ;;
-      50) LAST_ERROR="token 不能包含 C0 或 DEL 控制字符：${TOKEN_FILE}" ;;
+      48) LAST_ERROR="token 文件必须是 64 字节小写十六进制且无尾随换行：${TOKEN_FILE}" ;;
       *) LAST_ERROR="当前用户无法读取 token，且没有可用的 sudo 权限：${TOKEN_FILE}" ;;
     esac
     if [ "$token_status" -ne 0 ]; then

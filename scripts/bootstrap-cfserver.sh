@@ -16,15 +16,12 @@ AGENT_ENV_FILE="${CF_AGENT_WECHAT_ENV_FILE:-${AGENT_ROOT}/docker/.env}"
 STORAGE_ROOT="${CF_AGENT_WECHAT_STORAGE_ROOT:-/srv/storage/cf-agent-wechat}"
 RUNTIME_ROOT="${CF_AGENT_WECHAT_RUNTIME_ROOT:-${STORAGE_ROOT}/runtime}"
 ARCHIVE_ROOT="${CF_AGENT_WECHAT_ARCHIVE_ROOT:-${STORAGE_ROOT}/session-archive}"
-SECRETS_ROOT="${STORAGE_ROOT}/secrets"
+SECRETS_ROOT="/srv/storage/cf-agent-wechat/secrets"
 TOKEN_FILE="${CF_AGENT_WECHAT_TOKEN_FILE:-${SECRETS_ROOT}/auth-token}"
 LEGACY_DATA_ROOT="${STORAGE_ROOT}/data"
 LEGACY_HOME_ROOT="${STORAGE_ROOT}/wechat-home"
 
-GATEWAY_COMPOSE_FILE="${CF_AGENT_GATEWAY_COMPOSE_FILE:-/opt/cf-agent-gateway/deploy/compose.yaml}"
-GATEWAY_PROJECT_DIR="${CF_AGENT_GATEWAY_PROJECT_DIR:-/opt/cf-agent-gateway/deploy}"
-GATEWAY_ENV_FILE="${CF_AGENT_GATEWAY_ENV_FILE:-/opt/cf-agent-gateway/deploy/.env}"
-GATEWAY_HEARTBEAT_COMMAND="${GATEWAY_PROJECT_DIR}/check-wechat-worker-heartbeat"
+GATEWAY_RUNTIME_CONTROL="/opt/cf-agent-gateway/deploy/wechat-runtime-control"
 
 RUNTIME_UID="${CF_AGENT_WECHAT_RUNTIME_UID:-1000}"
 RUNTIME_GID="${CF_AGENT_WECHAT_RUNTIME_GID:-1000}"
@@ -36,7 +33,6 @@ TIMEOUT_GRACE=2
 NETWORK_NAME="cf-internal"
 NETWORK_ALIAS="cf-agent-wechat"
 AGENT_SERVICE="agent-wechat"
-GATEWAY_SERVICE="wechat-worker"
 AGENT_PROJECT="cf-agent-wechat"
 
 TESTING="${CF_BOOTSTRAP_TESTING:-0}"
@@ -80,7 +76,7 @@ usage() {
 Usage: ./scripts/bootstrap-cfserver.sh
 
 Prepare and validate the production deployment. This command never creates a
-WeChat session, starts agent-wechat, or starts Gateway wechat-worker.
+WeChat session, starts agent-wechat, or starts Gateway controlled workers.
 EOF
 }
 
@@ -263,8 +259,8 @@ validate_empty_token_mountpoint() {
 validate_platform_and_tools() {
   local command_name os_id os_like
   for command_name in \
-    apt-get awk chmod chown curl dirname dpkg-query env flock grep id install ln \
-    mktemp mv openssl python3 readlink realpath rm stat timeout; do
+    apt-get awk chmod chown curl dirname dpkg-query env flock grep id install \
+    mktemp mv openssl python3 readlink realpath rm stat timeout wc; do
     require_command "$command_name"
   done
   python3 -c 'import json, venv' >/dev/null 2>&1 ||
@@ -379,11 +375,69 @@ reject_environment_overrides() {
   done
   for variable in \
     AGENT_WECHAT_IMAGE AGENT_WECHAT_BIND_IP AGENT_WECHAT_PORT \
-    AGENT_WECHAT_CONTAINER_NAME COMPOSE_PROJECT_NAME PROXY RUST_LOG; do
+    AGENT_WECHAT_CONTAINER_NAME COMPOSE_PROJECT_NAME \
+    CF_AGENT_WECHAT_STORAGE_ROOT CF_AGENT_WECHAT_RUNTIME_ROOT \
+    CF_AGENT_WECHAT_ARCHIVE_ROOT CF_AGENT_WECHAT_TOKEN_FILE PROXY RUST_LOG; do
     if [[ -v $variable ]]; then
       die "$variable must come from the authoritative docker/.env file"
     fi
   done
+}
+
+proxy_is_safe() {
+  local value="$1" port
+  local pattern='^(http|https|socks5|socks5h)://(\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9][A-Za-z0-9.-]*):([1-9][0-9]{0,4})$'
+
+  [ -z "$value" ] && return 0
+  [[ "$value" =~ $pattern ]] || return 1
+  port="${BASH_REMATCH[3]}"
+  [ "$port" -le 65535 ]
+}
+
+validate_gateway_runtime_contract() {
+  local contract_json
+
+  if [ -L "$GATEWAY_RUNTIME_CONTROL" ] ||
+    [ ! -f "$GATEWAY_RUNTIME_CONTROL" ] ||
+    [ ! -x "$GATEWAY_RUNTIME_CONTROL" ]; then
+    die "Gateway Runtime Contract controller is unavailable at the fixed path"
+  fi
+  contract_json="$(run_with_hard_timeout "$COMPOSE_TIMEOUT" \
+    "$GATEWAY_RUNTIME_CONTROL" contract 2>/dev/null)" ||
+    die "Gateway Runtime Contract v1 could not be read"
+  [ "${#contract_json}" -le 65536 ] ||
+    die "Gateway Runtime Contract response is too large"
+  printf '%s' "$contract_json" | python3 -c '
+import json
+import sys
+
+try:
+    payload = json.load(sys.stdin)
+except (json.JSONDecodeError, UnicodeDecodeError):
+    raise SystemExit(2)
+expected = {
+    "contract_version": 1,
+    "poll_worker_service": "worker",
+    "delivery_worker_service": "delivery-worker",
+    "dispatch_worker_service": "dispatch-worker",
+    "token_mode": "file",
+    "token_container_path": "/run/secrets/cf-agent-wechat-auth-token",
+}
+if not isinstance(payload, dict):
+    raise SystemExit(2)
+if set(payload) != set(expected):
+    raise SystemExit(2)
+if type(payload.get("contract_version")) is not int:
+    raise SystemExit(2)
+for key, value in expected.items():
+    if payload.get(key) != value:
+        raise SystemExit(2)
+for key in expected:
+    if key != "contract_version" and not isinstance(payload.get(key), str):
+        raise SystemExit(2)
+' || die "Gateway Runtime Contract does not match required version 1"
+  unset contract_json
+  pass "Gateway Runtime Contract v1 is compatible"
 }
 
 validate_and_normalize_paths() {
@@ -396,20 +450,19 @@ validate_and_normalize_paths() {
   normalize_path "archive root" "$ARCHIVE_ROOT"; archive="$NORMALIZED_PATH"
   normalize_path "Token file" "$TOKEN_FILE"; token="$NORMALIZED_PATH"
   normalize_path "secrets root" "$SECRETS_ROOT"; secrets="$NORMALIZED_PATH"
-  normalize_path "Gateway project directory" "$GATEWAY_PROJECT_DIR"; GATEWAY_PROJECT_DIR="$NORMALIZED_PATH"
-  normalize_path "Gateway Compose" "$GATEWAY_COMPOSE_FILE"; GATEWAY_COMPOSE_FILE="$NORMALIZED_PATH"
-  normalize_path "Gateway environment" "$GATEWAY_ENV_FILE"; GATEWAY_ENV_FILE="$NORMALIZED_PATH"
-  GATEWAY_HEARTBEAT_COMMAND="${GATEWAY_PROJECT_DIR}/check-wechat-worker-heartbeat"
-  normalize_path "Gateway heartbeat checker" "$GATEWAY_HEARTBEAT_COMMAND"
-  GATEWAY_HEARTBEAT_COMMAND="$NORMALIZED_PATH"
+  normalize_path "Gateway Runtime controller" "$GATEWAY_RUNTIME_CONTROL"
+  GATEWAY_RUNTIME_CONTROL="$NORMALIZED_PATH"
 
   STORAGE_ROOT="$storage"; RUNTIME_ROOT="$runtime"; ARCHIVE_ROOT="$archive"
   TOKEN_FILE="$token"; SECRETS_ROOT="$secrets"
   LEGACY_DATA_ROOT="${STORAGE_ROOT}/data"; LEGACY_HOME_ROOT="${STORAGE_ROOT}/wechat-home"
-  expected_token="${STORAGE_ROOT}/secrets/auth-token"
+  expected_token="/srv/storage/cf-agent-wechat/secrets/auth-token"
   [ "$TOKEN_FILE" = "$expected_token" ] ||
-    die "Token file must remain at the independent storage secrets path"
-  [ "$SECRETS_ROOT" = "${STORAGE_ROOT}/secrets" ] || die "invalid secrets root"
+    die "Token file must remain at the fixed production host path"
+  [ "$SECRETS_ROOT" = "/srv/storage/cf-agent-wechat/secrets" ] ||
+    die "invalid fixed secrets root"
+  [ "$GATEWAY_RUNTIME_CONTROL" = "/opt/cf-agent-gateway/deploy/wechat-runtime-control" ] ||
+    die "Gateway Runtime controller must remain at the fixed path"
   path_is_within "$RUNTIME_ROOT" "$STORAGE_ROOT" ||
     die "runtime root must remain within the storage root"
   path_is_within "$ARCHIVE_ROOT" "$STORAGE_ROOT" ||
@@ -443,10 +496,7 @@ validate_input_path_chains() {
   validate_no_symlink_ancestors "runtime root" "$RUNTIME_ROOT"
   validate_no_symlink_ancestors "archive root" "$ARCHIVE_ROOT"
   validate_no_symlink_ancestors "Token file" "$TOKEN_FILE"
-  validate_no_symlink_ancestors "Gateway project directory" "$GATEWAY_PROJECT_DIR"
-  validate_no_symlink_ancestors "Gateway Compose file" "$GATEWAY_COMPOSE_FILE"
-  validate_no_symlink_ancestors "Gateway environment file" "$GATEWAY_ENV_FILE"
-  validate_no_symlink_ancestors "Gateway heartbeat checker" "$GATEWAY_HEARTBEAT_COMMAND"
+  validate_no_symlink_ancestors "Gateway Runtime controller" "$GATEWAY_RUNTIME_CONTROL"
 }
 
 validate_repository_inputs() {
@@ -454,13 +504,7 @@ validate_repository_inputs() {
   validate_management_directory "docker configuration directory" "$(dirname -- "$AGENT_ENV_FILE")"
   validate_management_file "production Compose file" "$AGENT_COMPOSE_FILE" readonly
   validate_management_file "production environment file" "$AGENT_ENV_FILE" environment
-  validate_management_directory "Gateway project directory" "$GATEWAY_PROJECT_DIR"
-  validate_management_file "Gateway Compose file" "$GATEWAY_COMPOSE_FILE" readonly
-  validate_management_file "Gateway environment/config file" "$GATEWAY_ENV_FILE" environment
   [ -r "${SCRIPT_DIR}/requirements.txt" ] || die "QR login requirements file is not readable"
-  validate_management_file "Gateway heartbeat checker" "$GATEWAY_HEARTBEAT_COMMAND" readonly
-  [ -x "$GATEWAY_HEARTBEAT_COMMAND" ] ||
-    die "Gateway heartbeat checker must be executable by the management user"
 }
 
 parse_agent_environment() {
@@ -496,10 +540,8 @@ parse_agent_environment() {
       CF_AGENT_WECHAT_RUNTIME_ROOT) ENV_RUNTIME_ROOT="$value" ;;
       CF_AGENT_WECHAT_ARCHIVE_ROOT) ENV_ARCHIVE_ROOT="$value" ;;
       PROXY)
-        case "$value" in
-          ''|http://*|https://*|socks5://*|socks5h://*) ;;
-          *) die "PROXY must be empty or use an approved proxy URL scheme" ;;
-        esac
+        proxy_is_safe "$value" ||
+          die "PROXY must be unauthenticated and contain only an approved scheme, host, and port"
         ;;
       RUST_LOG) ENV_RUST_LOG="$value" ;;
       *) die "production environment contains an unsupported key: $key" ;;
@@ -573,14 +615,6 @@ execute_docker() {
         "CF_AGENT_WECHAT_TOKEN_FILE=$TOKEN_FILE"
       )
       ;;
-    gateway)
-      clean+=(
-        -u AGENT_WECHAT_IMAGE -u AGENT_WECHAT_BIND_IP -u AGENT_WECHAT_PORT
-        -u AGENT_WECHAT_CONTAINER_NAME -u CF_AGENT_WECHAT_STORAGE_ROOT
-        -u CF_AGENT_WECHAT_RUNTIME_ROOT -u CF_AGENT_WECHAT_ARCHIVE_ROOT
-        -u CF_AGENT_WECHAT_TOKEN_FILE -u COMPOSE_PROJECT_NAME -u PROXY -u RUST_LOG
-      )
-      ;;
     raw) ;;
     *) die "internal error: invalid Docker execution mode" ;;
   esac
@@ -605,13 +639,6 @@ agent_compose() {
     --project-directory "$AGENT_ROOT" \
     --project-name "$AGENT_PROJECT" \
     -f "$AGENT_COMPOSE_FILE" "$@"
-}
-
-gateway_compose() {
-  execute_docker "$COMPOSE_TIMEOUT" gateway compose \
-    --env-file "$GATEWAY_ENV_FILE" \
-    --project-directory "$GATEWAY_PROJECT_DIR" \
-    -f "$GATEWAY_COMPOSE_FILE" "$@"
 }
 
 validate_selected_docker_contract() {
@@ -652,8 +679,7 @@ select_local_rootful_docker() {
 
 select_compose_configuration_access() {
   if [ "$DOCKER_USE_SUDO" -eq 1 ] ||
-    { [ -r "$AGENT_COMPOSE_FILE" ] && [ -r "$AGENT_ENV_FILE" ] &&
-      [ -r "$GATEWAY_COMPOSE_FILE" ] && [ -r "$GATEWAY_ENV_FILE" ]; }; then
+    { [ -r "$AGENT_COMPOSE_FILE" ] && [ -r "$AGENT_ENV_FILE" ]; }; then
     return
   fi
   DOCKER_USE_SUDO=1
@@ -676,58 +702,93 @@ ensure_network() {
   pass "cf-internal network is ready"
 }
 
-create_auth_token() {
-  local temp_file
-  temp_file="$(privileged mktemp "${SECRETS_ROOT}/.auth-token.XXXXXX")" ||
-    die "temporary Token file could not be created"
-  # The positional parameters below are evaluated by privileged /bin/sh.
-  # shellcheck disable=SC2016
-  if ! privileged /bin/sh -eu -c '
-    set +x
-    output=$1
-    openssl_bin=$2
-    "$openssl_bin" rand -hex 32 > "$output"
-    chown 0:0 "$output"
-    chmod 600 "$output"
-  ' bootstrap-token "$temp_file" "$OPENSSL_BIN"; then
-    privileged rm -f -- "$temp_file"
-    die "auth Token could not be generated"
-  fi
-  if ! privileged ln -- "$temp_file" "$TOKEN_FILE" 2>/dev/null; then
-    if ! path_present "$TOKEN_FILE"; then
-      privileged rm -f -- "$temp_file"
-      die "auth Token could not be installed atomically"
-    fi
-  fi
-  privileged rm -f -- "$temp_file"
-  log "generated root-only API auth Token (content not displayed)"
+prepare_auth_token() {
+  local action status grep_status
+  local fsync_code='import os, sys; fd = os.open(sys.argv[1], os.O_RDONLY); os.fsync(fd); os.close(fd)'
+
+  if action="$(privileged /bin/sh -u -c '
+set +x
+token_file=$1
+secrets_dir=$2
+openssl_bin=$3
+python_bin=$4
+fsync_code=$5
+
+is_current() {
+  [ ! -L "$token_file" ] &&
+    [ -f "$token_file" ] &&
+    [ "$(stat -c "%u:%g:%a:%h" -- "$token_file" 2>/dev/null)" = "10001:10001:600:1" ] &&
+    [ "$(wc -c < "$token_file")" -eq 64 ] &&
+    LC_ALL=C grep -Eq "^[0-9a-f]{64}$" "$token_file"
 }
 
-validate_auth_token() {
-  local metadata token_status
-  if privileged test -L "$TOKEN_FILE" || ! privileged test -f "$TOKEN_FILE"; then
-    die "auth Token must be a non-symlink regular file"
-  fi
-  metadata="$(privileged stat -c '%u:%g:%a:%h' -- "$TOKEN_FILE" 2>/dev/null)" ||
-    die "auth Token metadata could not be inspected"
-  [ "$metadata" = 0:0:600:1 ] ||
-    die "auth Token must be root:root 600 with one hard link"
-  # The positional parameters below are evaluated by privileged /bin/sh.
-  # shellcheck disable=SC2016
-  if privileged /bin/sh -c '
-    [ "$(wc -l < "$1")" -eq 1 ] && grep -Eq "^[0-9a-f]{64}$" "$1"
-  ' bootstrap-token-check "$TOKEN_FILE"; then
-    token_status=0
+is_legacy() {
+  [ ! -L "$token_file" ] &&
+    [ -f "$token_file" ] &&
+    [ "$(stat -c "%u:%g:%a:%h" -- "$token_file" 2>/dev/null)" = "0:0:600:1" ] &&
+    [ "$(wc -c < "$token_file")" -eq 65 ] &&
+    LC_ALL=C grep -Eq "^[0-9a-f]{64}$" "$token_file"
+}
+
+if is_current; then
+  action=unchanged
+elif [ ! -e "$token_file" ] && [ ! -L "$token_file" ]; then
+  action=generated
+elif is_legacy; then
+  action=migrated
+else
+  exit 62
+fi
+
+if [ "$action" = unchanged ]; then
+  printf "%s\n" "$action"
+  exit 0
+fi
+
+temp_file="$(mktemp "$secrets_dir/.auth-token.XXXXXX")" || exit 63
+trap "rm -f -- \"$temp_file\"" EXIT HUP INT TERM
+umask 077
+if [ "$action" = generated ]; then
+  token_value="$("$openssl_bin" rand -hex 32)" || exit 63
+else
+  token_value="$(cat -- "$token_file")" || exit 63
+fi
+[ "${#token_value}" -eq 64 ] &&
+  printf "%s" "$token_value" | LC_ALL=C grep -Eq "^[0-9a-f]{64}$" ||
+  exit 63
+printf "%s" "$token_value" > "$temp_file" || exit 63
+unset token_value
+chown 10001:10001 "$temp_file" || exit 63
+chmod 600 "$temp_file" || exit 63
+"$python_bin" -c "$fsync_code" "$temp_file" || exit 63
+mv -fT -- "$temp_file" "$token_file" || exit 63
+trap - EXIT HUP INT TERM
+is_current || exit 64
+printf "%s\n" "$action"
+' bootstrap-token "$TOKEN_FILE" "$SECRETS_ROOT" "$OPENSSL_BIN" \
+    python3 "$fsync_code")"; then
+    :
   else
-    token_status=$?
+    status=$?
+    case "$status" in
+      62)
+        die "auth Token has an unknown format; preserve it and repair owner/mode/content offline"
+        ;;
+      *) die "auth Token could not be prepared without exposing its contents" ;;
+    esac
   fi
-  [ "$token_status" -eq 0 ] || die "auth Token content is invalid"
-  # Token expansion stays inside privileged /bin/sh.
-  # shellcheck disable=SC2016
-  if privileged /bin/sh -c 'grep -Fq "$(cat "$1")" "$2"' \
-    bootstrap-token-env-check "$TOKEN_FILE" "$AGENT_ENV_FILE"; then
+
+  if privileged grep -Fq -f "$TOKEN_FILE" -- "$AGENT_ENV_FILE"; then
     die "auth Token content must not appear in docker/.env"
+  else
+    grep_status=$?
   fi
+  [ "$grep_status" -eq 1 ] ||
+    die "docker/.env could not be checked for auth Token content"
+  case "$action" in
+    generated) log "generated Contract v1 API auth Token (content not displayed)" ;;
+    migrated) log "migrated the sole supported legacy API auth Token format" ;;
+  esac
 }
 
 prepare_management_state() {
@@ -736,10 +797,7 @@ prepare_management_state() {
   ensure_root_directory "storage root" "$STORAGE_ROOT" 755
   ensure_root_directory "archive root" "$ARCHIVE_ROOT" 700
   ensure_root_directory "secrets directory" "$SECRETS_ROOT" 700
-  if ! path_present "$TOKEN_FILE"; then
-    create_auth_token
-  fi
-  validate_auth_token
+  prepare_auth_token
 
   validate_runtime_directory "runtime root" "$RUNTIME_ROOT"
   validate_runtime_directory "runtime data" "${RUNTIME_ROOT}/data"
@@ -763,7 +821,7 @@ prepare_management_state() {
     die "archive filesystem could not be inspected"
   [ "$storage_device" = "$archive_device" ] ||
     die "runtime and archive management roots must use one filesystem"
-  pass "management directories and independent root-only Token are ready"
+  pass "management directories and Contract v1 Token file are ready"
 }
 
 attest_agent_compose() {
@@ -776,7 +834,8 @@ attest_agent_compose() {
     die "production Compose JSON render failed or exceeded its hard timeout"
 
   python3 - "$ATTESTATION_FILE" "$ENV_IMAGE" "$ENV_PORT" \
-    "$RUNTIME_ROOT" "$TOKEN_FILE" "$NETWORK_NAME" "$NETWORK_ALIAS" <<'PY'
+    "$RUNTIME_ROOT" "$TOKEN_FILE" "$NETWORK_NAME" "$NETWORK_ALIAS" \
+    "$ENV_CONTAINER" "$AGENT_PROJECT" <<'PY'
 import json
 import sys
 
@@ -788,6 +847,8 @@ import sys
     token_file,
     network_name,
     network_alias,
+    expected_container,
+    expected_project,
 ) = sys.argv[1:]
 
 def fail(message: str) -> None:
@@ -801,6 +862,10 @@ try:
 except (OSError, json.JSONDecodeError, KeyError, TypeError):
     fail("invalid service JSON")
 
+if config.get("name") != expected_project:
+    fail("Compose project name is not cf-agent-wechat")
+if service.get("container_name") != expected_container:
+    fail("container name differs from the approved value")
 if service.get("image") != expected_image:
     fail("image is not the approved digest-pinned reference")
 if service.get("restart") != "no":
@@ -879,21 +944,8 @@ PY
   pass "production Compose is digest-pinned, restart=no, loopback-only, and correctly isolated"
 }
 
-validate_gateway_compose() {
-  local services
-  gateway_compose config --quiet >/dev/null 2>&1 ||
-    die "Gateway Compose validation failed or exceeded its hard timeout"
-  services="$(gateway_compose config --services 2>/dev/null)" ||
-    die "Gateway service list could not be read"
-  printf '%s\n' "$services" | awk -v expected="$GATEWAY_SERVICE" '
-    $0 == expected { found = 1 }
-    END { exit(found ? 0 : 1) }
-  ' || die "Gateway Compose does not define wechat-worker"
-  pass "Gateway Compose/config is readable and defines wechat-worker"
-}
-
-confirm_services_stopped() {
-  local running_ids all_ids restart_policy container_id worker_ids
+confirm_agent_stopped() {
+  local running_ids all_ids restart_policy container_id
   running_ids="$(agent_compose ps --status running --quiet "$AGENT_SERVICE" 2>/dev/null)" ||
     die "agent-wechat running state could not be queried"
   [ -z "$running_ids" ] ||
@@ -909,11 +961,7 @@ confirm_services_stopped() {
       die "existing agent-wechat container must use restart policy no"
   done <<< "$all_ids"
 
-  worker_ids="$(gateway_compose ps --status running --quiet "$GATEWAY_SERVICE" 2>/dev/null)" ||
-    die "Gateway wechat-worker state could not be queried"
-  [ -z "$worker_ids" ] ||
-    die "Gateway wechat-worker must be stopped before a fresh runtime is verified"
-  pass "agent-wechat and Gateway wechat-worker are stopped"
+  pass "agent-wechat is stopped with restart=no"
 }
 
 main() {
@@ -921,6 +969,7 @@ main() {
   configure_external_tools
   reject_environment_overrides
   validate_and_normalize_paths
+  validate_gateway_runtime_contract
   authorize_privilege
   validate_external_tool_integrity
   validate_docker_socket
@@ -936,8 +985,7 @@ main() {
   prepare_management_state
   ensure_network
   attest_agent_compose
-  validate_gateway_compose
-  confirm_services_stopped
+  confirm_agent_stopped
 
   pass "CF_agent-wechat base deployment preparation is complete"
   printf '%s\n' 'Next step (controlled SSH TTY):'

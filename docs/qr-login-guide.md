@@ -23,10 +23,12 @@ cd /opt/cf-agent-wechat
 
 1. 当前 SSH 会话是受控 TTY，终端宽度足以显示二维码。
 2. 没有另一个 start/stop 流程持有并发锁。
-3. Bootstrap 已完成且生产 Compose render 为 `restart: "no"`。
-4. `wechat-worker` 可由脚本停止和确认。
-5. Token、runtime、archive、Gateway 路径、固定 heartbeat checker、Docker
-   socket、`live-restore=false` 和 Compose 校验通过。
+3. Gateway controller 来自 `CF_agent-gateway` 固定 SHA
+   `2db9dff6ece65004cc75723e1243215a5d04b304`，`contract` 严格匹配 version 1。
+4. 非 root 用户只在变更前执行一次 `sudo -v`；后续 controller 命令均为 `sudo -n`。
+5. 每次入口都重新检查 default context、本地 rootful Unix socket、
+   `live-restore=false`、`cf-agent-wechat.service` 未启用、render/actual
+   `restart=no`、批准 image digest 和 runtime UID/GID/mode。
 6. 终端、录屏、日志采集和 CI 不会捕获二维码。
 
 ## 权威状态机
@@ -35,9 +37,9 @@ cd /opt/cf-agent-wechat
 
 1. 校验用户、TTY、配置和依赖。
 2. 获取独占锁。
-3. 安全读取 `docker/.env` 和 root-only Token。
-4. 校验本机 Docker、Compose 和 Gateway 路径。
-5. 停止并确认 Gateway `wechat-worker`。
+3. 直接执行 controller `contract`；不匹配时在任何变更前退出。
+4. 安全解析 `docker/.env`，创建/迁移并读取 Contract v1 Token。
+5. controller `stop` 必须返回 `{"stopped":true}`。
 6. 停止并移除旧 `agent-wechat` 容器，不删除 bind 数据。
 7. 原子归档旧 runtime，并写入脱敏 manifest。
 8. 创建全新的 `runtime/data` 和 `runtime/wechat-home`。
@@ -48,7 +50,9 @@ cd /opt/cf-agent-wechat
 13. 验证 container running、Docker health 和 WeChat process 稳定。
 14. 验证 auth 为 `logged_in`、chats 可读且非空、messages 可读。
 15. 再次确认 WeChat process identity 稳定。
-16. 只有全部通过才启动 `wechat-worker`，并确认 running/healthy/heartbeat。
+16. 只有全部通过才执行 controller `start`，随后 `status` 必须满足：
+    `ready=true`、`token_contract_valid=true`、`worker_health=healthy`、
+    `delivery_health=healthy`。
 
 如果新 runtime 的 API 在显示二维码前报告 `logged_in`，不得短路成功；流程必须
 fail closed，并保留现场。生产运行每次都必须看到新的二维码。
@@ -77,12 +81,11 @@ Docker healthcheck 只证明容器和 Agent API 健康。生产放行还要求�
 | Auth | `logged_in` |
 | Chats | API 可读且至少一个聊天 |
 | Messages | 对 API 返回的一个聊天读取成功 |
-| Gateway | `wechat-worker` running/healthy，heartbeat 正常 |
+| Gateway | ready/token contract 有效，poll 与 delivery health 均为 healthy |
 
-固定 checker 为
-`/opt/cf-agent-gateway/deploy/check-wechat-worker-heartbeat`，由 Gateway 部署提供。
-本仓库只校验并以管理用户身份在 hard timeout 内执行，不创建、修改或通过 `sudo`
-执行它；checker 仅以退出码报告当前 Worker heartbeat，且不得输出敏感内容。
+固定入口为 `/opt/cf-agent-gateway/deploy/wechat-runtime-control`。本仓库不解析
+Gateway Compose、数据库或容器名；controller 自行验证 worker/delivery health、Token
+contract 和 heartbeat，并在 start 失败时重新停止两个受控 Worker。
 
 任何单项都不能替代完整门槛。验证不得输出账号、聊天 ID 或消息正文。
 
@@ -90,7 +93,7 @@ Docker healthcheck 只证明容器和 Agent API 健康。生产放行还要求�
 
 任一步失败：
 
-- `wechat-worker` 保持停止；
+- `worker` 与 `delivery-worker` 保持停止，失败路径可 best-effort 再次 `stop`；
 - 当前失败 runtime 保留或隔离；
 - 已有 archive 不删除、不覆盖；
 - Token 不输出；本轮已在受控 TTY 显示的二维码不再次回显，也不写入错误、日志或文件；
@@ -107,10 +110,13 @@ Docker healthcheck 只证明容器和 Agent API 健康。生产放行还要求�
 - fresh runtime status；
 - archive path；
 - container/health/process/auth/chats/messages 结果类别；
-- Worker running/healthy/heartbeat 状态。
+- Gateway ready、Token contract、poll/delivery health 状态。
 
 CFserver Host 按 `Asia/Shanghai` 展示，容器、日志、archive manifest 和原始审计时间
 使用 UTC。不要在同一字段中混用时区。
 
 详细故障处理见[故障排查](troubleshooting.md)，实机验收项见
 [验证总览](validation.md)。
+
+本实现尚未在 CFserver 完成真实扫码和 Gateway controller 验收；基础静态检查不等于
+生产验收。

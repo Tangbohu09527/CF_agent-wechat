@@ -40,7 +40,7 @@ usage() {
 Usage: ./scripts/start-qr-login.sh [--dry-run]
 
 Create a fresh production runtime, require a new QR login, validate the
-WeChat runtime and message APIs, then start Gateway wechat-worker.
+WeChat runtime and message APIs, then release Gateway poll and delivery workers.
 EOF
 }
 
@@ -212,8 +212,20 @@ payload = {
     },
     "sensitiveData": {
         "tokenIncluded": False,
-        "accountIdentifiersIncluded": False,
-        "chatIdentifiersIncluded": False,
+        "manifestContains": {
+            "token": False,
+            "accountIdentifiers": False,
+            "chatIdentifiers": False,
+            "messageBodies": False,
+        },
+        "archivePayloadMayContain": {
+            "wechatSession": True,
+            "accountIdentifiers": True,
+            "chatIdentifiers": True,
+            "messageMetadata": True,
+            "cache": True,
+            "databaseContent": True,
+        },
     },
     "failureCleanup": {
         "attempted": cleanup_attempted == "true",
@@ -256,7 +268,7 @@ on_exit() {
   original_last_error="${LAST_ERROR:-}"
   if [ "$DRY_RUN" -eq 0 ] && [ "$FLOW_COMPLETE" -eq 0 ] &&
     [ "$WORKER_GUARD" -eq 1 ]; then
-    if stop_gateway_worker >/dev/null 2>&1; then
+    if stop_gateway_workers >/dev/null 2>&1; then
       WORKER_STOP_CONFIRMED=1
     else
       WORKER_STOP_CONFIRMED=0
@@ -284,9 +296,9 @@ on_exit() {
       error "Archive path: not created"
     fi
     if [ "$WORKER_GUARD" -eq 1 ] && [ "$WORKER_STOP_CONFIRMED" -eq 1 ]; then
-      error "Gateway wechat-worker remains stopped; AI scheduling was not started."
+      error "Gateway poll and delivery workers remain stopped."
     elif [ "$WORKER_GUARD" -eq 1 ]; then
-      error "Gateway wechat-worker stop could not be confirmed; its state is unknown. Treat AI scheduling as active and stop it manually before retrying."
+      error "Gateway controlled-worker stop could not be confirmed; use wechat-runtime-control stop before retrying."
     fi
     if [ "$AGENT_FAILURE_CLEANUP_ATTEMPTED" = true ]; then
       if [ "$agent_cleanup_failed" -eq 0 ]; then
@@ -505,6 +517,12 @@ create_fresh_runtime() {
     LAST_ERROR="Fresh WeChat HOME directory could not be created."
     return 1
   fi
+  runtime_verify_directory_contract \
+    "$RUNTIME_ROOT" "$RUNTIME_UID" "$RUNTIME_GID" "$RUNTIME_MODE" || return 1
+  runtime_verify_directory_contract \
+    "${RUNTIME_ROOT}/data" "$DATA_UID" "$DATA_GID" "$DATA_MODE" || return 1
+  runtime_verify_directory_contract \
+    "${RUNTIME_ROOT}/wechat-home" "$HOME_UID" "$HOME_GID" "$HOME_MODE"
 }
 
 wait_for_clean_auth() {
@@ -618,11 +636,11 @@ run_forced_login() {
 print_dry_run() {
   printf '%s\n' 'Dry run: no containers, workers, or directories were modified.'
   printf '%s\n' 'Planned flow:'
-  printf '%s\n' '  1. Stop Gateway wechat-worker.'
+  printf '%s\n' '  1. Validate Gateway Contract v1 and stop poll/delivery workers.'
   printf '%s\n' '  2. Stop and remove only the agent-wechat container.'
   printf '%s\n' '  3. Atomically archive the current runtime when present.'
   printf '%s\n' '  4. Create an empty runtime and force a terminal QR login.'
-  printf '%s\n' '  5. Validate process, auth, chats, and messages before worker start.'
+  printf '%s\n' '  5. Validate Agent, then start/status both controlled Gateway workers.'
 }
 
 print_final_status() {
@@ -635,7 +653,8 @@ print_final_status() {
   printf 'Auth:\n  logged_in\n'
   printf 'QR Runtime Mode:\n  fresh\n'
   printf 'Message API:\n  chats and messages readable\n'
-  printf 'Gateway WeChat Worker:\n  running, healthy, heartbeat verified\n'
+  printf 'Gateway Runtime:\n  ready; worker and delivery-worker healthy\n'
+  printf 'Gateway Token Contract:\n  valid\n'
   if [ -n "$ARCHIVE_PATH" ]; then
     printf 'Archive:\n  %s\n' "$ARCHIVE_PATH"
   else
@@ -673,6 +692,20 @@ main() {
     error "$LAST_ERROR"
     return 1
   fi
+  FLOW_PHASE="prepare_auth_token"
+  if ! runtime_manage_auth_token prepare; then
+    error "$LAST_ERROR"
+    return 1
+  fi
+  case "$TOKEN_FILE_ACTION" in
+    generated) printf '%s\n' 'Created production auth-token under Contract v1.' ;;
+    migrated) printf '%s\n' 'Migrated the sole supported legacy auth-token format.' ;;
+  esac
+  FLOW_PHASE="load_auth_token"
+  if ! load_auth_token; then
+    error "$LAST_ERROR"
+    return 1
+  fi
   if [ ! -f "${SCRIPT_DIR}/qr_login.py" ]; then
     error "QR login helper is missing."
     return 1
@@ -684,19 +717,13 @@ main() {
   fi
 
   FLOW_STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  FLOW_PHASE="stop_gateway_worker"
+  FLOW_PHASE="stop_gateway_workers"
   WORKER_GUARD=1
-  if ! stop_gateway_worker; then
+  if ! stop_gateway_workers; then
     error "$LAST_ERROR"
     return 1
   fi
   WORKER_STOP_CONFIRMED=1
-
-  FLOW_PHASE="load_auth_token"
-  if ! load_auth_token; then
-    error "$LAST_ERROR"
-    return 1
-  fi
 
   AGENT_CLEANUP_GUARD=1
   FLOW_PHASE="remove_agent_container"
@@ -777,8 +804,8 @@ main() {
     return 1
   fi
 
-  FLOW_PHASE="start_gateway_worker"
-  if ! start_gateway_worker; then
+  FLOW_PHASE="start_gateway_workers"
+  if ! start_gateway_workers; then
     error "$LAST_ERROR"
     return 1
   fi

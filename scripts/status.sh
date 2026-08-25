@@ -15,9 +15,10 @@ print_status() {
   local auth_status="$5"
   local runtime_mode="$6"
   local message_status="$7"
-  local worker_status="$8"
-  local worker_health="$9"
-  local worker_heartbeat="${10}"
+  local gateway_ready="$8"
+  local token_contract="$9"
+  local worker_health="${10}"
+  local delivery_health="${11}"
 
   printf '%s\n' '================================'
   printf '%s\n' 'CF Agent WeChat Status'
@@ -29,9 +30,10 @@ print_status() {
   printf 'Auth:\n  %s\n' "$auth_status"
   printf 'QR Runtime Mode:\n  %s\n' "$runtime_mode"
   printf 'Message API:\n  %s\n' "$message_status"
-  printf 'Gateway WeChat Worker:\n  %s\n' "$worker_status"
-  printf 'Gateway Worker Health:\n  %s\n' "$worker_health"
-  printf 'Gateway Worker Heartbeat:\n  %s\n' "$worker_heartbeat"
+  printf 'Gateway Runtime Ready:\n  %s\n' "$gateway_ready"
+  printf 'Gateway Token Contract:\n  %s\n' "$token_contract"
+  printf 'Gateway Poll Worker Health:\n  %s\n' "$worker_health"
+  printf 'Gateway Delivery Worker Health:\n  %s\n' "$delivery_health"
   printf '%s\n' '================================'
 }
 
@@ -83,6 +85,7 @@ raise SystemExit(0 if all(checks) else 1)
 }
 
 prepare_status_management_configuration() {
+  gateway_validate_runtime_contract || return 1
   runtime_authorize_sudo || return 1
   runtime_validate_management_file \
     "$AGENT_COMPOSE_FILE" "agent-wechat Compose" || return 1
@@ -90,16 +93,6 @@ prepare_status_management_configuration() {
     "$AGENT_ENV_FILE" "agent-wechat environment file" "600 0600 640 0640" ||
     return 1
   runtime_load_management_environment || return 1
-  runtime_validate_management_directory \
-    "$GATEWAY_PROJECT_DIR" "Gateway project directory" 1 || return 1
-  runtime_validate_management_file \
-    "$GATEWAY_COMPOSE_FILE" "Gateway Compose" || return 1
-  runtime_validate_management_file \
-    "$GATEWAY_ENV_FILE" "Gateway environment file" "600 0600 640 0640" ||
-    return 1
-  runtime_validate_management_file \
-    "$GATEWAY_HEARTBEAT_COMMAND" "Gateway heartbeat checker" || return 1
-  [ -x "$GATEWAY_HEARTBEAT_COMMAND" ] || return 1
   runtime_select_compose_access
 }
 
@@ -111,23 +104,33 @@ main() {
   local auth_status="unavailable"
   local runtime_mode="unknown"
   local message_status="unavailable"
-  local worker_status="unavailable"
+  local gateway_ready="unavailable"
+  local gateway_token_contract="unavailable"
   local worker_health="unavailable"
-  local worker_heartbeat="unavailable"
+  local delivery_health="unavailable"
+  local gateway_summary=""
   local initial_wechat_identity="" final_wechat_identity="" encoded_chat=""
-  local worker_container_id=""
   local configuration_ok=1 token_ok=1 docker_ok=0
-  local container_query_ok=0 worker_query_ok=0 process_identity_ok=0
+  local container_query_ok=0 gateway_query_ok=0 process_identity_ok=0
 
-  prepare_status_management_configuration || configuration_ok=0
-  if ! validate_configuration; then
-    configuration_ok=0
-  fi
   if ! resolve_python; then
     configuration_ok=0
   fi
   if ! command -v curl >/dev/null 2>&1; then
     configuration_ok=0
+  fi
+  if [ "$configuration_ok" -eq 1 ] &&
+    ! prepare_status_management_configuration; then
+    configuration_ok=0
+  fi
+  if [ "$configuration_ok" -eq 1 ] && ! validate_configuration; then
+    configuration_ok=0
+  fi
+  if [ "$configuration_ok" -eq 1 ] &&
+    gateway_summary="$(gateway_status_summary)"; then
+    IFS=$'\t' read -r gateway_ready gateway_token_contract \
+      worker_health delivery_health <<< "$gateway_summary"
+    gateway_query_ok=1
   fi
 
   if [ "$configuration_ok" -eq 1 ] && runtime_select_docker; then
@@ -139,22 +142,6 @@ main() {
       fi
     else
       container_status="unavailable"
-    fi
-    if [ -f "$GATEWAY_COMPOSE_FILE" ] && [ -d "$GATEWAY_PROJECT_DIR" ] &&
-      worker_status="$(gateway_worker_state)"; then
-      worker_query_ok=1
-    else
-      worker_status="unavailable"
-    fi
-    if [ "$worker_status" = "running" ] &&
-      worker_container_id="$(gateway_compose ps --status running --quiet \
-        "$GATEWAY_SERVICE" 2>/dev/null)" &&
-      [ -n "$worker_container_id" ]; then
-      worker_health="$(container_health_status "$worker_container_id" 2>/dev/null || printf unavailable)"
-      if [ "$worker_health" = "healthy" ] &&
-        gateway_worker_heartbeat_is_healthy; then
-        worker_heartbeat="verified"
-      fi
     fi
   fi
   if [ "$configuration_ok" -eq 1 ] && check_agent_server 2>/dev/null; then
@@ -193,15 +180,15 @@ main() {
 
   print_status \
     "$container_status" "$docker_health" "$server_status" "$process_status" \
-    "$auth_status" "$runtime_mode" "$message_status" "$worker_status" \
-    "$worker_health" "$worker_heartbeat"
+    "$auth_status" "$runtime_mode" "$message_status" "$gateway_ready" \
+    "$gateway_token_contract" "$worker_health" "$delivery_health"
 
   if [ "$configuration_ok" -ne 1 ]; then
     error "Status configuration or required commands are unavailable."
     return 1
   fi
-  if [ "$container_query_ok" -ne 1 ] || [ "$worker_query_ok" -ne 1 ]; then
-    error "Container or Gateway wechat-worker state could not be queried."
+  if [ "$container_query_ok" -ne 1 ] || [ "$gateway_query_ok" -ne 1 ]; then
+    error "Container or Gateway Runtime Contract status could not be queried."
     return 1
   fi
   if [ "$token_ok" -ne 1 ]; then
@@ -240,9 +227,11 @@ main() {
     error "Chats or messages API is not readable."
     return 1
   fi
-  if [ "$worker_status" != "running" ] || [ "$worker_health" != "healthy" ] ||
-    [ "$worker_heartbeat" != "verified" ]; then
-    error "Gateway wechat-worker is not running, healthy, and heartbeat-verified."
+  if [ "$gateway_ready" != "true" ] ||
+    [ "$gateway_token_contract" != "true" ] ||
+    [ "$worker_health" != "healthy" ] ||
+    [ "$delivery_health" != "healthy" ]; then
+    error "Gateway Runtime Contract status is not ready."
     return 1
   fi
   return 0

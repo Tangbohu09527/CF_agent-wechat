@@ -17,7 +17,13 @@
 - 使用外部 `cf-internal`，固定 alias 为 `cf-agent-wechat`。
 - 只使用受信任的固定系统工具和非符号链接 `/var/run/docker.sock`；Docker 必须为
   local rootful daemon，context endpoint 固定且 `live-restore=false`。
-- Token 以 root-only 文件独立只读挂载，不属于 runtime。
+- Token 固定为 `/srv/storage/cf-agent-wechat/secrets/auth-token`：非 symlink 普通
+  文件、link count 1、`10001:10001`、`0600`、64 位小写十六进制且无尾随 LF；
+  secrets 父目录保持 `root:root 0700`。
+- 生产 API/WS 只从 `127.0.0.1` 和批准的 Agent port 派生；继承的 `API_URL` /
+  `WS_URL` 被清理，Token 不发送到非 loopback 地址。
+- `PROXY` 只允许空值或无认证的 `http`/`https`/`socks5`/`socks5h`
+  `host:port`；userinfo、query、fragment 和控制字符一律拒绝。
 - 当前 runtime 只包含全新的 `data` 和 `wechat-home`。
 - 旧 runtime 原子归档并保留，不恢复成活跃 session。
 - 生产重启策略必须为 `restart: "no"`。
@@ -35,15 +41,16 @@ cd /opt/cf-agent-wechat
 sudo ./scripts/bootstrap-cfserver.sh
 ```
 
-Bootstrap 检查 Debian 固定系统工具、systemd、本机 rootful Docker、真实 Unix socket、
-固定 context endpoint、`live-restore=false`、Compose v2、仓库、Compose、环境文件、
-runtime/archive/secrets、owner/mode/link count、镜像 digest、loopback、网络 alias、
-Gateway 路径、固定 `check-wechat-worker-heartbeat` 和 Token。它准备管理目录、
-`cf-internal` 和独立 API Token，渲染生产 Compose，并确认 Agent 和 Worker 没有被
-Bootstrap 投入生产。
+Bootstrap 检查 Debian、systemd、本机 rootful Docker、真实 Unix socket、固定
+context endpoint、`live-restore=false`、Compose、目录/权限、镜像、loopback、alias、
+Token 及 Gateway Contract v1。Gateway 事实来源固定为
+`Tangbohu09527/CF_agent-gateway` SHA
+`2db9dff6ece65004cc75723e1243215a5d04b304`，控制入口固定为
+`/opt/cf-agent-gateway/deploy/wechat-runtime-control`。Bootstrap 可创建新 Token，
+或只迁移精确旧格式 `root:root 0600 + 64 lowercase hex + 单个 LF`；其他格式不覆盖。
 
 Bootstrap 完成只表示基础部署准备完成。它不创建或恢复微信 session，不启动
-`agent-wechat`，不启动 `wechat-worker`，不表示微信已经登录或 Runtime 已上线。
+`agent-wechat` 或 Gateway Worker，不表示微信已经登录或 Runtime 已上线。
 详细说明见[新设备部署引导](deployment/new-device-bootstrap.md)。
 
 ## 阶段二：人工 Fresh QR
@@ -58,7 +65,8 @@ cd /opt/cf-agent-wechat
 固定状态机：
 
 ```text
-停止并确认 wechat-worker
+直接校验 Contract v1；非 root 一次 sudo -v
+  -> sudo -n controller stop，并确认 {"stopped":true}
   -> 停止并移除旧 agent-wechat 容器
   -> 原子归档旧 runtime
   -> 创建全新 data/wechat-home
@@ -67,7 +75,8 @@ cd /opt/cf-agent-wechat
   -> 手机确认
   -> container + Docker health + WeChat process
   -> auth logged_in + chats readable + messages readable
-  -> 启动并确认 wechat-worker
+  -> sudo -n controller start
+  -> status: ready/token_contract_valid=true，worker/delivery health=healthy
 ```
 
 已有 `logged_in` 也不能跳过 fresh QR。未在当前 TTY 实际显示二维码前，任何成功事件
@@ -86,11 +95,12 @@ cd /opt/cf-agent-wechat
 4. auth 为 `logged_in`。
 5. chats 可读且非空。
 6. 对 API 返回的一个聊天读取 messages 成功。
-7. `wechat-worker` running/healthy，Gateway 提供的 heartbeat 正常。
+7. Gateway `ready` 和 `token_contract_valid` 为 true，`worker` 与
+   `delivery-worker` health 均为 healthy。
 
 Compose healthcheck 只证明容器和 Agent API 健康，不能证明第 3 至第 7 项。
 
-任一步失败都必须返回非零，保持 `wechat-worker` 停止，保留当前失败 runtime 和历史
+任一步失败都必须返回非零，保持两个受控 Gateway Worker 停止，保留失败 runtime 和历史
 archive，不输出 Token、账号、聊天 ID 或消息正文，也不把本轮已在受控 TTY 显示的
 二维码再次回显或写入错误、日志、文件。配置修复后可以安全重试；不得通过恢复旧
 session 获得绿色状态。
@@ -107,9 +117,9 @@ session 获得绿色状态。
 Bootstrap -> `start-qr-login.sh`”执行。不得把 recreate 后 bind mount 仍存在描述为
 session recovery。完整流程见 [Recovery Guide](recovery-guide.md)。
 
-真实 Docker E2E 已覆盖正常退出、异常退出和 daemon restart 后保持停止；最终证据以
-新 PR 的绿色 GitHub Actions Run ID 为准。CI 只模拟 daemon 初始化，不能证明真实 Host
-reboot；Host 与 Gateway boot stop gate 仍必须在 CFserver 实机验证。
+本次 R2 只执行基础语法、compile、ShellCheck（若可用）和 diff 检查；这些不是生产
+验收。真实扫码、Host/Docker reboot、Gateway 开机停止状态、Token contract 和 controller
+失败回停仍待 CFserver 实机验证。
 
 ## 安全与时间
 
@@ -117,10 +127,11 @@ reboot；Host 与 Gateway boot stop gate 仍必须在 CFserver 实机验证。
 - CFserver Host 使用 `Asia/Shanghai`。
 - 容器、日志、archive manifest 和原始审计证据使用 UTC。
 - 展示层可以转换时区，但必须标明时区。
-- 旧 runtime archive 可能包含历史 session、缓存和消息数据，必须 root-protected；
-  Token 严禁进入 archive，且任何 archive 都不得挂回生产复用。
-- 本仓库只协调 Gateway `wechat-worker`，不启停 `dispatch-worker` 或
-  `delivery-worker`，不修改 Gateway、PostgreSQL、Checkpoint 或其他仓库。
+- Archive payload 可能含 WeChat session、账号/Chat 标识、消息 metadata、cache 和
+  数据库内容，必须受限保存且不得用于自动复用；manifest 本身不含 Token、账号标识、
+  Chat ID 或消息正文。
+- controller 只协调 `worker` 和 `delivery-worker`；不控制 `gateway`、
+  `postgres`、`dispatch-worker` 或 migration，也不修改其他仓库。
 
 ## 下一步
 

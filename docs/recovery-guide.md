@@ -16,22 +16,24 @@
 | QR/API 验证失败 | Worker 保持停止 | 保留现场，修复后重新执行完整入口 |
 
 旧 archive 只用于受控审计、故障分析和外部保留策略。任何 archive 都不得挂回生产
-`data` 或 `wechat-home` 作为常规恢复目标。
-归档本身可能包含历史微信 session、缓存和消息数据，必须保持 root-protected；Token
-是唯一被明确禁止进入 archive 的运行 secret。
+`data` 或 `wechat-home` 作为常规恢复目标。Archive payload 可能包含微信 session、
+账号标识、聊天标识、消息元数据、缓存和数据库内容，必须保持 root-protected。
+Archive manifest 只记录脱敏运行元数据，不得包含 Token、微信账号、Chat ID 或消息正文。
 
 ## 标准恢复步骤
 
 1. 停止业务消息。
-2. 确认 Gateway boot/restart stop gate 下 `wechat-worker` 已停止；无法确认时 fail
-   closed 并转交 Gateway/CFserver 运维。
-3. 运行 `./scripts/stop-qr-runtime.sh` 进行受控停止，不执行 Compose `down`。
-4. 检查失败 runtime 和 archive，只查看脱敏元数据。
-5. 部署输入变化时运行 `sudo ./scripts/bootstrap-cfserver.sh`。
-6. 在受控 SSH TTY 运行 `./scripts/start-qr-login.sh`。
-7. 扫描当前终端显示的新二维码。
-8. 等待 process、auth、chats 和 messages 验证。
-9. 确认 `wechat-worker` running/healthy/heartbeat 后恢复业务消息。
+2. 部署输入变化时运行 `sudo ./scripts/bootstrap-cfserver.sh`。
+3. 在受控 SSH TTY 运行 `./scripts/start-qr-login.sh`；非 root 用户只在变更前执行一次
+   `sudo -v`，后续 Gateway 控制均使用 `sudo -n`。
+4. 脚本先直接调用固定 controller 的 `contract`，严格验证 Contract v1；不匹配时在
+   任何变更、归档或二维码显示前 fail closed。
+5. 脚本通过 controller `stop` 停止 `worker` 和 `delivery-worker`，确认成功后才停止
+   Agent、归档旧 runtime 并创建全新 runtime。
+6. 扫描当前终端显示的新二维码。
+7. 等待 process、Docker health、auth、chats 和 messages 验证。
+8. 脚本通过 controller `start` 和 `status` 放行双 Worker，并要求 `ready=true`、Token
+   合同有效且两个 Worker 均为 healthy，随后才恢复业务消息。
 
 Bootstrap 只准备部署，不登录、不启动 Agent 或 Worker。没有配置变化时，也不能用
 Bootstrap 代替扫码启动。
@@ -39,8 +41,8 @@ Bootstrap 代替扫码启动。
 ## Crash
 
 生产 Compose 为 `restart: "no"`。容器进程退出后，Docker 不应自动拉起
-`agent-wechat`。外部监控发现 Agent 停止时，应确保 `wechat-worker` 不再消费该
-Runtime；本仓库只能在脚本取得控制后停止并复核 Worker，不能修改 Gateway 的自动门禁。
+`agent-wechat`。外部监控发现 Agent 停止时，应确保 `worker` 和 `delivery-worker`
+不再消费该 Runtime；失败处理可以 best-effort 再次调用 controller `stop`。
 
 保留失败现场后重新运行完整 fresh-QR 入口。不要先执行 `docker restart`，也不要把
 旧 `logged_in` 当作恢复证据。
@@ -54,7 +56,7 @@ Docker 必须保持 local rootful、固定 `unix:///var/run/docker.sock` endpoin
 
 - `agent-wechat` 不存在或保持停止；
 - 旧 runtime 仍在存储上，但不是可恢复的活跃 session；
-- `wechat-worker` 由 Gateway boot stop gate 保持停止；
+- `worker` 和 `delivery-worker` 由 Gateway boot stop gate 保持停止；
 - PostgreSQL、Gateway 和其他 Worker 按各自批准规则处理，本仓库不干预。
 
 如果 Agent 自动启动，说明生产 Compose 或外部服务偏离 `restart: "no"`，必须先停止
@@ -67,8 +69,8 @@ Docker 必须保持 local rootful、固定 `unix:///var/run/docker.sock` endpoin
 
 升级或回滚步骤：
 
-1. 在旧的已批准代码、Compose 和环境输入下运行 `stop-qr-runtime.sh`，确认
-   Agent/Worker 均已停止。
+1. 在旧的已批准代码、Compose 和环境输入下运行 `stop-qr-runtime.sh`，确认 Agent、
+   `worker` 和 `delivery-worker` 均已停止。
 2. 修改到新的已批准代码 Commit、Compose、环境输入和镜像 digest。
 3. 运行 Bootstrap 验证新输入、权限、网络和 Token，不启动服务。
 4. 运行 forced fresh QR 入口。
@@ -82,27 +84,29 @@ Docker 必须保持 local rootful、固定 `unix:///var/run/docker.sock` endpoin
 - 旧 runtime 和失败 runtime 保留，不自动删除。
 - archive root 保持 root-protected，因为归档可能包含历史 session、缓存和消息数据；
   这些数据不得挂回生产。
-- Token 是独立 API auth secret，可以由 Bootstrap 安全复用，但不代表微信 session
-  复用。
-- Token 不进入 runtime、archive、manifest、日志或备份说明。
+- Token 固定在 `/srv/storage/cf-agent-wechat/secrets/auth-token`：普通文件、非 symlink、
+  hard link count=1、owner `10001:10001`、mode `0600`，内容为无尾随换行的 64 位小写
+  十六进制值。
+- Bootstrap 只自动迁移明确旧格式：`root:root`、`0600`、link count 1、64 位小写
+  十六进制值加单个 LF；迁移不改变逻辑 Token 值，其他格式 fail closed。
+- Token 不进入 runtime、archive、manifest、日志、argv 或备份说明。
 - archive 到期处置只能由本项目之外的审批流程执行。
 - 不通过 PostgreSQL、Checkpoint、`bootstrap_mode=latest` 或 localId 回退修复微信
   Runtime。
 
 ## Gateway 边界
 
-本仓库只协调 `wechat-worker`，不启停 `dispatch-worker` 或
-`delivery-worker`，不修改 Gateway 代码、PostgreSQL、Checkpoint、Hermes 数据或其他
-仓库。Gateway boot stop gate 和 Worker heartbeat 需要在真实 CFserver 验证。
+本仓库只调用固定入口
+`/opt/cf-agent-gateway/deploy/wechat-runtime-control` 的 `contract`、`stop`、`start` 和
+`status`。Contract v1 来自 Gateway Commit
+`2db9dff6ece65004cc75723e1243215a5d04b304`（分支
+`codex/v2-runtime-production-hardening`）。本仓库不猜测 Gateway Compose、服务容器名、
+heartbeat 文件或数据库状态。
 
-固定 heartbeat checker 路径为
-`/opt/cf-agent-gateway/deploy/check-wechat-worker-heartbeat`。它由 Gateway 提供，
-本仓库不创建或修改，并只以管理用户身份在 hard timeout 内执行；不得通过 `sudo`
-运行，也不得输出敏感内容。
-
-真实 Docker E2E 已覆盖正常/异常退出和 daemon restart 后 Agent 保持停止，最终以新
-PR 的绿色 Actions Run ID 为证。该 CI 场景不是 Host reboot；真实 Host 与 Gateway
-boot stop gate 仍需在 CFserver 验证。
+controller 只控制 `worker` 和 `delivery-worker`。本仓库不启停 `gateway`、
+`dispatch-worker`、`postgres` 或 migration，也不修改 Gateway 代码或数据库。
+Controller、Token 合同、Docker/Host 重启行为和完整 forced fresh QR 流程尚待在真实
+CFserver 验证；本仓库的基础静态检查不构成生产验收。
 
 ## 时间与记录
 
@@ -110,6 +114,7 @@ CFserver Host 使用 `Asia/Shanghai`；容器、日志、archive manifest 和原
 使用 UTC。记录转换后的展示时间时必须标明时区。
 
 故障材料只能包含 Commit、镜像 digest、UTC 时间、脱敏状态、退出码和 archive path，
-不得包含 Token、二维码、账号、联系人、聊天 ID 或消息正文。
+不得包含 Token、二维码、账号、联系人、聊天 ID 或消息正文。Archive payload 本身是
+受限敏感资产，不得因 manifest 脱敏而视为无敏感数据。
 
 操作细节见[生产运维](operations.md)和[故障排查](troubleshooting.md)。
