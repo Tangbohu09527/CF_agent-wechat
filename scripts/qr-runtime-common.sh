@@ -340,9 +340,13 @@ runtime_assert_tree_has_no_auth_token() {
   if ! runtime_privileged test -d "$root"; then
     return 0
   fi
+  # Archives use atomic directory moves and do not dereference internal
+  # symlinks, so the scan must not follow them. Sockets, FIFOs, and device
+  # files do not carry archived regular-file content and are skipped; regular
+  # file read errors still return a non-0/1 status and fail closed below.
   if runtime_privileged "$TIMEOUT_BIN" --signal=TERM --kill-after=2s \
     "${TOKEN_SCAN_TIMEOUT}s" /usr/bin/env LC_ALL=C /usr/bin/grep \
-    -R -F -q -f "$TOKEN_FILE" -- "$root" >/dev/null 2>&1; then
+    -r --devices=skip -F -q -f "$TOKEN_FILE" -- "$root" >/dev/null; then
     LAST_ERROR="${label} contains auth-token bytes and cannot be archived."
     return 1
   else
