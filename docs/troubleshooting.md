@@ -40,11 +40,25 @@ Verification -> Do not do。详细恢复步骤见 [Recovery Guide](recovery-guid
 cd /opt/cf-agent-wechat
 ./scripts/status.sh
 
-sudo docker compose +  --env-file /opt/cf-agent-wechat/docker/.env +  --project-directory /opt/cf-agent-wechat +  --project-name cf-agent-wechat +  -f /opt/cf-agent-wechat/docker/compose.cfserver.yaml +  ps
+sudo -v
 
-sudo docker compose +  --env-file /opt/cf-agent-wechat/docker/.env +  --project-directory /opt/cf-agent-wechat +  --project-name cf-agent-wechat +  -f /opt/cf-agent-wechat/docker/compose.cfserver.yaml +  logs --tail=200 agent-wechat
+sudo -n docker compose \
+  --env-file /opt/cf-agent-wechat/docker/.env \
+  --project-directory /opt/cf-agent-wechat \
+  --project-name cf-agent-wechat \
+  -f /opt/cf-agent-wechat/docker/compose.cfserver.yaml \
+  ps
 
-sudo stat -c '%F %u:%g:%a:%h %n' +  /srv/storage/cf-agent-wechat/secrets +  /srv/storage/cf-agent-wechat/secrets/auth-token
+sudo -n docker compose \
+  --env-file /opt/cf-agent-wechat/docker/.env \
+  --project-directory /opt/cf-agent-wechat \
+  --project-name cf-agent-wechat \
+  -f /opt/cf-agent-wechat/docker/compose.cfserver.yaml \
+  logs --tail=200 agent-wechat
+
+sudo -n stat -c '%F %u:%g:%a:%h %n' \
+  /srv/storage/cf-agent-wechat/secrets \
+  /srv/storage/cf-agent-wechat/secrets/auth-token
 ~~~
 
 不要输出完整 Compose render 或 `.env`。日志、工单和截图不得包含 Token、

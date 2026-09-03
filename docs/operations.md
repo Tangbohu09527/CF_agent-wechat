@@ -91,9 +91,16 @@ Automatic Gateway boot stop gate 仍是已知限制，不得在交接中写成�
 只盘点路径、时间与容量，不读取 payload：
 
 ~~~bash
-sudo ls -ld +  /srv/storage/cf-agent-wechat/session-archive +  /srv/storage/cf-agent-wechat/session-archive/*
+sudo -v
 
-sudo du -sh +  /srv/storage/cf-agent-wechat/runtime +  /srv/storage/cf-agent-wechat/session-archive
+sudo -n find /srv/storage/cf-agent-wechat/session-archive \
+  -mindepth 1 \
+  -maxdepth 1 \
+  -printf '%f\n'
+
+sudo -n du -sh \
+  /srv/storage/cf-agent-wechat/runtime \
+  /srv/storage/cf-agent-wechat/session-archive
 ~~~
 
 Archive 不覆盖、不自动删除、不恢复。payload 可能含 Session、账号/Chat 标识、消息
@@ -116,7 +123,11 @@ metadata、cache 和数据库内容，访问与备份按受限敏感资产管理
 只查看元数据：
 
 ~~~bash
-sudo stat -c '%F %u:%g:%a:%h %n' +  /srv/storage/cf-agent-wechat/secrets +  /srv/storage/cf-agent-wechat/secrets/auth-token
+sudo -v
+
+sudo -n stat -c '%F %u:%g:%a:%h %n' \
+  /srv/storage/cf-agent-wechat/secrets \
+  /srv/storage/cf-agent-wechat/secrets/auth-token
 ~~~
 
 预期父目录 `0:0:700`；Token 为普通非 symlink 文件、`10001:10001:600:1`。
@@ -129,7 +140,14 @@ Agent 自身日志策略为 `json-file 20m × 3`：
 
 ~~~bash
 cd /opt/cf-agent-wechat
-sudo docker compose +  --env-file /opt/cf-agent-wechat/docker/.env +  --project-directory /opt/cf-agent-wechat +  --project-name cf-agent-wechat +  -f /opt/cf-agent-wechat/docker/compose.cfserver.yaml +  logs --tail=200 agent-wechat
+sudo -v
+
+sudo -n docker compose \
+  --env-file /opt/cf-agent-wechat/docker/.env \
+  --project-directory /opt/cf-agent-wechat \
+  --project-name cf-agent-wechat \
+  -f /opt/cf-agent-wechat/docker/compose.cfserver.yaml \
+  logs --tail=200 agent-wechat
 ~~~
 
 不要使用 verbose curl trace，不打印 Authorization、`.env` 或代理凭据。Gateway 的

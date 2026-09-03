@@ -35,7 +35,12 @@ sudo -v
 sudo -n /opt/cf-agent-gateway/deploy/wechat-runtime-control contract
 sudo -n /opt/cf-agent-gateway/deploy/wechat-runtime-control status
 
-sudo docker compose +  --env-file /opt/cf-agent-wechat/docker/.env +  --project-directory /opt/cf-agent-wechat +  --project-name cf-agent-wechat +  -f /opt/cf-agent-wechat/docker/compose.cfserver.yaml +  config --quiet
+sudo -n docker compose \
+  --env-file /opt/cf-agent-wechat/docker/.env \
+  --project-directory /opt/cf-agent-wechat \
+  --project-name cf-agent-wechat \
+  -f /opt/cf-agent-wechat/docker/compose.cfserver.yaml \
+  config --quiet
 
 ./scripts/status.sh
 ~~~
@@ -168,7 +173,10 @@ Docker health 或 Auth `logged_in` 单项都不是完整成功。
 ~~~bash
 sudo -v
 
-sudo -n +  /opt/cf-agent-gateway/deploy/wechat-runtime-control +  stop +  --timeout-seconds 30
+sudo -n \
+  /opt/cf-agent-gateway/deploy/wechat-runtime-control \
+  stop \
+  --timeout-seconds 30
 ~~~
 
 只有 Controller 成功确认受控 Worker 已停止后，才执行：
@@ -229,7 +237,14 @@ Archive 不是 Session 恢复源。不得跳过 Token scan、绕过 Controller �
 
 ~~~bash
 cd /opt/cf-agent-wechat
-sudo docker compose +  --env-file /opt/cf-agent-wechat/docker/.env +  --project-directory /opt/cf-agent-wechat +  --project-name cf-agent-wechat +  -f /opt/cf-agent-wechat/docker/compose.cfserver.yaml +  pull agent-wechat
+sudo -v
+
+sudo -n docker compose \
+  --env-file /opt/cf-agent-wechat/docker/.env \
+  --project-directory /opt/cf-agent-wechat \
+  --project-name cf-agent-wechat \
+  -f /opt/cf-agent-wechat/docker/compose.cfserver.yaml \
+  pull agent-wechat
 ~~~
 
 5. 运行 Bootstrap。
