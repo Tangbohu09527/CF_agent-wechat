@@ -1,5 +1,13 @@
 # 2026-08-14 消息与媒体生产验证记录
 
+> [!CAUTION]
+> **Historical / Archived.** 本页适用于 2026-08-14 的消息/media 样本；文档审计起点
+> 为 Commit `5ee3b21bd8a01dd36d15b506ffa1441d85a1328a`，不代表现场镜像源码映射。
+> 它不是当前 CFserver Runbook。仍有效的是当时私聊/群聊文本、消息字段和图片 media
+> 观察；不能外推到当前上游 schema、forced QR、Gateway 内部语义或图片/文件发送。
+> 当前事实见 [生产状态](../production-status.md)，当前验收见
+> [2026-09-03 R2 记录](2026-09-03-forced-qr-r2-production.md)。
+
 ## 记录边界
 
 本文记录 `CF_agent-wechat` 在 CFserver 上新增的脱敏实机证据。文档录入前的仓库

@@ -1,13 +1,15 @@
 # CF_agent-wechat Docker 历史实验手册
 
 > [!CAUTION]
-> **V1 实验室部署，已废弃，非 CFserver 当前生产方案。**
-> 本文包含 VNC/noVNC 等历史实验步骤，严禁在 CFserver 上作为生产 runbook 使用。
-> 当前生产入口为
-> [CFserver 正式部署](../docs/deployment/cfserver-production.md)。
-> 当前生产 Compose 必须为 `restart: "no"`，Bootstrap 不登录或启动服务，每次启动
-> 必须人工运行 `start-qr-login.sh` 并扫描全新二维码。下文的裸 Compose、自动恢复、
-> 旧 session 和 VNC 内容均不得用于生产。
+> **Historical / Archived.** 本页适用于早期 V1 实验室 Compose 和
+> `ghcr.io/thisnick/agent-wechat:0.11.15`，原始仓库 Commit 未记录；不是当前
+> CFserver Runbook。当前事实见 [生产状态](../docs/production-status.md)，当前操作只见
+> [CFserver 生产 Runbook](../docs/deployment/cfserver-production.md)。
+>
+> 仍有效：当时固定实验环境的容器、API、日志轮转与 VNC/noVNC 观察。不能外推：
+> 裸 Compose 命令、自动恢复、旧 Session、VNC 修复资产、tag-only 镜像或实验 Token
+> 权限。当前生产为 `restart: "no"`、`ENABLE_VNC=0`，每次 Agent restart 必须
+> fresh QR。
 
 本目录提供 V1 容器部署基线。镜像 `ghcr.io/thisnick/agent-wechat:0.11.15` 已在
 Debian 13 环境完成基础部署和 API 验证，但仓库 Compose 与验证环境在重启策略和
@@ -142,17 +144,12 @@ docker compose --env-file .env up -d
 docker compose --env-file .env ps
 curl --fail --silent --show-error http://127.0.0.1:6174/health
 docker compose --env-file .env logs --tail=200 agent-wechat
-
-TOKEN="$(cat secrets/auth-token)"
-curl --fail --silent --show-error \
-  -H "Authorization: Bearer ${TOKEN}" \
-  http://127.0.0.1:6174/api/status/auth
-unset TOKEN
 ```
 
 预期容器最终为 `healthy`，`/health` 返回成功。认证接口显示 `logged_out` 时，
 需要完成微信/agent-wechat 登录流程并再次查询状态。已验证成功状态为
-`status=logged_in`。
+`status=logged_in`。历史环境曾执行受认证状态检查，但本归档文档不再保留读取 Token
+或构造 Authorization header 的命令；当前只使用生产生命周期脚本。
 
 ## 微信初始化
 
