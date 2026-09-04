@@ -300,6 +300,13 @@ class RuntimeFixture:
         if not self.ready_file.exists():
             raise RuntimeError("mock agent server did not become ready")
         ports = json.loads(self.ready_file.read_text(encoding="utf-8"))
+        env_contents = self.agent_env.read_text(encoding="utf-8")
+        env_contents = env_contents.replace(
+            "AGENT_WECHAT_PORT=6174",
+            f"AGENT_WECHAT_PORT={ports['http_port']}",
+        )
+        self.agent_env.write_text(env_contents, encoding="utf-8")
+        os.chmod(self.agent_env, 0o600)
         self.env["API_URL"] = f"http://127.0.0.1:{ports['http_port']}"
         self.env["WS_URL"] = (
             f"ws://127.0.0.1:{ports['ws_port']}"

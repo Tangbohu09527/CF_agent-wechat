@@ -204,11 +204,16 @@ case "$command_name" in
     record "$compose_kind compose config"
     if [ "$compose_kind" = "agent" ] &&
       [ "$*" = "--format json" ]; then
+      published_port="$(awk -F= '
+        $1 == "AGENT_WECHAT_PORT" { print substr($0, index($0, "=") + 1) }
+      ' "$compose_env_file")"
+      [ -n "$published_port" ] || exit 68
       printf '{"name":"cf-agent-wechat","services":{"agent-wechat":{'
       printf '"image":"ghcr.io/example/agent-wechat@sha256:%064d",' 0
       printf '"container_name":"agent-wechat-fixture",'
       printf '"restart":"no",'
-      printf '"ports":[{"target":6174,"published":"6174","host_ip":"127.0.0.1","protocol":"tcp"}],'
+      printf '"ports":[{"target":6174,"published":"%s","host_ip":"127.0.0.1","protocol":"tcp"}],' \
+        "$published_port"
       printf '"networks":{"cf-internal":{"aliases":["cf-agent-wechat"]}},'
       printf '"environment":{"ENABLE_VNC":"0"},'
       printf '"healthcheck":{'
