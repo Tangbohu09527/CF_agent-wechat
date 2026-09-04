@@ -120,8 +120,19 @@ case "${1:-}" in
         ;;
     esac
     ;;
+  image)
+    record "docker image inspect"
+    [ "${2:-}" = inspect ] || exit 64
+    printf 'sha256:%064d\n' 1
+    exit 0
+    ;;
   inspect)
     record "docker inspect"
+    if printf '%s\n' "$@" | grep -q 'HostConfig.RestartPolicy.Name'; then
+      printf '/agent-wechat-fixture|ghcr.io/example/agent-wechat@sha256:%064d|' 0
+      printf 'sha256:%064d|no\n' 1
+      exit 0
+    fi
     if printf '%s\n' "$@" | grep -q '.State.Health'; then
       if [ "$(state_get container_health healthy)" = "healthy" ]; then
         printf '%s\n' 'healthy'
@@ -165,7 +176,7 @@ while [ "$#" -gt 0 ]; do
       compose_env_file="$2"
       shift 2
       ;;
-    --project-directory)
+    --project-directory|--project-name)
       shift 2
       ;;
     -f)
@@ -193,8 +204,9 @@ case "$command_name" in
     record "$compose_kind compose config"
     if [ "$compose_kind" = "agent" ] &&
       [ "$*" = "--format json" ]; then
-      printf '{"services":{"agent-wechat":{'
+      printf '{"name":"cf-agent-wechat","services":{"agent-wechat":{'
       printf '"image":"ghcr.io/example/agent-wechat@sha256:%064d",' 0
+      printf '"container_name":"agent-wechat-fixture",'
       printf '"restart":"no",'
       printf '"ports":[{"target":6174,"published":"6174","host_ip":"127.0.0.1","protocol":"tcp"}],'
       printf '"networks":{"cf-internal":{"aliases":["cf-agent-wechat"]}},'

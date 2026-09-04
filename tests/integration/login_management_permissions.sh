@@ -288,11 +288,11 @@ assert_status_sudo_paths() {
     fail "status.sh did not inspect Docker availability, security, and live-restore"
   [ "$(audit_count sudo docker-context)" -eq 2 ] || \
     fail "status.sh did not inspect the Docker context and socket"
-  [ "$(audit_count sudo docker-compose)" -eq 4 ] || \
+  [ "$(audit_count sudo docker-compose)" -eq 2 ] || \
     fail "status.sh used an unexpected Compose query sequence"
   [ "$(audit_count sudo docker-exec)" -eq 2 ] || \
     fail "status.sh did not attest a stable WeChat process"
-  [ "$(audit_count sudo docker-inspect)" -eq 3 ] ||
+  [ "$(audit_count sudo docker-inspect)" -eq 2 ] ||
     fail "status.sh did not inspect Agent health and runtime mounts"
   [ "$(controller_count 'gateway controller contract')" -eq 1 ] ||
     fail "status.sh did not validate Controller contract exactly once"
@@ -858,6 +858,10 @@ done
 [ -s "$READY_FILE" ] || fail "mock server did not become ready"
 HTTP_PORT="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["http_port"])' "$READY_FILE")"
 WS_PORT="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["ws_port"])' "$READY_FILE")"
+sed -i \
+  "s|^AGENT_WECHAT_PORT=.*|AGENT_WECHAT_PORT=$HTTP_PORT|" \
+  "$AGENT_ENV_FILE"
+chmod 600 "$AGENT_ENV_FILE"
 
 reset_audit
 STATUS_OUTPUT="${TEST_ROOT}/status.out"
