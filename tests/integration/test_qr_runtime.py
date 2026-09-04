@@ -167,6 +167,7 @@ class RuntimeFixture:
             "docker": "mock_docker.sh",
             "sudo": "mock_sudo.sh",
             "date": "mock_date.sh",
+            "mv": "mock_mv.sh",
         }
         for target, source in helper_names.items():
             destination = self.fake_bin / target
@@ -230,6 +231,7 @@ class RuntimeFixture:
                 "LOGIN_CONFIRM_RETRIES": "2",
                 "LOGIN_CONFIRM_INTERVAL": "0",
                 "MOCK_DOCKER_STATE_DIR": str(self.docker_state),
+                "MOCK_RUNTIME_ROOT": str(self.runtime),
                 "MOCK_DOCKER_LOG": str(self.audit_log),
                 "MOCK_DOCKER_MUTATION_LOG": str(self.mutation_log),
                 "MOCK_AGENT_COMPOSE_FILE": str(self.agent_compose),
@@ -243,6 +245,7 @@ class RuntimeFixture:
                 "MOCK_LOGIN_CONTINUE_FILE": str(self.login_continue_file),
                 "MOCK_REAL_PYTHON": sys.executable,
                 "MOCK_REAL_DATE": shutil.which("date") or "/bin/date",
+                "MOCK_REAL_MV": shutil.which("mv") or "/bin/mv",
                 "MOCK_FIXED_UTC": "1",
                 "NO_COLOR": "1",
                 "HTTP_PROXY": "http://127.0.0.1:9",
@@ -583,7 +586,7 @@ class ForcedQrRuntimeTests(unittest.TestCase):
         before = tree_digest(self.fixture.storage)
         result = subprocess.run(
             ["bash", str(self.fixture.scripts / "start-qr-login.sh")],
-            cwd=self.repo,
+            cwd=self.fixture.repo,
             env=self.fixture.env,
             text=True,
             stdout=subprocess.PIPE,

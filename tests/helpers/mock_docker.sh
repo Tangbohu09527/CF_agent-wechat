@@ -149,7 +149,7 @@ case "${1:-}" in
       fi
       exit 0
     fi
-    runtime_root="${CF_AGENT_WECHAT_RUNTIME_ROOT:?}"
+    runtime_root="${CF_AGENT_WECHAT_RUNTIME_ROOT:-${MOCK_RUNTIME_ROOT:?}}"
     printf '[{"Mounts":['
     printf '{"Source":"%s/data","Destination":"/data","RW":true},' \
       "$runtime_root"
