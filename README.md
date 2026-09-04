@@ -16,11 +16,13 @@ Skills、ERP、RAG、OCR 和文件理解不属于本仓库。
 
 > [!IMPORTANT]
 > forced-QR R2 已于 2026-09-03 完成真实 CFserver 验收，当前生产在线。Repository
-> promotion 已于 2026-09-04 完成：PR #5、PR #4、PR #1 均已合并，Repository
-> `main` 为 `02583fe76220916019ca961bb37dfa015640384e`，main CI Run
-> `33853255941` 成功。
-> 仓库合并没有连接或修改 CFserver，也没有重新构建或发布生产镜像；不得把该 `main`
-> SHA 写成已经重新部署。
+> branch authority 为 `main`。Repository promotion 已于 2026-09-04 完成：PR #5、
+> PR #4、PR #1 均已合并；PR #1 promotion merge baseline 为
+> `02583fe76220916019ca961bb37dfa015640384e`，其 baseline CI Run
+> `33853255941` 成功。Live `main` tip 有意不硬编码，必须通过 GitHub 或
+> `git rev-parse origin/main` 动态查询。
+> 仓库合并没有连接或修改 CFserver，也没有重新构建或发布生产镜像；不得把
+> `02583fe...` 写成已经重新部署。
 > 当前事实只以 [生产状态](docs/production-status.md) 为准。
 
 ## 核心决策
@@ -68,10 +70,10 @@ chats/messages 可读或 Gateway 已放行。生产在线必须以 `./scripts/st
 
 | 状态 | 当前使用方式 |
 | --- | --- |
-| **已完成** | forced-QR R2 已进入 Repository `main` `02583fe76220916019ca961bb37dfa015640384e` |
-| **已验证（自动化）** | main CI Run `33853255941` 成功，五项 Job 全部通过 |
+| **已完成** | forced-QR R2 已进入 Repository branch authority `main`；live tip 动态查询 |
+| **已验证（自动化）** | PR #1 promotion baseline CI Run `33853255941` 成功，五项 Job 全部通过 |
 | **已验证（CFserver 行为）** | 2026-09-03 的脱敏记录证明 forced fresh QR 生产行为 |
-| **未证明** | 最终源码 SHA 与现场 Image ID 的精确构建映射、automatic boot stop gate |
+| **未证明** | 选定 Release Commit、构建输入与现场 Image ID 的精确映射、automatic boot stop gate |
 | **Repository promotion** | **COMPLETED**；仓库合并不表示生产重新部署 |
 ## 当前限制
 
@@ -80,7 +82,7 @@ chats/messages 可读或 Gateway 已放行。生产在线必须以 `./scripts/st
 - Archive 是受限敏感资产，保留期、容量、备份与安全销毁由外部运维策略负责。
 - 上游 `agent-wechat` API/schema 可能变化；镜像升级必须重新验证。
 - `seccomp=unconfined` 与 `SYS_PTRACE` 是当前上游要求，需持续审查。
-- 现场 Docker Image ID 与精确源码 SHA 的构建映射尚无完整证据。
+- 现场 Docker Image ID 与选定 Release Commit、构建输入的精确映射尚无完整证据。
 
 ## 文档
 

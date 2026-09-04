@@ -81,8 +81,10 @@
 [当前生产状态](production-status.md)为准；执行生产操作时，只使用
 [CFserver 生产 Runbook](deployment/cfserver-production.md)。
 
-Repository promotion 已于 2026-09-04 完成。该仓库事件不改写 2026-09-03 及更早
-验证记录，也不证明 Repository `main` 已重新构建或部署到 CFserver。
+Repository promotion 已于 2026-09-04 完成，branch authority 为 `main`；live tip
+通过 GitHub 或 `git rev-parse origin/main` 动态查询。该仓库事件不改写
+2026-09-03 及更早验证记录，也不证明任何选定 Release Commit 已重新构建或部署到
+CFserver。
 
 ## 文档维护规则
 

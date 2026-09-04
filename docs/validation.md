@@ -7,11 +7,11 @@
 
 | 标签 | 当前使用方式 |
 | --- | --- |
-| **已完成** | 实现、测试、Workflow 和文档已进入 Repository `main` `02583fe76220916019ca961bb37dfa015640384e` |
+| **已完成** | 实现、测试、Workflow 和文档已进入 Repository branch authority `main`；live tip 动态查询 |
 | **已验证（自动化）** | 隔离测试覆盖，不连接 CFserver 或真实微信 |
 | **已验证（CFserver 行为）** | 带日期的脱敏现场记录观察到预期行为 |
 | **未证明** | 缺少 exact build/provenance 或 automatic boot gate 证据 |
-| **Repository promotion** | **COMPLETED**；PR #1/#4/#5 已合并，main CI Run `33853255941` 成功 |
+| **Repository promotion** | **COMPLETED**；PR #1 baseline `02583fe76220916019ca961bb37dfa015640384e`，baseline CI Run `33853255941` 成功 |
 
 历史基线只证明其日期、Commit 与运行方式，不能替代当前 R2 证据。
 
@@ -108,6 +108,6 @@
 - `seccomp=unconfined` 与 `SYS_PTRACE` 仍需持续风险评估。
 - 本仓库不验证 Gateway 内部去重、Admission、Checkpoint、Dispatch、Response、
   Delivery Receipt 或 Hermes 业务语义。
-- 现场 Image ID 与源码 SHA 的精确构建映射未验证。
-- Repository `main` `02583fe...` 未被证明已经重新部署；现场 Image ID 仍为
+- 现场 Image ID 与选定 Release Commit、构建输入的精确映射未验证。
+- PR #1 promotion merge baseline `02583fe...` 未被证明已经重新部署；现场 Image ID 仍为
   `sha256:7ee0309980b7d03b747b40c6c04cbaeafe2d8fc01fc9429810cbc7571ebbf720`。
