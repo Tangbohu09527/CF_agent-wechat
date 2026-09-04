@@ -1,65 +1,91 @@
 # CF_agent-wechat 文档索引
 
-本目录提供本项目独立部署和维护所需的全部说明，不依赖其他仓库文档。文档只描述
-Gateway 的调用与 `wechat-worker` 控制契约，不展开其内部实现。
+本页是唯一文档索引。当前事实、可复用 Runbook 与一次性验收记录必须分开使用。
 
-> [!WARNING]
-> forced-QR 目标流程要求代码中存在 `start-qr-login.sh`、`stop-qr-runtime.sh`、
-> `qr-runtime-common.sh` 以及 runtime 版生产 Compose。2026-08-20 审计时，这些实现仅在
-> 本仓库 `feat/forced-qr-login@9cb7163`，未合入当时的 `main` 代码基线 `96264e2`。执行目标流程前必须
-> 先通过新设备部署文档中的代码能力门禁。
+## Start here
+
+| 文档 | 用途 | 权威性 |
+| --- | --- | --- |
+| [当前生产状态](production-status.md) | 生产在线状态、Git/PR 栈、镜像证据、重启事实与已知限制 | **当前生产事实唯一入口** |
+| [CFserver 生产 Runbook](deployment/cfserver-production.md) | Bootstrap、fresh QR、stop、status、重启、升级与回滚 | **详细生产操作唯一入口** |
+| [R2 生产验收记录](validation/2026-09-03-forced-qr-r2-production.md) | 2026-09-03 forced-QR R2 实机 Closeout | **当前生产验收唯一详细记录** |
 
 ## 新开发者阅读顺序
 
-1. [项目说明](00_项目说明.md)：职责、非职责和状态口径。
-2. [架构设计](01_架构设计.md)：容器、runtime/archive、登录和 worker 闸门。
-3. [新设备部署引导](deployment/new-device-bootstrap.md)：从空白 Debian 主机开始部署。
-4. [CFserver 正式部署](deployment/cfserver-production.md)：目标生产配置与生命周期契约。
-5. [微信登录管理](login-management.md)：forced-QR、扫码和登录失败恢复。
-6. [生产运维](operations.md)：日常检查、停止、升级、归档和回滚。
-7. [验证总览](validation.md)：自动化、历史实机、未验证和后续规划。
-8. [故障排查与常见问题](troubleshooting.md)：按症状恢复并确认项目边界。
+1. [项目说明](00_项目说明.md)：职责、状态口径和安全边界。
+2. [架构设计](01_架构设计.md)：Runtime、Archive、Controller 与三层 readiness。
+3. [当前生产状态](production-status.md)：当前事实、PR 提升和证据限制。
+4. [新设备 Bootstrap](deployment/new-device-bootstrap.md)：空白 Host 的准备门禁。
+5. [CFserver 生产 Runbook](deployment/cfserver-production.md)：唯一详细生产操作。
+6. [登录生命周期](login-management.md)：fresh QR、锁、权限和失败隔离。
+7. [生产运维](operations.md)与[故障排查](troubleshooting.md)。
+8. [验证总览](validation.md)：当前验收、历史证据和未来回归。
+## Current production
 
-## 当前权威资料
-
-| 文档 | 负责内容 |
+| 文档 | 用途 |
 | --- | --- |
-| [项目说明](00_项目说明.md) | 项目定位、状态、边界和安全口径 |
-| [架构设计](01_架构设计.md) | 数据流、生命周期、runtime/archive 与可用判定 |
-| [新设备部署引导](deployment/new-device-bootstrap.md) | 主机、Docker、代码门禁、存储、Token、环境和首次启动 |
-| [CFserver 正式部署](deployment/cfserver-production.md) | forced-QR 目标 Compose 与 start/stop 契约 |
-| [微信登录管理](login-management.md) | forced-QR 协议、状态、返回语义与失败恢复 |
-| [API 边界](api.md) | agent-server 的认证、聊天、消息和 media 边界 |
-| [生产运维](operations.md) | 日常检查、升级、归档、容量、回滚和交接 |
-| [故障排查与常见问题](troubleshooting.md) | 配置、锁、归档、进程、QR、API、worker 与 FAQ |
+| [项目说明](00_项目说明.md) | 项目职责、外部边界和当前限制摘要 |
+| [验证总览](validation.md) | 已完成 R2 验收、未来 Release 清单、历史记录与剩余限制 |
+| [生产运维](operations.md) | 日常状态、维护、重启边界、归档盘点和交接 |
 
-## 验证资料
+## Architecture and boundaries
 
-| 文档 | 证据边界 |
+| 文档 | 用途 |
 | --- | --- |
-| [验证总览](validation.md) | 新实现的自动化证据、旧实机证据、未验证项和现场清单 |
-| [2026-08-13 CFserver 生产验证](validation/2026-08-13-cfserver-production.md) | 旧基线的部署、已信任设备登录和基础接口证据 |
-| [2026-08-14 消息与媒体生产验证](validation/2026-08-14-message-media-production.md) | 旧基线的消息、引用和图片 media 证据 |
+| [架构设计](01_架构设计.md) | Host/Docker、Xvfb、WeChat、agent-server、Gateway 的层级与职责 |
+| [API 边界](api.md) | 当前脚本实际使用的 API、上游观察行为、认证与超时边界 |
 
-两份日期记录是历史事实，不得改写成 forced-QR 新流程已经实机通过。
+## Deployment
 
-## 历史实验资料
+| 文档 | 用途 |
+| --- | --- |
+| [部署导航](deployment-guide.md) | 区分 Bootstrap、start、stop、status 与 recovery |
+| [新设备 Bootstrap](deployment/new-device-bootstrap.md) | 只准备部署输入，不创建 Session 或启动服务 |
 
-以下页面可能包含 VNC/noVNC、旧 Compose、旧持久化布局或桌面调试步骤，只用于追溯，
-不得作为当前生产 runbook：
+## Login lifecycle
 
-- [02 部署记录](02_部署记录.md)
-- [03 V1 验证计划](03_V1验证计划.md)
-- [04 二开规划](04_二开规划.md)
-- [05 V1 验证结果](05_V1验证结果.md)
-- [Docker 实验室手册](../docker/README.md)
+| 文档 | 用途 |
+| --- | --- |
+| [登录生命周期](login-management.md) | 状态机、脚本职责、权限、锁、退出码与 fail-closed 原则 |
+| [QR 操作指南](qr-login-guide.md) | Operator 在 SSH TTY 中扫码和判断成功/失败 |
+
+## Operations and recovery
+
+| 文档 | 用途 |
+| --- | --- |
+| [恢复指南](recovery-guide.md) | 按“检查 -> 判断 -> 操作 -> 验证 -> 失败回退”处理故障 |
+| [故障排查](troubleshooting.md) | 按症状定位只读检查、安全动作和禁止操作 |
+
+## Validation evidence
+
+| 文档 | 分类 | 用途 |
+| --- | --- | --- |
+| [2026-09-03 R2 生产验收](validation/2026-09-03-forced-qr-r2-production.md) | 当前一次性记录 | forced fresh QR、重启、Gateway Contract 与集成链路证据 |
+| [2026-08-13 CFserver 记录](validation/2026-08-13-cfserver-production.md) | 历史快照 | 旧可信设备登录与基础 API 证据，不能证明 forced QR |
+| [2026-08-14 消息/媒体记录](validation/2026-08-14-message-media-production.md) | 历史快照 | 当时消息与图片 media 观察，不能替代当前 Runbook |
+
+## Historical documents
+
+以下材料保留原路径以维持链接，但都不是当前 CFserver Runbook：
+
+| 文档 | 历史范围 |
+| --- | --- |
+| [部署记录](02_部署记录.md) | 早期 V1、VNC/noVNC、自动恢复实验 |
+| [V1 验证计划](03_V1验证计划.md) | 早期验收计划快照 |
+| [二开规划](04_二开规划.md) | 早期扩展设想 |
+| [V1 验证结果](05_V1验证结果.md) | 固定实验环境能力记录 |
+| [R2 实现审计](deployment-audit.md) | PR #2 等实现选择的历史审计，不是操作入口 |
+| [Docker 实验室手册](../docker/README.md) | 实验室 Compose 与 VNC/noVNC 资料 |
+
+历史结论只在其日期、Commit 和明确范围内有效。与当前事实冲突时，以
+[当前生产状态](production-status.md)为准；执行生产操作时，只使用
+[CFserver 生产 Runbook](deployment/cfserver-production.md)。
 
 ## 文档维护规则
 
-1. “已完成”只说明实现存在；“已验证”必须注明自动化或带日期的 CFserver 实机证据。
-2. 新实机结论必须记录日期、代码 Commit、镜像 digest、环境、动作、结果和未验证范围。
-3. 正常流程只在部署、登录和运维权威页维护；其他页面链接到权威入口。
-4. 不从旧基线外推新 runtime、forced-QR、worker 闸门或长期稳定性结论。
-5. 不记录 Token、二维码、真实账号、联系人、聊天 ID、正文、服务器地址、API Key、
-   密码或数据库内容。
-6. 不在本仓库复制或维护 Gateway、Hermes 或其他项目的内部部署说明。
+1. 当前事实、可复用 Runbook、一次性验收记录和 Historical 文档必须分开。
+2. “已验证”必须注明自动化或带日期的 CFserver 行为证据，二者不能互相替代。
+3. 新现场结论记录日期、源码 SHA、镜像证据、环境、动作、结果和未证明范围。
+4. 不从历史可信设备、VNC/noVNC 或旧 Gateway 架构外推当前 forced-QR 能力。
+5. 不记录 Token、二维码、账号、联系人、Chat ID、正文、服务器地址或数据库凭据。
+6. Gateway、Hermes 与其他仓库的内部部署说明留在各自项目。

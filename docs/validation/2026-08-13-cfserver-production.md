@@ -1,5 +1,13 @@
 # 2026-08-13 CFserver 生产验证记录
 
+> [!CAUTION]
+> **Historical / Archived.** 本页只适用于 2026-08-13、基线 Commit `fe3c963`，
+> 包含已废弃的可信设备确认和 `logged_in` short-circuit。它不是当前生产 Runbook。
+> 仍有效的是当时容器、无 VNC 链路和基础 API 观察；不能外推到 forced fresh QR、
+> Runtime 轮换、Gateway Contract 或当前镜像。当前事实见
+> [生产状态](../production-status.md)，当前验收见
+> [2026-09-03 R2 记录](2026-09-03-forced-qr-r2-production.md)。
+
 ## 记录边界
 
 本文记录 `CF_agent-wechat` 在 CFserver 上的脱敏实机验证结果。基线 Commit：
@@ -120,10 +128,11 @@ entrypoint 覆盖，使用镜像默认启动流程。`docker/docker-compose.yml`
 
 本次验证支持以下准确表述：
 
-> 微信入口、登录管理、消息接口和 Gateway 网络访问已完成实机验证。
+> 在基线 Commit `fe3c963` 和本文明确列出的历史验证范围内，微信入口、当时的登录
+> 管理、消息接口和 Gateway 网络访问完成了实机验证。
 
-该结论不表示上层 AI 链路已经完成，也不外推到其他镜像、部署文件、设备信任状态
-或长期运行周期。
+该结论不表示上层 AI 链路已经完成，也不外推到当前 forced fresh QR 生命周期、其他
+镜像、部署文件、设备信任状态或长期运行周期。
 
 当前生产运维见 [CFserver 正式部署](../deployment/cfserver-production.md)，登录细节见
 [微信登录管理](../login-management.md)，总览见 [验证总览](../validation.md)。

@@ -15,6 +15,7 @@ import threading
 import time
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs, unquote, urlsplit
 
 
 WEBSOCKET_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
@@ -28,13 +29,27 @@ class MockState:
         log_file: Path,
         pause_file: Path,
         continue_file: Path,
+        scenario_file: Path | None,
     ) -> None:
         self.token = token_file.read_text(encoding="utf-8").rstrip("\n")
         self.state_file = state_file
         self.log_file = log_file
         self.pause_file = pause_file
         self.continue_file = continue_file
+        self.scenario_file = scenario_file
         self.lock = threading.Lock()
+
+    def scenario(self) -> dict[str, object]:
+        if self.scenario_file is None:
+            return {}
+        try:
+            payload = json.loads(self.scenario_file.read_text(encoding="utf-8"))
+        except (FileNotFoundError, json.JSONDecodeError):
+            return {}
+        return payload if isinstance(payload, dict) else {}
+
+    def setting(self, name: str, default: object) -> object:
+        return self.scenario().get(name, default)
 
     def status(self) -> str:
         return self.state_file.read_text(encoding="utf-8").strip()
@@ -69,39 +84,137 @@ class MockHttpHandler(http.server.BaseHTTPRequestHandler):
     def authorized(self) -> bool:
         return self.headers.get("Authorization") == f"Bearer {self.mock.token}"
 
-    def respond(self, status: int, payload: dict[str, object]) -> None:
+    def respond(self, status: int, payload: object) -> None:
         body = json.dumps(payload).encode("utf-8")
+        self.respond_bytes(status, body, "application/json")
+
+    def respond_bytes(self, status: int, body: bytes, content_type: str) -> None:
         self.send_response(status)
-        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
 
     def do_GET(self) -> None:
-        if self.path != "/api/status/auth":
+        request_path = urlsplit(self.path).path
+        if request_path == "/health":
+            self.mock.record("GET /health")
+            health_status = int(self.mock.setting("health_status", 200))
+            self.respond(health_status, {"status": "ok"})
+            return
+
+        known_path = request_path in {"/api/status/auth", "/api/chats"}
+        if not known_path and not request_path.startswith("/api/messages/"):
             self.respond(404, {"error": "not found"})
             return
         if not self.authorized():
             self.respond(401, {"error": "unauthorized"})
             return
 
-        self.mock.record("GET /api/status/auth")
-        status = self.mock.status()
-        payload: dict[str, object] = {"status": status}
-        if status == "logged_in":
-            payload["loggedInUser"] = "wxid_permissions_test"
-        self.respond(200, payload)
+        if request_path == "/api/status/auth":
+            self.mock.record("GET /api/status/auth")
+            status = self.mock.status()
+            payload: dict[str, object] = {"status": status}
+            if status == "logged_in":
+                payload["loggedInUser"] = str(
+                    self.mock.setting(
+                        "account_id", "account-fixture-not-for-output"
+                    )
+                )
+            self.respond(200, payload)
+            return
+
+        if request_path == "/api/chats":
+            self.mock.record("GET /api/chats")
+            mode = str(self.mock.setting("chats_mode", "ok"))
+            if mode == "error":
+                self.respond(503, {"error": "fixture failure"})
+            elif mode == "api_error":
+                fixture_chat = {
+                    "chatId": str(
+                        self.mock.setting(
+                            "chat_id", "chat-fixture-not-for-output"
+                        )
+                    )
+                }
+                self.respond(
+                    200,
+                    {
+                        "success": False,
+                        "error": "fixture failure",
+                        "chats": [fixture_chat],
+                        "data": [fixture_chat],
+                    },
+                )
+            elif mode == "invalid":
+                self.respond_bytes(200, b"not-json", "application/json")
+            elif mode == "empty":
+                self.respond(200, {"chats": []})
+            else:
+                self.respond(
+                    200,
+                    {
+                        "chats": [
+                            {
+                                "chatId": str(
+                                    self.mock.setting(
+                                        "chat_id",
+                                        "chat-fixture-not-for-output",
+                                    )
+                                )
+                            }
+                        ]
+                    },
+                )
+            return
+
+        self.mock.record("GET /api/messages/<redacted>")
+        expected_chat = str(
+            self.mock.setting("chat_id", "chat-fixture-not-for-output")
+        )
+        requested_chat = unquote(request_path.removeprefix("/api/messages/"))
+        if requested_chat != expected_chat:
+            self.respond(404, {"error": "unknown fixture chat"})
+            return
+        mode = str(self.mock.setting("messages_mode", "ok"))
+        if mode == "error":
+            self.respond(503, {"error": "fixture failure"})
+        elif mode == "api_error":
+            self.respond(200, {"error": "fixture failure"})
+        elif mode == "invalid":
+            self.respond_bytes(200, b"not-json", "application/json")
+        else:
+            self.respond(200, {"messages": []})
 
     def do_POST(self) -> None:
-        if self.path != "/api/status/login":
+        request = urlsplit(self.path)
+        if request.path != "/api/status/login":
             self.respond(404, {"error": "not found"})
             return
         if not self.authorized():
             self.respond(401, {"error": "unauthorized"})
             return
+        query = parse_qs(request.query)
+        if query.get("newAccount") != ["true"]:
+            self.respond(400, {"error": "fresh login requires newAccount=true"})
+            return
 
-        self.mock.record("POST /api/status/login")
-        self.respond(200, {"success": False, "state": {"status": "qr_pending"}})
+        self.mock.record("POST /api/status/login newAccount=true")
+        mode = str(self.mock.setting("login_request_mode", "pending"))
+        if mode == "http_error":
+            self.respond(503, {"error": "fixture failure"})
+        elif mode == "api_error":
+            self.respond(200, {"success": False, "error": "fixture failure"})
+        elif mode == "invalid":
+            self.respond_bytes(200, b"not-json", "application/json")
+        elif mode == "rejected":
+            self.respond(200, {"success": False, "state": {"status": "failed"}})
+        elif mode == "success":
+            self.respond(200, {"success": True})
+        else:
+            self.respond(
+                200, {"success": False, "state": {"status": "qr_pending"}}
+            )
 
 
 def websocket_frame(payload: str) -> bytes:
@@ -140,7 +253,8 @@ def read_websocket_request(connection: socket.socket) -> tuple[str, dict[str, st
 def handle_websocket(connection: socket.socket, state: MockState) -> None:
     connection.settimeout(30)
     path, headers = read_websocket_request(connection)
-    if not path.startswith("/api/ws/login"):
+    parsed_path = urlsplit(path)
+    if parsed_path.path != "/api/ws/login":
         raise ConnectionError("unexpected WebSocket path")
     if headers.get("authorization") != f"Bearer {state.token}":
         raise ConnectionError("unauthorized WebSocket")
@@ -161,28 +275,69 @@ def handle_websocket(connection: socket.socket, state: MockState) -> None:
         "\r\n"
     )
     connection.sendall(response.encode("ascii"))
-    state.record("WS /api/ws/login")
+    scenario = state.scenario()
+    query = parse_qs(parsed_path.query, keep_blank_values=True)
+    new_account = query.get("newAccount", [""])[-1]
+    if scenario.get("require_new_account") is True and new_account != "true":
+        raise ConnectionError("newAccount=true is required")
+    if scenario.get("record_ws_query") is True:
+        state.record(
+            f"WS /api/ws/login newAccount={new_account or 'missing'}"
+        )
+    else:
+        state.record("WS /api/ws/login")
     state.pause_file.touch()
 
-    deadline = time.monotonic() + 60
-    while not state.continue_file.exists():
-        if time.monotonic() >= deadline:
-            raise TimeoutError("test did not release WebSocket events")
-        time.sleep(0.05)
+    if scenario.get("ws_auto_continue") is not True:
+        deadline = time.monotonic() + 60
+        while not state.continue_file.exists():
+            if time.monotonic() >= deadline:
+                raise TimeoutError("test did not release WebSocket events")
+            time.sleep(0.05)
 
-    events = [
-        {"type": "status", "message": "Navigating login flow..."},
-        {"type": "phone_confirm"},
+    events: list[dict[str, object]] = [
+        {"type": "status", "message": "Navigating login flow..."}
     ]
+    if scenario.get("emit_qr") is True:
+        events.append(
+            {"type": "qr", "qrData": "fixture://fresh-device-login"}
+        )
+        state.record("EVENT qr")
+    events.append({"type": "phone_confirm"})
     for event in events:
         connection.sendall(websocket_frame(json.dumps(event)))
     state.record("EVENT phone_confirm")
+
+    login_mode = str(scenario.get("login_mode", "success"))
+    if login_mode == "error":
+        state.record("EVENT error")
+        connection.sendall(
+            websocket_frame(
+                json.dumps({"type": "error", "message": "fixture"})
+            )
+        )
+        return
+    if login_mode == "timeout":
+        state.record("EVENT login_timeout")
+        connection.sendall(
+            websocket_frame(json.dumps({"type": "login_timeout"}))
+        )
+        return
 
     state.set_status("logged_in")
     state.record("EVENT login_success")
     connection.sendall(
         websocket_frame(
-            json.dumps({"type": "login_success", "userId": "wxid_permissions_test"})
+            json.dumps(
+                {
+                    "type": "login_success",
+                    "userId": str(
+                        state.setting(
+                            "account_id", "account-fixture-not-for-output"
+                        )
+                    ),
+                }
+            )
         )
     )
     time.sleep(0.1)
@@ -212,6 +367,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ready-file", type=Path, required=True)
     parser.add_argument("--pause-file", type=Path, required=True)
     parser.add_argument("--continue-file", type=Path, required=True)
+    parser.add_argument("--scenario-file", type=Path)
     return parser.parse_args()
 
 
@@ -223,6 +379,7 @@ def main() -> int:
         args.log_file,
         args.pause_file,
         args.continue_file,
+        args.scenario_file,
     )
     stop = threading.Event()
 

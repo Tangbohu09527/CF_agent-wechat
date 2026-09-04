@@ -1,153 +1,89 @@
 # CF_agent-wechat
 
-`CF_agent-wechat` 是企业 AI 自动化系统的**微信入口层**。它在 CFserver 上运行
-WeChat Linux 客户端与 agent-server，管理微信登录和本地运行态，并向上层调用方提供
-健康、认证、聊天和消息接口。
+`CF_agent-wechat` 是企业 AI 自动化链路中的微信入口服务：
 
-本项目**不是 Gateway**，不负责任务调度、AI 推理、业务编排、权限决策或企业系统
-逻辑。Gateway 是本项目的调用方；本项目只在 forced-QR 生命周期中控制其
-`wechat-worker` 的停止与放行，不维护 Gateway 的代码、数据库或启动策略。
+```text
+WeChat Linux client
+  -> agent-server HTTP API
+  -> CF_agent-gateway
+  -> Hermes
+```
 
-> [!WARNING]
-> forced-QR、`runtime/session-archive` 和 worker 闸门仅适用于本仓库
-> `feat/forced-qr-login@9cb7163` 及其后续合入版本。该流程已完成本地自动化验证，
-> 尚未完成 CFserver 真实手机扫码与 Debian 启动窗口验证；本文审计的 `main` 代码基线为 `96264e2`，
-> 不包含这些入口，不得按目标流程命令运行。仅合入本文档不会获得运行能力。
+本仓库负责 `agent-wechat` 容器部署边界、forced fresh QR 生命周期、WeChat
+进程与认证/API 就绪验证、Runtime/Archive、Token 挂载，以及通过 Gateway Runtime
+Contract version 1 协调 Poll/Delivery Worker。Gateway 内部消息模型、AI 权限、Hermes、
+Skills、ERP、RAG、OCR 和文件理解不属于本仓库。
 
-## 项目职责
+> [!IMPORTANT]
+> forced-QR R2 已于 2026-09-03 完成真实 CFserver 验收，当前生产在线。仓库实现仍位于
+> PR #5 已合并到 PR #4，PR #4 已合并到 PR #1 `feat/forced-qr-login`；
+> PR #1 仍未合入 `main`。
+> 当前事实只以 [生产状态](docs/production-status.md) 为准。
 
-本项目负责：
+## 核心决策
 
-- 运行容器内 Xvfb、fluxbox、dunst、WeChat Linux 客户端和 agent-server；
-- 管理微信登录、运行目录轮换、历史会话归档和登录状态检查；
-- 在完整健康、进程、认证、聊天和消息验证通过后放行 `wechat-worker`；
-- 提供 `/health`、认证、聊天、消息和 media 接口边界；
-- 维护本项目的部署、运维、验证和故障排查文档。
+- 每次 CFserver 重启、`agent-wechat` 容器重建、人工重新启动或 Runtime 轮换，都必须
+  创建全新 Runtime，并在交互式 SSH TTY 扫描新的二维码。
+- 旧 Runtime 只移动到 `session-archive/<UTC timestamp>`，不得恢复为 active Session。
+- 生产 Compose 使用 `restart: "no"`；主机重启后 `cf-agent-wechat` 保持停止。
+- 真实重启验收中 Gateway Poll/Delivery Worker 曾自动恢复。因此重启后不能假设 Gate
+  已关闭，fresh QR 前必须通过正式 Controller 显式 `stop` 并确认。
+- Gateway-only 部署若不重启或删除 `cf-agent-wechat`，已观察到微信 Session 保持；
+  该结论不能外推为 `agent-wechat` 自身重启可复用 Session。
 
-本项目不负责：
+## 生产入口
 
-- Gateway 内部身份、权限、路由、轮询或任务调度；
-- Hermes 或其他 AI 服务的推理与上下文管理；
-- Skills、ERP 或其他企业业务逻辑；
-- 宿主机整体备份平台、归档到期删除或外部监控系统。
+```text
+Bootstrap   sudo ./scripts/bootstrap-cfserver.sh   # 只准备，不上线
+Fresh QR    ./scripts/start-qr-login.sh            # 唯一生产启动
+Stop        ./scripts/stop-qr-runtime.sh           # 停 Worker 和 Agent，保留数据
+Status      ./scripts/status.sh                    # 只读完整状态判定
+Compat      ./scripts/login.sh                     # 仅转入 start-qr-login.sh
+```
+
+不要用 `docker compose up`、`docker compose restart`、`docker compose down`、
+`docker restart cf-agent-wechat`、手工启动 Gateway Worker 或恢复 Archive 替代这些入口。
+
+## 生产边界
+
+- 项目根：`/opt/cf-agent-wechat`
+- Compose：`/opt/cf-agent-wechat/docker/compose.cfserver.yaml`
+- 环境文件：`/opt/cf-agent-wechat/docker/.env`
+- 容器/Compose project：`cf-agent-wechat`
+- API：容器端口 `6174`，宿主仅 loopback，容器网络为外部 `cf-internal`
+- Runtime：`/srv/storage/cf-agent-wechat/runtime`
+- Archive：`/srv/storage/cf-agent-wechat/session-archive/<UTC timestamp>`
+- Token：`/srv/storage/cf-agent-wechat/secrets/auth-token`，只读挂载到
+  `/data/auth-token`
+- Gateway Controller：`/opt/cf-agent-gateway/deploy/wechat-runtime-control`
+
+Docker health 只证明 Agent API `/health` 可达，不证明 WeChat 已登录、真实进程稳定、
+chats/messages 可读或 Gateway 已放行。生产在线必须以 `./scripts/status.sh` 的全部
+11 个状态项和退出码为准。
 
 ## 状态口径
 
-| 状态 | 定义 |
+| 状态 | 当前使用方式 |
 | --- | --- |
-| **已完成** | 本仓库目标分支存在可执行实现；不等于已在 CFserver 实机通过 |
-| **已验证** | 必须注明“自动化验证”或“CFserver 实机验证”，二者不能互相替代 |
-| **未验证** | 实现可能存在，但当前缺少对应现场证据 |
-| **后续规划** | 尚未完成的合入、现场验收或运维治理工作，不得写成现有能力 |
+| **已完成** | 实现已进入 PR #1 Head；不等于已经进入 `main` |
+| **已验证（自动化）** | Unit、lifecycle、Bootstrap、permission、Compose 与 restart=no 门禁已通过 |
+| **已验证（CFserver 行为）** | 2026-09-03 的脱敏记录证明 forced fresh QR 生产行为 |
+| **未证明** | 最终源码 SHA 与现场 Image ID 的精确构建映射、automatic boot stop gate |
+| **后续提升** | PR #1 合入 `main`；该动作不表示生产重新部署 |
+## 当前限制
 
-### 已完成
+- CFserver 重启后必须人工 fresh QR；automatic Gateway boot stop gate 尚未证明。
+- 离线或重启窗口内的消息可能无法由本地微信客户端补拉。
+- Archive 是受限敏感资产，保留期、容量、备份与安全销毁由外部运维策略负责。
+- 上游 `agent-wechat` API/schema 可能变化；镜像升级必须重新验证。
+- `seccomp=unconfined` 与 `SYS_PTRACE` 是当前上游要求，需持续审查。
+- 现场 Docker Image ID 与精确源码 SHA 的构建映射尚无完整证据。
 
-| 能力 | 实现边界 |
-| --- | --- |
-| forced-QR 启动 | `start-qr-login.sh` 编排全新 runtime，内部调用 `login.sh --force-qr` 和 `newAccount=true` |
-| runtime/archive 保护 | 旧 runtime 原子移入唯一 UTC 归档；不覆盖历史；Token 独立；mixed layout fail-fast |
-| 停止入口 | `stop-qr-runtime.sh` 先停 worker、再停入口容器，不删除 runtime、Token 或归档 |
-| worker 闸门 | 脚本取得控制后先停 `wechat-worker`；进程、auth、chats、messages 全部通过后才启动 |
-| 失败隔离 | 轮换后的失败保持 worker 停止并尝试 stop/remove 入口容器；不主动删除持久数据 |
-
-以上“已完成”仅指 `feat/forced-qr-login` 目标实现，不表示这些入口已存在于当前
-`main`。
-
-### 已验证
-
-- **自动化验证：** forced-QR 参数、实际 QR 渲染门槛、runtime/legacy 归档、不覆盖、
-  mixed layout、独占锁、失败清理、状态判定和 worker 放行顺序已由本仓测试覆盖。
-- **历史 CFserver 实机验证：** 2026-08-13 验证了当时基线的容器、无 VNC 链路、
-  已信任设备手机确认、状态管理及 Gateway 对四个入口端点的访问。
-- **历史 CFserver 实机验证：** 2026-08-14 验证了文本发送、群消息字段、引用结构和
-  图片 media 读取。
-
-历史证据不能外推为新的 forced-QR 生命周期已经现场通过。
-
-### 未验证
-
-- 全新 runtime 在 CFserver 上完成“SSH 显示 QR -> 手机扫码/确认 -> API 就绪 ->
-  worker 放行”的真实闭环；
-- Debian 启动到人工运行脚本之前，外部 `wechat-worker` 持续停止的 boot/restart gate；
-- forced-QR 模式的 legacy 首次迁移、mixed layout、失败 cleanup 和重复归档现场行为；
-- 新模式的长期稳定性、停机窗口消息补拉、图片发送和文件发送。
-
-### 后续规划
-
-1. 将 forced-QR 实现整合到经批准的生产代码提交，并保留可追溯版本。
-2. 按 [验证总览](docs/validation.md) 在 CFserver 完成脱敏实机验收。
-3. 由外部运维策略确定归档容量监控、保存期限、访问控制和审批删除流程。
-
-## 目标生产流程
-
-```text
-Debian 启动
-  -> SSH 登录 CFserver
-  -> start-qr-login.sh 停止并确认 wechat-worker
-  -> 归档旧 runtime，创建全新 data/wechat-home
-  -> 启动 cf-agent-wechat
-  -> SSH 终端显示全新二维码
-  -> 手机扫码和确认
-  -> 验证 WeChat 进程、auth、chats、messages
-  -> 全部通过后启动 wechat-worker
-```
-
-Gateway 通过外部 Docker 网络 `cf-internal` 调用：
-
-```text
-http://cf-agent-wechat:6174
-```
-
-容器内生产链路使用 `DISPLAY=:99`、Xvfb `1280x800x24` 和 `ENABLE_VNC=0`。
-VNC、noVNC、x11vnc、websockify、宿主 X11、XFCE 和 RDP 都不属于目标生产方案。
-
-## 快速部署入口
-
-1. 先确认批准代码具备 forced-QR 入口；任一检查失败都停止部署：
-
-   ```bash
-   cd /opt/cf-agent-wechat
-   test -x scripts/start-qr-login.sh
-   test -x scripts/stop-qr-runtime.sh
-   test -f scripts/qr-runtime-common.sh
-   grep -q 'on-failure:3' docker/compose.cfserver.yaml
-   grep -q 'CF_AGENT_WECHAT_RUNTIME_ROOT' docker/compose.cfserver.yaml
-   ```
-
-2. 全新主机按 [新设备部署引导](docs/deployment/new-device-bootstrap.md) 准备 Docker、
-   目录、Token、环境输入和调用方控制边界。
-
-3. 部署前预览；dry run 不应修改容器、worker、runtime、归档或锁：
-
-   ```bash
-   ./scripts/start-qr-login.sh --dry-run
-   ```
-
-4. 在维护窗口正式启动并扫描 SSH 终端中的最新二维码：
-
-   ```bash
-   ./scripts/start-qr-login.sh
-   ./scripts/status.sh
-   ```
-
-5. 停止入口时使用：
-
-   ```bash
-   ./scripts/stop-qr-runtime.sh
-   ```
-
-不要用裸 `docker compose up`、`restart` 或 `down` 代替生命周期脚本。完整契约见
-[CFserver 正式部署](docs/deployment/cfserver-production.md)。
-
-## 文档入口
+## 文档
 
 - [文档索引](docs/README.md)
-- [项目说明](docs/00_项目说明.md)
-- [架构设计](docs/01_架构设计.md)
-- [新设备部署引导](docs/deployment/new-device-bootstrap.md)
-- [CFserver 正式部署](docs/deployment/cfserver-production.md)
-- [微信登录管理](docs/login-management.md)
+- [当前生产状态](docs/production-status.md)
+- [CFserver 生产 Runbook](docs/deployment/cfserver-production.md)
+- [forced-QR R2 生产验收记录](docs/validation/2026-09-03-forced-qr-r2-production.md)
 - [API 边界](docs/api.md)
-- [生产运维](docs/operations.md)
-- [故障排查与常见问题](docs/troubleshooting.md)
-- [验证总览](docs/validation.md)
+- [恢复指南](docs/recovery-guide.md)

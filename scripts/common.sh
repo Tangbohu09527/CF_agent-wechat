@@ -4,7 +4,7 @@
 set +x
 set +a
 
-SCRIPTS_DIR="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+SCRIPTS_DIR="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 
 API_URL="${API_URL:-http://127.0.0.1:6174}"
 API_URL="${API_URL%/}"
@@ -15,6 +15,7 @@ CONTAINER_NAME="${CONTAINER_NAME:-${AGENT_WECHAT_CONTAINER_NAME:-cf-agent-wechat
 
 HTTP_CONNECT_TIMEOUT="${HTTP_CONNECT_TIMEOUT:-5}"
 HTTP_TIMEOUT="${HTTP_TIMEOUT:-45}"
+DOCKER_READ_TIMEOUT="${DOCKER_READ_TIMEOUT:-20}"
 LOGIN_TIMEOUT_MS="${LOGIN_TIMEOUT_MS:-300000}"
 LOGIN_CONFIRM_RETRIES="${LOGIN_CONFIRM_RETRIES:-5}"
 LOGIN_CONFIRM_INTERVAL="${LOGIN_CONFIRM_INTERVAL:-2}"
@@ -41,12 +42,30 @@ unset AUTH_TOKEN
 AUTH_TOKEN=""
 export -n AUTH_TOKEN
 AUTH_STATUS=""
-AUTH_ACCOUNT=""
 LAST_ERROR=""
 LOGIN_PYTHON=""
+SUDO_AUTHORIZED=0
 
 error() {
   printf '错误：%s\n' "$*" >&2
+}
+
+authorize_management_sudo() {
+  local purpose="${1:-执行生产管理操作}"
+
+  if [ "$(id -u)" -eq 0 ] || [ "$SUDO_AUTHORIZED" -eq 1 ]; then
+    return 0
+  fi
+  if ! command -v sudo >/dev/null 2>&1; then
+    LAST_ERROR="$purpose 需要 sudo，但系统未安装 sudo。"
+    return 1
+  fi
+  printf '需要 sudo 权限以%s；请在当前终端完成授权。\n' "$purpose" >&2
+  if ! sudo -v; then
+    LAST_ERROR="$purpose 失败：当前用户没有可用的 sudo 权限。"
+    return 1
+  fi
+  SUDO_AUTHORIZED=1
 }
 
 resolve_python() {
@@ -96,11 +115,53 @@ validate_configuration() {
     LAST_ERROR="LOGIN_CONFIRM_RETRIES must be positive."
     return 1
   fi
+  if ! [[ "$LOGIN_CONFIRM_INTERVAL" =~ ^[0-9]+$ ]]; then
+    LAST_ERROR="LOGIN_CONFIRM_INTERVAL must be a non-negative integer."
+    return 1
+  fi
+  if ! [[ "$HTTP_CONNECT_TIMEOUT" =~ ^[1-9][0-9]*$ ]]; then
+    LAST_ERROR="HTTP_CONNECT_TIMEOUT must be a positive integer."
+    return 1
+  fi
+  if ! [[ "$HTTP_TIMEOUT" =~ ^[1-9][0-9]*$ ]]; then
+    LAST_ERROR="HTTP_TIMEOUT must be a positive integer."
+    return 1
+  fi
+  if ! [[ "$DOCKER_READ_TIMEOUT" =~ ^[1-9][0-9]*$ ]]; then
+    LAST_ERROR="DOCKER_READ_TIMEOUT must be a positive integer."
+    return 1
+  fi
 
 }
 
+validate_token_file_content() {
+  local token_path="$1"
+
+  /usr/bin/od -An -v -t u1 -- "$token_path" | /usr/bin/awk '
+    BEGIN { bytes = 0; bad = 0 }
+    {
+      for (field = 1; field <= NF; field++) {
+        byte = $field + 0
+        bytes++
+        if (!((byte >= 48 && byte <= 57) || (byte >= 97 && byte <= 102)))
+          bad = 1
+      }
+    }
+    END {
+      if (bytes != 64 || bad) exit 48
+    }
+  '
+}
+
+set_token_content_error() {
+  case "$1" in
+    48) LAST_ERROR="token 文件必须是 64 字节小写十六进制且无尾随换行：${TOKEN_FILE}" ;;
+    *) LAST_ERROR="无法验证 token 文件内容：${TOKEN_FILE}" ;;
+  esac
+}
+
 load_auth_token() {
-  local token_value token_status
+  local token_value token_status metadata token_dir current_uid
 
   AUTH_TOKEN=""
   export -n AUTH_TOKEN
@@ -113,6 +174,44 @@ load_auth_token() {
       LAST_ERROR="token 路径不是普通文件：${TOKEN_FILE}"
       return 1
     fi
+    token_dir="$(dirname -- "$TOKEN_FILE")"
+    if [ -L "$token_dir" ] || [ ! -d "$token_dir" ]; then
+      LAST_ERROR="secrets 路径必须是非符号链接目录：${token_dir}"
+      return 1
+    fi
+    if [ "$TOKEN_FILE" = "$DEFAULT_TOKEN_FILE" ]; then
+      if ! metadata="$(stat -Lc '%u:%g:%a' -- "$token_dir")" ||
+        [ "$metadata" != "0:0:700" ]; then
+        LAST_ERROR="secrets 目录必须保持 root:root 700：${token_dir}"
+        return 1
+      fi
+      if ! metadata="$(stat -Lc '%u:%g:%a:%h' -- "$TOKEN_FILE")" ||
+        [ "$metadata" != "10001:10001:600:1" ]; then
+        LAST_ERROR="auth-token 必须保持 10001:10001、mode 0600 且无额外硬链接：${TOKEN_FILE}"
+        return 1
+      fi
+    elif [ "$(uname -s)" = "Linux" ]; then
+      current_uid="$(id -u)"
+      if ! metadata="$(stat -Lc '%u:%a' -- "$token_dir")" ||
+        [ "$metadata" != "$current_uid:700" ]; then
+        LAST_ERROR="自定义 secrets 目录必须由当前用户持有且 mode 700：${token_dir}"
+        return 1
+      fi
+      if ! metadata="$(stat -Lc '%u:%a:%h' -- "$TOKEN_FILE")" ||
+        [ "$metadata" != "$current_uid:600:1" ]; then
+        LAST_ERROR="自定义 auth-token 必须由当前用户持有、mode 600 且无额外硬链接：${TOKEN_FILE}"
+        return 1
+      fi
+    fi
+    if validate_token_file_content "$TOKEN_FILE"; then
+      token_status=0
+    else
+      token_status=$?
+    fi
+    if [ "$token_status" -ne 0 ]; then
+      set_token_content_error "$token_status"
+      return 1
+    fi
     if ! token_value="$(/bin/cat -- "$TOKEN_FILE")"; then
       LAST_ERROR="无法读取 token 文件：${TOKEN_FILE}"
       return 1
@@ -122,13 +221,12 @@ load_auth_token() {
       LAST_ERROR="当前用户无法读取自定义 token 路径；sudo 读取仅允许默认路径：${DEFAULT_TOKEN_FILE}"
       return 1
     fi
-    if ! command -v sudo >/dev/null 2>&1; then
-      LAST_ERROR="当前用户无法读取 token，且未安装 sudo：${TOKEN_FILE}"
+    if ! authorize_management_sudo "读取受保护的生产 auth-token"; then
       return 1
     fi
 
     if token_value="$(
-      sudo -- /bin/sh -c '
+      sudo -n -- /bin/sh -c '
 token_file=/srv/storage/cf-agent-wechat/secrets/auth-token
 secrets_dir=/srv/storage/cf-agent-wechat/secrets
 if [ ! -e "$secrets_dir" ]; then
@@ -152,8 +250,26 @@ fi
 if [ "$(/usr/bin/stat -c "%u:%g:%a" "$secrets_dir")" != "0:0:700" ]; then
   exit 45
 fi
-if [ "$(/usr/bin/stat -c "%u:%g:%a" "$token_file")" != "0:0:600" ]; then
+if [ "$(/usr/bin/stat -Lc "%u:%g:%a:%h" "$token_file")" != "10001:10001:600:1" ]; then
   exit 46
+fi
+/usr/bin/od -An -v -t u1 -- "$token_file" | /usr/bin/awk "
+  BEGIN { bytes = 0; bad = 0 }
+  {
+    for (field = 1; field <= NF; field++) {
+      byte = \$field + 0
+      bytes++
+      if (!((byte >= 48 && byte <= 57) || (byte >= 97 && byte <= 102)))
+        bad = 1
+    }
+  }
+  END {
+    if (bytes != 64 || bad) exit 48
+  }
+"
+token_status=$?
+if [ "$token_status" -ne 0 ]; then
+  exit "$token_status"
 fi
 exec /bin/cat -- "$token_file"
 ' cf-agent-wechat-token-reader
@@ -169,8 +285,9 @@ exec /bin/cat -- "$token_file"
       43) LAST_ERROR="token 路径不是普通文件：${TOKEN_FILE}" ;;
       44) LAST_ERROR="sudo 无法读取 token 文件：${TOKEN_FILE}" ;;
       45) LAST_ERROR="secrets 目录必须保持 root:root 700：/srv/storage/cf-agent-wechat/secrets" ;;
-      46) LAST_ERROR="auth-token 必须保持 root:root 600：${TOKEN_FILE}" ;;
+      46) LAST_ERROR="auth-token 必须保持 10001:10001、mode 0600 且无额外硬链接：${TOKEN_FILE}" ;;
       47) LAST_ERROR="secrets 路径必须是非符号链接目录：/srv/storage/cf-agent-wechat/secrets" ;;
+      48) LAST_ERROR="token 文件必须是 64 字节小写十六进制且无尾随换行：${TOKEN_FILE}" ;;
       *) LAST_ERROR="当前用户无法读取 token，且没有可用的 sudo 权限：${TOKEN_FILE}" ;;
     esac
     if [ "$token_status" -ne 0 ]; then
@@ -234,39 +351,219 @@ if not isinstance(status, str) or not status:
     print("认证状态响应缺少 status 字段。", file=sys.stderr)
     raise SystemExit(2)
 
-account = payload.get("loggedInUser") or ""
-if not isinstance(account, str):
-    account = str(account)
-if any(character in account for character in ("\n", "\r", "\t")):
-    print("loggedInUser 字段包含非法换行符。", file=sys.stderr)
-    raise SystemExit(2)
-
-if any(character in status for character in ("\n", "\r", "\t")):
+if any(ord(character) < 0x20 or ord(character) == 0x7F for character in status):
     print("status contains an invalid control character.", file=sys.stderr)
     raise SystemExit(2)
 
-sys.stdout.write(status + "\t" + account)
+sys.stdout.write(status)
 ')"; then
     LAST_ERROR="无法解析 agent-wechat 认证状态。"
     return 1
   fi
 
-  AUTH_STATUS="${parsed%%$'\t'*}"
-  if [[ "$parsed" == *$'\t'* ]]; then
-    AUTH_ACCOUNT="${parsed#*$'\t'}"
-  else
-    AUTH_ACCOUNT=""
-  fi
+  # Read by the scripts that source this shared library.
+  # shellcheck disable=SC2034
+  AUTH_STATUS="$parsed"
 }
 
 fetch_auth_status() {
   local response
 
-  if ! response="$(api_request GET /api/status/auth 2>&1)"; then
-    LAST_ERROR="认证状态接口调用失败：${response}"
+  if ! response="$(api_request GET /api/status/auth 2>/dev/null)"; then
+    LAST_ERROR="认证状态接口调用失败。"
     return 1
   fi
   parse_auth_response "$response"
+}
+
+auth_status_is_qr_ready() {
+  case "$1" in
+    logged_out|qr_pending|waiting_for_qr|waiting_for_scan) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+check_agent_server() {
+  curl \
+    --disable \
+    --noproxy '*' \
+    --request GET \
+    --fail \
+    --silent \
+    --show-error \
+    --connect-timeout "$HTTP_CONNECT_TIMEOUT" \
+    --max-time "$HTTP_TIMEOUT" \
+    "${API_URL}/health" >/dev/null
+}
+
+parse_chats_response() {
+  local response="$1"
+  local mode="${2:-validate}"
+
+  printf '%s' "$response" | "$PYTHON_BIN" -c '
+import json
+import sys
+from urllib.parse import quote
+
+mode = sys.argv[1]
+try:
+    payload = json.load(sys.stdin)
+except (json.JSONDecodeError, UnicodeDecodeError):
+    raise SystemExit(2)
+
+def chat_list(value):
+    if isinstance(value, list):
+        return value
+    if isinstance(value, dict):
+        if value.get("success") is False or "error" in value:
+            return None
+        for key in ("chats", "data", "items", "results", "list"):
+            if key in value:
+                candidate = chat_list(value[key])
+                if candidate is not None:
+                    return candidate
+    return None
+
+chats = chat_list(payload)
+if chats is None:
+    raise SystemExit(2)
+if mode == "validate":
+    raise SystemExit(0)
+if mode != "first":
+    raise SystemExit(2)
+
+for chat in chats:
+    if not isinstance(chat, dict):
+        continue
+    for key in ("chatId", "chat_id", "id", "userName", "username"):
+        value = chat.get(key)
+        if isinstance(value, (str, int)) and str(value):
+            sys.stdout.write(quote(str(value), safe=""))
+            raise SystemExit(0)
+raise SystemExit(3)
+' "$mode"
+}
+
+check_chats_api() {
+  local response
+
+  if ! response="$(api_request GET /api/chats 2>/dev/null)"; then
+    LAST_ERROR="聊天接口不可读。"
+    return 1
+  fi
+  if ! parse_chats_response "$response" validate >/dev/null 2>&1; then
+    LAST_ERROR="聊天接口未返回可识别的 JSON 列表。"
+    return 1
+  fi
+}
+
+fetch_first_chat_path() {
+  local response encoded_chat
+
+  if ! response="$(api_request GET /api/chats 2>/dev/null)"; then
+    LAST_ERROR="聊天接口不可读。"
+    return 1
+  fi
+  if ! encoded_chat="$(parse_chats_response "$response" first 2>/dev/null)"; then
+    LAST_ERROR="聊天接口没有返回可用于验证的聊天。"
+    return 1
+  fi
+  printf '%s' "$encoded_chat"
+}
+
+check_messages_api() {
+  local encoded_chat="$1"
+  local response
+
+  if ! response="$(api_request GET "/api/messages/${encoded_chat}" 2>/dev/null)"; then
+    LAST_ERROR="消息接口不可读。"
+    return 1
+  fi
+  if ! printf '%s' "$response" | "$PYTHON_BIN" -c '
+import json
+import sys
+
+try:
+    payload = json.load(sys.stdin)
+except (json.JSONDecodeError, UnicodeDecodeError):
+    raise SystemExit(2)
+
+def message_list(value):
+    if isinstance(value, list):
+        return value
+    if isinstance(value, dict):
+        if value.get("success") is False or "error" in value:
+            return None
+        for key in ("messages", "data", "items", "results", "list"):
+            if key in value:
+                candidate = message_list(value[key])
+                if candidate is not None:
+                    return candidate
+    return None
+
+if message_list(payload) is None:
+    raise SystemExit(2)
+' >/dev/null 2>&1; then
+    LAST_ERROR="消息接口未返回可识别的消息列表。"
+    return 1
+  fi
+}
+
+docker_readonly_capture() {
+  local output status output_lower
+
+  if output="$(LC_ALL=C timeout --signal=TERM --kill-after=2s \
+    "${DOCKER_READ_TIMEOUT}s" docker "$@" 2>&1)"; then
+    printf '%s' "$output"
+    return 0
+  else
+    status=$?
+  fi
+
+  output_lower="${output,,}"
+  case "$output_lower" in
+    *permission\ denied*|*access\ denied*|*operation\ not\ permitted*) ;;
+    *) return "$status" ;;
+  esac
+  case "$output_lower" in
+    *docker.sock*|*docker\ daemon\ socket*|*docker\ socket*|*connect\ to\ the\ docker\ daemon*) ;;
+    *) return "$status" ;;
+  esac
+  command -v sudo >/dev/null 2>&1 || return "$status"
+  if ! authorize_management_sudo "查询本机 Docker"; then
+    return "$status"
+  fi
+  timeout --signal=TERM --kill-after=2s "${DOCKER_READ_TIMEOUT}s" \
+    sudo -n -- docker "$@"
+}
+
+get_wechat_process_identity() {
+  # Variables in this snippet are expanded by the shell inside the container.
+  # shellcheck disable=SC2016
+  docker_readonly_capture exec "$CONTAINER_NAME" sh -c '
+launcher_real="$(readlink -f /usr/bin/wechat 2>/dev/null || true)"
+case "$launcher_real" in
+  /*) ;;
+  *) exit 1 ;;
+esac
+
+for process_dir in /proc/[0-9]*; do
+  proc_exe="$(readlink "$process_dir/exe" 2>/dev/null || true)"
+  [ "$proc_exe" = "$launcher_real" ] || continue
+  process_id="${process_dir##*/}"
+  start_time="$(awk "{ print \$22 }" "$process_dir/stat" 2>/dev/null || true)"
+  [ -n "$start_time" ] || continue
+  printf "%s:%s\n" "$process_id" "$start_time"
+  exit 0
+done
+exit 1
+' 2>/dev/null
+}
+
+wechat_process_is_running() {
+  local identity
+
+  identity="$(get_wechat_process_identity)" && [ -n "$identity" ]
 }
 
 detect_container_status() {
@@ -277,7 +574,9 @@ detect_container_status() {
   fi
 
   if inspect_output="$(
-    LC_ALL=C docker inspect --format '{{.State.Running}}' "$CONTAINER_NAME" 2>&1
+    LC_ALL=C timeout --signal=TERM --kill-after=2s \
+      "${DOCKER_READ_TIMEOUT}s" docker inspect \
+      --format '{{.State.Running}}' "$CONTAINER_NAME" 2>&1
   )"; then
     inspect_status=0
   else
@@ -297,8 +596,13 @@ detect_container_status() {
     if ! command -v sudo >/dev/null 2>&1; then
       return 1
     fi
+    if ! authorize_management_sudo "查询本机 Docker"; then
+      return 1
+    fi
     if ! inspect_output="$(
-      sudo -- docker inspect --format '{{.State.Running}}' "$CONTAINER_NAME" 2>/dev/null
+      timeout --signal=TERM --kill-after=2s "${DOCKER_READ_TIMEOUT}s" \
+        sudo -n -- docker inspect --format '{{.State.Running}}' \
+        "$CONTAINER_NAME" 2>/dev/null
     )"; then
       return 1
     fi
@@ -400,6 +704,8 @@ ensure_login_environment() {
     if ! "$LOGIN_PYTHON" -m pip install \
       --disable-pip-version-check \
       --requirement "$REQUIREMENTS_FILE"; then
+      # Read by the scripts that call this shared function.
+      # shellcheck disable=SC2034
       LAST_ERROR="登录工具依赖安装失败。"
       return 1
     fi

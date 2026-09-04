@@ -1,151 +1,208 @@
 # agent-server API 边界
 
-> [!NOTE]
-> 2026-08-13/14 的接口结果是旧生产基线证据。forced-QR 用法仅适用于
-> `feat/forced-qr-login@9cb7163` 及其后续合入版本；该用法已自动化验证，尚未完成
-> CFserver 真实扫码闭环。本文审计的 `main` 代码基线 `96264e2` 不含 `--force-qr`。
+## Scope
 
-## 适用范围
+本仓库不实现上游 `agent-server`。本文区分：
 
-本文描述 `CF_agent-wechat` 对外提供的 agent-server 接口及当前验证边界。Gateway
-内部身份、权限、Hermes 调度、消息 checkpoint 和业务编排不属于本项目文档范围。
+1. **R2 lifecycle contract**：当前脚本和测试实际调用、解析并用于生产放行的接口。
+2. **Observed upstream behavior**：生产集成中观察到的发送/media 行为，不是本仓库拥有
+   的稳定公共 schema。
 
-CFserver 容器间调用地址：
+Gateway 内部 Message、Admission、Checkpoint、Dispatch、Response、Delivery Receipt、
+重试和去重不属于本文。
 
-```text
-http://cf-agent-wechat:6174
-```
+## Address and network
 
-该地址只用于 `cf-internal` 网络。服务不提供 TLS，不应直接暴露到公网。
+| 调用方 | Base URL |
+| --- | --- |
+| CFserver Host 生命周期脚本 | `http://127.0.0.1:6174` |
+| `cf-internal` 中的 Gateway | `http://cf-agent-wechat:6174` |
 
-## 认证
+6174 只绑定 Host loopback，不提供公网 API 或 TLS。WebSocket 从同一 loopback Agent
+地址派生为 `ws://127.0.0.1:6174/api/ws/login`。
 
-除健康检查外，接口使用 Authorization 请求头携带生产 Token。公共示例只能使用
-占位符 `<AGENT_WECHAT_TOKEN>`，不得读取、打印或提交真实 Token。
+## Authentication
 
-生产 Token 由 Compose 只读挂载到 `/data/auth-token`。宿主文件保持
-`root:root 600`，其父目录保持 `root:root 700`。日常状态和登录操作应使用
-`scripts/status.sh`；forced-QR 目标版本的登录和恢复统一使用
-`start-qr-login.sh`，不要为了手工调用放宽权限。
+- `GET /health` 不使用 Bearer Token。
+- 其他当前生命周期 HTTP 请求使用
+  `Authorization: Bearer <AGENT_WECHAT_TOKEN>`。
+- HTTP 与 WebSocket 同时发送 `X-Session-Id: default`。
+- 生产 session ID 只接受 `default`。
+- Token 从只读 `/data/auth-token` 对应的 Host 文件加载，不放在 URL、argv、`.env`
+  或日志中。
 
-## 2026-08-13 历史生产验证
+公共示例不得替换成真实 Token。
 
-以下端点已经由 Gateway 经 `cf-internal` 实机调用：
+## R2 lifecycle endpoints
 
-| 方法 | 路径 | 用途 | 状态 |
-| --- | --- | --- | --- |
-| GET | `/health` | 服务健康检查 | 已实现并实机验证 |
-| GET | `/api/status/auth` | 查询微信认证状态 | 已实现并实机验证 |
-| GET | `/api/chats` | 读取聊天列表 | 已实现并实机验证 |
-| GET | `/api/messages/{chat_id}` | 读取指定聊天的消息 | 已实现并实机验证 |
+### GET /health
 
-`{chat_id}` 必须来自 API 返回值并由调用方正确编码。公共文档和日志不得记录真实
-聊天标识。
+| 项目 | 当前行为 |
+| --- | --- |
+| Authentication | 无 |
+| Request body | 无 |
+| Response parsing | 脚本只要求 HTTP 成功，不依赖 body schema |
+| Timeout | 生命周期脚本默认 connect 5 秒、total 45 秒；Compose healthcheck timeout 5 秒 |
+| Failure | 连接错误、超时或非成功 HTTP 状态均失败 |
 
-## 登录接口
+Docker health 只证明该端点可达，不能证明 WeChat 登录或 Gateway readiness。
 
-| 方法或协议 | 路径 | 目标用途 | 证据边界 |
-| --- | --- | --- | --- |
-| GET | `/api/status/auth` | 登录前、登录后及生产可用复核 | 旧基线已实机验证；forced-QR 组合流程未实机验证 |
-| POST | `/api/status/login` | forced 模式在全新 runtime 请求登录 | `newAccount=true` 已自动化验证；真实扫码未验证 |
-| WebSocket | `/api/ws/login` | 接收 QR、手机确认、成功、超时和错误事件 | forced 模式实际 QR 渲染门槛已自动化验证；真实扫码未验证 |
+### GET /api/status/auth
 
-2026-08-13 已实机验证的是“已信任设备 -> 手机确认 -> 登录成功”，不是全新二维码流程。
-forced-QR 目标版本由 `start-qr-login.sh` 编排 runtime 轮换并内部调用
-`login.sh --force-qr`；运维人员不得单独调用底层接口或脚本绕过归档和 worker 闸门。
-详细行为见[微信登录管理](login-management.md)。
+| 项目 | 当前行为 |
+| --- | --- |
+| Authentication | Bearer + `X-Session-Id: default` |
+| Request body/query | 无 |
+| Required response | JSON object，顶层 `status` 必须为非空字符串且无控制字符 |
+| Used values | `logged_in`、`logged_out`、`qr_pending`、`waiting_for_qr`、`waiting_for_scan` |
+| Timeout | 默认 connect 5 秒、total 45 秒 |
+| Failure | HTTP、JSON、类型或 `status` 校验失败均不可用 |
 
-`GET /api/status/auth` 的当前关键状态为：
+脚本不依赖账号字段，也不得输出账号字段。除上述状态外的上游值不会被文档宣称为稳定
+枚举。
 
-- `logged_in`：微信已登录。
-- `logged_out`：微信未登录；目标版本必须重新执行完整 forced-QR 生命周期。
-- `app_not_running`：微信客户端未运行，应先查容器日志。
+### GET /api/chats
 
-响应可能包含实际账号标识；任何对外记录都应替换为
-`<BOT_WECHAT_ACCOUNT_ID>`。
+| 项目 | 当前行为 |
+| --- | --- |
+| Authentication | Bearer + `X-Session-Id: default` |
+| Request body/query | 无 |
+| Accepted list shape | JSON list，或 object 中递归的 `chats/data/items/results/list` |
+| Explicit rejection | `success=false` 或存在 `error` 的 object |
+| Fresh start requirement | 至少一个可识别聊天 |
+| Candidate ID fields | `chatId`、`chat_id`、`id`、`userName`、`username` |
+| Timeout | 默认 connect 5 秒、total 45 秒 |
 
-## 2026-08-14 历史消息与媒体生产验证
+这些多形态 parser 是对上游已观察行为的兼容处理，不是本仓库冻结的响应 schema。状态
+输出不会打印选中的 ID。
 
-以下接口已在 CFserver 生产环境中完成真实私聊、群聊或图片样本验证：
+### GET /api/messages/{chat_id}
 
-| 方法 | 路径 | 本次验证行为 | 状态 |
-| --- | --- | --- | --- |
-| POST | `/api/messages/send` | 使用 `chatId` 和 `text` 发送私聊、群聊文本，文本实际出现在微信中 | 已实现并实机验证 |
-| GET | `/api/messages/{chat_id}` | 读取群消息字段、引用结构、图片消息和自消息字段 | 已实现并实机验证 |
-| GET | `/api/messages/{chat_id}/media/{local_id}` | 读取真实图片的 JPEG 数据 | 已实现并实机验证 |
+| 项目 | 当前行为 |
+| --- | --- |
+| Authentication | Bearer + `X-Session-Id: default` |
+| Path field | `chat_id` 必须来自 chats API |
+| URL encoding | 使用 percent-encoding，所有非安全字符编码后放入单个 path segment |
+| Accepted list shape | JSON list，或 object 中递归的 `messages/data/items/results/list` |
+| Explicit rejection | `success=false` 或存在 `error` 的 object |
+| Timeout | 默认 connect 5 秒、total 45 秒 |
 
-### 文本发送
+R2 放行只验证“可读取可识别的消息列表”，不冻结消息字段、排序、分页或时间单位，也不
+输出 Chat ID 或正文。
 
-生产验证使用以下脱敏请求体：
+### POST /api/status/login?newAccount=true
 
-```json
+| 项目 | 当前行为 |
+| --- | --- |
+| Authentication | Bearer + `X-Session-Id: default` |
+| Query | 必须为 `newAccount=true` |
+| Request body | 当前脚本不发送 body |
+| Accepted response | JSON object；无有效 `error/errors`，且 `success=true` 或 status 为 QR pending 状态 |
+| Status location | 顶层 `status`，或 object `state.status` |
+| Timeout | 默认 connect 5 秒、total 45 秒 |
+
+该 HTTP 成功只表示登录流程已开始，不是二维码证据或登录成功。
+
+### WebSocket /api/ws/login
+
+实际连接：
+
+~~~text
+GET Upgrade /api/ws/login?timeoutMs=<LOGIN_TIMEOUT_MS>&newAccount=true
+Authorization: Bearer <AGENT_WECHAT_TOKEN>
+X-Session-Id: default
+~~~
+
+| 项目 | 当前行为 |
+| --- | --- |
+| Default timeout | `LOGIN_TIMEOUT_MS=300000`，作为总 deadline 和 `timeoutMs` query |
+| Proxy | WebSocket client 使用 no-proxy |
+| Accepted event object | 必须是 UTF-8 JSON object |
+| Event types | `status`、`qr`、`phone_confirm`、`login_success`、`login_timeout`、`error` |
+| QR payload lookup | event 本身，以及 object `state`、`data`、`payload` |
+| Text QR fields | `qrBinaryData`（UTF-8 bytes/list 或 string）、`qrData` string |
+| PNG field | `qrDataUrl` 在 production fresh QR 中被拒绝 |
+
+关键错误行为：
+
+- WebSocket URL 含 username/password：拒绝。
+- 非 `default` session ID：拒绝。
+- connect/recv 失败、early close、invalid JSON、non-UTF8、timeout：拒绝。
+- 外部错误内容会替换 Token、移除 C0/DEL 控制字符并截断到 240 字符。
+- 当前 WebSocket 未渲染 QR 时收到 `login_success`：拒绝。
+- QR 文本包含 Token：在渲染前拒绝。
+- PNG-only `qrDataUrl`：在任何二维码输出前拒绝。
+
+收到 `login_success` 后仍需 Auth 确认以及
+`POST_LOGIN_READY_TIMEOUT=120` 秒内的进程/chats/messages 验证。
+
+## Observed upstream send behavior
+
+### POST /api/messages/send
+
+该端点已在生产集成链路和历史直接验收中观察到文本发送：
+
+~~~json
 {
   "chatId": "<CHAT_ID>",
   "text": "<REDACTED_MESSAGE_CONTENT>"
 }
-```
+~~~
 
-私聊和群聊均完成了“接口接收请求 -> 微信中实际出现文本”的观察。该结论只证明
-agent-wechat 的文本发送行为，不描述调用方身份、权限或 Hermes 调度实现。
+- 使用同一 Bearer Agent API 边界。
+- 私聊和群聊均观察到微信侧收到文本。
+- 历史样本观察到 `success=true`。
+- 字段可选性、错误码、限流、重试与完整响应 schema 未由本仓库冻结。
+- 当前生命周期脚本不调用该端点；Gateway 调用方必须自行设置有界超时。
 
-### 消息字段
+这是 **observed upstream behavior, not a repository-owned stable public contract**。
 
-| 场景 | 已观察字段或结构 | 准确边界 |
-| --- | --- | --- |
-| 普通群消息 | `sender`、`senderName`、`chatId`、`timestamp`、`isMentioned=false` | 提供微信消息原始字段 |
-| 真正 @机器人 | 通过微信成员选择功能发送时 `isMentioned=true` | 下游可区分真正 @与普通手工文字；本项目不做权限判断 |
-| 私聊和群聊引用 | 本次样本为 `type=49`，并存在 `reply` 结构 | 可提取被引用消息摘要；引用不等同于群聊 @ |
-| 图片消息 | `type=3`，并有可用的 `localId`、`serverId` | 支持定位并读取本次图片样本 |
-| 机器人发送文本 | 消息列表可见对应消息 | 可由 `isSelf` 或机器人发送者信息识别，不描述下游防回环实现 |
+## Observed upstream media behavior
 
-`type=49` 不能单独定义为引用消息；历史实验中的文件和合并转发外层也可能使用该
-类型。本次引用结论由 `type=49` 与 `reply` 结构共同支持。`reply` 的存在不证明被
-引用内容已经传入 Hermes；下游可以据此识别 reply 类型。
+### GET /api/messages/{chat_id}/media/{local_id}
 
-### 图片 media
+历史生产样本曾读取真实图片 media，观察到 `supported=true`、image/jpeg 类型、文件名
+和二进制数据。当前边界：
 
-真实图片样本的 media 响应已观察到：
+- 使用 Bearer Agent API 认证。
+- 两个 path 标识都来自上游消息结果，并应按单个 path segment 安全编码。
+- 图片读取曾通过；图片发送和文件发送不能由此推导。
+- media response 字段、Base64/二进制表示、错误码和跨版本兼容性未冻结。
+- 该端点不是 R2 status 或 fresh QR 放行条件。
 
-| 检查项 | 结果 |
-| --- | --- |
-| `supported` | `true` |
-| `media_type` | `image` |
-| `format` | `jpeg` |
-| `filename` | 存在，未记录真实值 |
-| 媒体数据长度 | 5712 字节 |
-| JPEG 文件签名 | 有效 |
-| SHA-256 | 已在审计中计算，公共文档不记录值 |
+这是 **observed upstream behavior, not a repository-owned stable public contract**。
 
-该结果只证明图片消息识别和 media 读取。图片发送接口、文件发送接口尚未完成生产
-实机验证；也不证明 Hermes 已读取图片或 Gateway 已完成附件持久化。
+## Error and timeout policy
 
-## 历史实验验证能力
+- `curl --fail` 将 HTTP 非成功状态视为失败，但本仓库不声明固定的 4xx/5xx code map。
+- HTTP 默认 `HTTP_CONNECT_TIMEOUT=5`、`HTTP_TIMEOUT=45` 秒。
+- WebSocket 登录默认 300 秒总 deadline，状态事件不会延长总 deadline。
+- 登录成功后的 Runtime readiness 默认 120 秒，每 2 秒轮询。
+- Agent/Gateway/Docker/Compose 还各有独立硬超时，不能改成无限等待。
+- 上游响应若不符合脚本当前 parser，生命周期按失败处理。
 
-以下能力或扩展边界只在早期固定镜像的实验环境中留下证据，仍只作为兼容性参考：
+## Status mapping
 
-| 方法 | 路径 | 历史验证边界 |
-| --- | --- | --- |
-| GET | `/api/contacts` | 读取联系人 |
+`status.sh` 使用 `/health`、auth、chats 和 messages，再叠加容器、WeChat 进程、
+Runtime mounts 与 Gateway Contract。退出码：
 
-历史实验还覆盖过 `txt`/`zip` 文件 media、群消息、引用上下文和合并转发消息外层
-识别。这些历史证据按原日期保留，不能与 2026-08-14 图片样本混写。合并转发内部
-解析、图片发送和 API 文件发送未由这些记录证明。具体历史边界见
-[V1 验证结果](05_V1验证结果.md)，该文档已封存为非当前生产方案。
-
-## WebSocket 事件边界
-
-`/api/ws/events` 在历史实验中仅验证过建立连接，未观察到新消息事件，因此仍属于
-待调查能力。不得把登录 WebSocket `/api/ws/login` 的成功验证外推为实时消息事件
-已经可用。
+- `0`：全部 11 项生产门槛通过。
+- `1`：配置/查询/Token/Message API/Gateway failure。
+- `2`：明确 `logged_out`。
+- `3`：容器、health、Agent、进程、Runtime mode 或其他 auth 状态不可用。
 
 ## 调用方约束
 
-- 调用方应设置连接、请求和重试上限，不得假设未记录的响应字段已经冻结。
-- 不得在日志、异常、URL 查询参数或命令历史中写入认证凭据。
-- 账号、联系人、聊天标识和消息正文均按敏感数据处理。
-- 容器健康不等于微信已登录；业务调用前应检查认证状态。
-- Gateway 只作为本服务调用方出现，其内部故障应转交 Gateway 项目处理。
+- 调用方必须设置连接、总请求和重试上限，不假设未记录字段已经冻结。
+- Token 不得进入 URL、argv、环境文件、异常、命令历史或日志。
+- 账号、联系人、Chat ID、消息正文和 media 均按敏感数据处理。
+- 业务调用前检查完整在线状态；Docker health 或 Auth 单项不足以放行。
+- Gateway 只作为本服务调用方出现，其内部故障转交 Gateway 项目处理。
+## Non-contract historical endpoints
 
-历史生产验证证据见
-[2026-08-13 CFserver 生产验证](validation/2026-08-13-cfserver-production.md) 和
-[2026-08-14 消息与媒体生产验证](validation/2026-08-14-message-media-production.md)。
+旧 V1 记录中出现过 contacts 与消息事件 WebSocket。当前 R2 脚本和测试不调用它们，
+本文不把它们列为当前生产 API。需要追溯时只查看
+[V1 验证结果](05_V1验证结果.md)，不得把历史观察外推到当前上游镜像。
+
+当前实机证据见
+[2026-09-03 R2 生产验收](validation/2026-09-03-forced-qr-r2-production.md)。
