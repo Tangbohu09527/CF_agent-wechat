@@ -3,6 +3,17 @@
 本页把已完成的 R2 生产验收、未来 Release 模板、历史记录和剩余限制明确分开。当前
 事实以 [生产状态](production-status.md) 为准。
 
+## Status definitions
+
+| 标签 | 当前使用方式 |
+| --- | --- |
+| **已完成** | 实现、测试、Workflow 和文档存在于 PR #1 Head |
+| **已验证（自动化）** | 隔离测试覆盖，不连接 CFserver 或真实微信 |
+| **已验证（CFserver 行为）** | 带日期的脱敏现场记录观察到预期行为 |
+| **未证明** | 缺少 exact build/provenance 或 automatic boot gate 证据 |
+| **后续提升** | PR #1 合入 `main`；不表示生产重新部署 |
+
+历史基线只证明其日期、Commit 与运行方式，不能替代当前 R2 证据。
 ## A. Completed R2 production acceptance
 
 以下项目已在 2026-09-03 Closeout 前完成真实 CFserver 验证：
@@ -72,6 +83,19 @@
 | [2026-08-14 消息与媒体](validation/2026-08-14-message-media-production.md) | 当时文本发送、消息字段、图片 media | 不能替代 2026-09-03 R2 生命周期验收 |
 | [V1 验证结果](05_V1验证结果.md) | 实验室固定镜像与 VNC/noVNC 背景 | 不能作为生产 Runbook 或自动恢复授权 |
 
+## Regression requirements
+
+以下变化必须重新运行自动化门禁，并在涉及生产行为时建立新的带日期脱敏记录：
+
+1. 镜像 digest、Compose、端口、网络、挂载或 `restart: "no"`。
+2. Runtime/Archive 路径、原子移动、权限或 manifest。
+3. Token owner/mode/content、只读挂载或 Token Contract。
+4. `newAccount=true`、QR payload、WebSocket 或登录超时。
+5. WeChat 进程、Auth、chats/messages 或 11 项 status 判定。
+6. Runtime Controller contract/stop/start/status 或 Poll/Delivery Gate。
+7. Host reboot、Docker daemon restart、升级、重建或回滚。
+8. Archive 保留、访问控制、备份或审批销毁。
+9. automatic boot stop gate 的实现或验证状态。
 ## D. Remaining limitations
 
 - Automatic Gateway boot stop gate 尚未实现或证明；真实 reboot 中 Worker 曾自动恢复。
@@ -82,4 +106,4 @@
 - 本仓库不验证 Gateway 内部去重、Admission、Checkpoint、Dispatch、Response、
   Delivery Receipt 或 Hermes 业务语义。
 - 现场 Image ID 与源码 SHA 的精确构建映射未验证。
-- R2 实现仍在 PR #4，尚未提升到 `main`。
+- PR #4/#5 已并入 PR #1；PR #1 仍未提升到 `main`。

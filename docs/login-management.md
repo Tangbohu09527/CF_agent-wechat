@@ -118,6 +118,27 @@ start/stop 共用：
 - cleanup 失败不覆盖原失败 phase，必须先人工确认残留容器再重启 Docker/Host。
 - Auth `logged_in`、Docker health、`login_success` 任一单项都不能手工放行 Worker。
 
+## Python venv
+
+二维码渲染与 WebSocket 辅助程序使用普通用户 venv，默认位于
+`~/.local/share/cf-agent-wechat/venv`，按 `scripts/requirements.txt` 校验。
+不要用 sudo 安装 Python 包，也不要修改系统 Python。
+
+## Common failure cues
+
+- `runtime is not clean`：fresh Runtime 意外报告已登录，保留现场并重跑完整入口。
+- mixed Runtime/legacy：来源不明确，禁止手工合并或删除。
+- WeChat process 不稳定：保留日志，Gate 继续关闭。
+- Auth `logged_in` 但 chats/messages 不可读：仍未达到生产 readiness。
+- QR 超时或 SSH 中断：等待锁释放，重新运行完整 fresh QR；旧二维码不可复用。
+- Controller start/status 或任一 Poll/Delivery health 失败：恢复 stop，转交 Gateway 边界，
+  不手工启动 Worker。
+
+## Configuration override boundary
+
+测试可覆盖超时、Python 或终端宽度，但生产不得覆盖固定 Controller、Token host path、
+`newAccount=true`、fresh Runtime、独占锁、完整 API 验证或 Poll/Delivery 放行门槛。
+管理路径来自固定默认值和受控 `docker/.env`。
 ## Current evidence boundary
 
 forced fresh QR、真实进程稳定、auth/chats/messages、Controller ready 与 Poll/Delivery

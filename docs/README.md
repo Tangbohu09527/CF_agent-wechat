@@ -10,6 +10,16 @@
 | [CFserver 生产 Runbook](deployment/cfserver-production.md) | Bootstrap、fresh QR、stop、status、重启、升级与回滚 | **详细生产操作唯一入口** |
 | [R2 生产验收记录](validation/2026-09-03-forced-qr-r2-production.md) | 2026-09-03 forced-QR R2 实机 Closeout | **当前生产验收唯一详细记录** |
 
+## 新开发者阅读顺序
+
+1. [项目说明](00_项目说明.md)：职责、状态口径和安全边界。
+2. [架构设计](01_架构设计.md)：Runtime、Archive、Controller 与三层 readiness。
+3. [当前生产状态](production-status.md)：当前事实、PR 提升和证据限制。
+4. [新设备 Bootstrap](deployment/new-device-bootstrap.md)：空白 Host 的准备门禁。
+5. [CFserver 生产 Runbook](deployment/cfserver-production.md)：唯一详细生产操作。
+6. [登录生命周期](login-management.md)：fresh QR、锁、权限和失败隔离。
+7. [生产运维](operations.md)与[故障排查](troubleshooting.md)。
+8. [验证总览](validation.md)：当前验收、历史证据和未来回归。
 ## Current production
 
 | 文档 | 用途 |
@@ -70,3 +80,12 @@
 历史结论只在其日期、Commit 和明确范围内有效。与当前事实冲突时，以
 [当前生产状态](production-status.md)为准；执行生产操作时，只使用
 [CFserver 生产 Runbook](deployment/cfserver-production.md)。
+
+## 文档维护规则
+
+1. 当前事实、可复用 Runbook、一次性验收记录和 Historical 文档必须分开。
+2. “已验证”必须注明自动化或带日期的 CFserver 行为证据，二者不能互相替代。
+3. 新现场结论记录日期、源码 SHA、镜像证据、环境、动作、结果和未证明范围。
+4. 不从历史可信设备、VNC/noVNC 或旧 Gateway 架构外推当前 forced-QR 能力。
+5. 不记录 Token、二维码、账号、联系人、Chat ID、正文、服务器地址或数据库凭据。
+6. Gateway、Hermes 与其他仓库的内部部署说明留在各自项目。

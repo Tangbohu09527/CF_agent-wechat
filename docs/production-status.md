@@ -12,9 +12,10 @@
 | Closeout date | 2026-09-03 |
 | Current forced-QR decision | 每次 CFserver/Agent 重启、容器重建或人工重新启动均使用 fresh Runtime 和新二维码 |
 | Repository `main` | `92393bc2ae1d89dae9449fc131413979aa2fa2f2` |
-| PR #1 | `OPEN`；Base `main`；Head `feat/forced-qr-login` @ `9cb7163cb226b4eed2581e11ff298e41f96226b6` |
-| PR #4 | `OPEN`；Base `feat/forced-qr-login`；Head `codex/forced-qr-production-hardening-r2` @ `dc103c855e965524aa54325ce9c878321e3b1f3f` |
-| R2 implementation review line | PR #4 / `codex/forced-qr-production-hardening-r2` |
+| PR #1 | `OPEN`；Base `main`；Head `feat/forced-qr-login`；已包含 PR #4/#5 与 current-main reconciliation |
+| PR #4 | `MERGED`；Merge Commit `92f3f062da564053678cbdd8d2830c82cab0f3fb` |
+| PR #5 | `MERGED`；Merge Commit `ed7d50c414c8b146345bbf188be66a1265c4a560` |
+| R2 implementation review line | PR #1 / `feat/forced-qr-login` |
 | Observed production image ID | `sha256:7ee0309980b7d03b747b40c6c04cbaeafe2d8fc01fc9429810cbc7571ebbf720` |
 | Exact source-to-image binding status | **未验证**；现有证据不足以把现场 Image ID 精确绑定到某个源码 SHA 或上游 digest |
 | Repository promotion status | R2 尚未合并到 `main`，未创建生产 Tag |
@@ -24,8 +25,8 @@
 ```text
 main
   -> PR #1 feat/forced-qr-login
-       -> PR #4 codex/forced-qr-production-hardening-r2
-            -> docs/wechat-r2-production-closeout
+       +-- merged PR #4 Runtime/CI hardening
+       +-- merged PR #5 production Closeout docs
 ```
 
 生产行为已经完成 CFserver 实机验证，不等于仓库分支已经完成 `main` promotion。
@@ -149,12 +150,11 @@ Hermes 连通性恢复属于 Gateway/Hermes 边界；本仓库只确认 agent-we
 8. 6174 不是公网 API；VNC/noVNC 不在生产链路。
 9. 本仓库不保证 Gateway、Hermes、数据库或业务自动化恢复。
 10. 源码 SHA 与现场 Image ID 的精确绑定未验证。
-11. PR #1 / PR #4 尚未完成最终 `main` promotion。
+11. PR #1 尚未完成最终 `main` promotion。
 12. Archive 保留、容量、备份与安全销毁由外部运维策略决定。
 
 ## Remaining repository work
 
-1. Review and merge 本 stacked documentation PR into PR #4。
-2. 按既有 PR 栈完成 PR #4 与 PR #1 的评审和提升；本次 Closeout 不执行 merge。
-3. 只有证据完整时才建立源码 SHA、上游 digest 与现场 Image ID 的精确映射。
-4. Gateway boot stop gate 需要独立后续实现与实机复验。
+1. Review PR #1 and confirm mergeable/CLEAN/CI；本次仓库提升先停在 PR #1，不合入 `main`。
+2. 只有证据完整时才建立源码 SHA、上游 digest 与现场 Image ID 的精确映射。
+3. Gateway boot stop gate 需要独立后续实现与实机复验。

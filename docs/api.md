@@ -191,6 +191,13 @@ Runtime mounts 与 Gateway Contract。退出码：
 - `2`：明确 `logged_out`。
 - `3`：容器、health、Agent、进程、Runtime mode 或其他 auth 状态不可用。
 
+## 调用方约束
+
+- 调用方必须设置连接、总请求和重试上限，不假设未记录字段已经冻结。
+- Token 不得进入 URL、argv、环境文件、异常、命令历史或日志。
+- 账号、联系人、Chat ID、消息正文和 media 均按敏感数据处理。
+- 业务调用前检查完整在线状态；Docker health 或 Auth 单项不足以放行。
+- Gateway 只作为本服务调用方出现，其内部故障转交 Gateway 项目处理。
 ## Non-contract historical endpoints
 
 旧 V1 记录中出现过 contacts 与消息事件 WebSocket。当前 R2 脚本和测试不调用它们，

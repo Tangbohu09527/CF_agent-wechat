@@ -16,8 +16,8 @@ Skills、ERP、RAG、OCR 和文件理解不属于本仓库。
 
 > [!IMPORTANT]
 > forced-QR R2 已于 2026-09-03 完成真实 CFserver 验收，当前生产在线。仓库实现仍位于
-> stacked PR：PR #1 `feat/forced-qr-login`，PR #4
-> `codex/forced-qr-production-hardening-r2`；R2 尚未提升到 `main`。
+> PR #5 已合并到 PR #4，PR #4 已合并到 PR #1 `feat/forced-qr-login`；
+> PR #1 仍未合入 `main`。
 > 当前事实只以 [生产状态](docs/production-status.md) 为准。
 
 ## 核心决策
@@ -61,6 +61,15 @@ Docker health 只证明 Agent API `/health` 可达，不证明 WeChat 已登录�
 chats/messages 可读或 Gateway 已放行。生产在线必须以 `./scripts/status.sh` 的全部
 11 个状态项和退出码为准。
 
+## 状态口径
+
+| 状态 | 当前使用方式 |
+| --- | --- |
+| **已完成** | 实现已进入 PR #1 Head；不等于已经进入 `main` |
+| **已验证（自动化）** | Unit、lifecycle、Bootstrap、permission、Compose 与 restart=no 门禁已通过 |
+| **已验证（CFserver 行为）** | 2026-09-03 的脱敏记录证明 forced fresh QR 生产行为 |
+| **未证明** | 最终源码 SHA 与现场 Image ID 的精确构建映射、automatic boot stop gate |
+| **后续提升** | PR #1 合入 `main`；该动作不表示生产重新部署 |
 ## 当前限制
 
 - CFserver 重启后必须人工 fresh QR；automatic Gateway boot stop gate 尚未证明。

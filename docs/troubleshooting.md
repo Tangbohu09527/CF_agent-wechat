@@ -64,6 +64,33 @@ sudo -n stat -c '%F %u:%g:%a:%h %n' \
 不要输出完整 Compose render 或 `.env`。日志、工单和截图不得包含 Token、
 Authorization、二维码、账号、联系人、群名、Chat ID、消息正文、内网 IP 或数据库 URL。
 
+## Common questions
+
+### 容器 healthy 是否等于生产在线？
+
+不等于。还要验证真实 WeChat 进程、Auth、fresh Runtime、chats/messages，以及
+Controller ready、Token Contract、Poll/Delivery health；以 11 项 status 和退出码为准。
+
+### 可以恢复旧 Archive 或改用 VNC 吗？
+
+不可以。Archive 只保留证据，不能恢复为 active Session；VNC/noVNC、Host X11、XFCE
+和 RDP 不属于当前生产路径。
+
+### 登录失败后可以手工启动 Worker 吗？
+
+不可以。Controller 是 Poll/Delivery 唯一入口；只有完整 Agent/API 验证后才允许
+`start/status`，失败时先确认 `stop`。
+
+### Agent 正常但没有 AI 回复，应重新登录吗？
+
+不应先重建 Agent。若 11 项状态通过，问题转交 Gateway/Hermes；本仓库不处理其内部
+Admission、Checkpoint、Dispatch、Response 或 Delivery Receipt。
+
+## Incident reporting minimum
+
+只记录 UTC 时间、源码 Commit、批准镜像引用或现场 Image ID、脱敏 11 项状态、脚本
+退出码和 Archive path。不得附带 Token 或指纹、二维码、账号、联系人、Chat ID、正文、
+media、服务器地址、API Key、密码、`.env` 或数据库内容。
 ## Layer ownership
 
 - Agent/container/WeChat/auth/chats/messages/Runtime：本仓库运维边界。

@@ -3,6 +3,18 @@
 本文覆盖日常只读检查、正常停止、维护、重启边界、Archive 盘点、日志和交接。生命周期
 命令的权威步骤见 [CFserver 生产 Runbook](deployment/cfserver-production.md)。
 
+## Lifecycle table
+
+| 场景 | 唯一入口 | 当前语义 |
+| --- | --- | --- |
+| 预演 | `start-qr-login.sh --dry-run` | 不改容器、Controller、目录、Archive 或锁 |
+| 正式启动 | `start-qr-login.sh` | Controller stop，轮换 Runtime，fresh QR，验证后 start/status |
+| 正式停止 | `stop-qr-runtime.sh` | Controller stop 后停止 Agent，保留 Runtime/Token/Archive |
+| Host reboot | Controller stop + fresh QR | Agent 因 `restart: "no"` 保持停止；Gate 必须显式确认 |
+| 升级/回滚 | stop -> Bootstrap -> fresh QR -> status | 不恢复旧 Archive，不复用旧 Session |
+| 失败 cleanup | 启动脚本自动处理 | 再次 stop Gate，尝试 stop/remove Agent，不删除持久数据 |
+
+任何场景都不得用裸 `docker compose up/restart/down` 或手工 Worker 启动替代生命周期入口。
 ## Daily status
 
 ~~~bash
@@ -164,7 +176,7 @@ sudo -n docker compose \
 - [ ] Runtime、Archive、Token 的路径和访问责任已交接。
 - [ ] Archive 保留、容量、备份和销毁有外部负责人。
 - [ ] 日志按 `20m × 3` 监控，且敏感信息规则明确。
-- [ ] PR #1/PR #4 尚未提升到 `main` 的仓库状态已交接。
+- [ ] PR #4/#5 已并入 PR #1、但 PR #1 尚未提升到 `main` 的状态已交接。
 - [ ] Source SHA 与现场 Image ID 的精确绑定仍未验证。
 
 ## Upgrade/rollback decision

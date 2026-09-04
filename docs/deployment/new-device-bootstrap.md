@@ -31,6 +31,30 @@ sudo ./scripts/bootstrap-cfserver.sh
 
 生产模式拒绝测试替身或 PATH 中可被普通用户替换的关键工具。
 
+## Debian and Docker preparation detail
+
+新 Host 先确认系统、架构、时间和空间：
+
+~~~bash
+cat /etc/os-release
+dpkg --print-architecture
+timedatectl status
+df -h /opt /srv /var/lib/docker 2>/dev/null || df -h /
+~~~
+
+安装基础工具时至少包含 `ca-certificates`、`curl`、`git`、`openssl`、
+`python3`、`python3-venv`、`sudo`、`util-linux` 和 `gawk`。Docker 使用官方
+Engine 与 Compose v2，并验证：
+
+~~~bash
+sudo docker version
+sudo docker info
+sudo docker compose version
+~~~
+
+不得使用旧 `docker-compose`。批准镜像必须拉取后解析为完整
+`@sha256:<digest>`，并在变更 digest 时重新核对容器内 WeChat UID/GID。这里只准备
+输入，不构建、发布或启动生产镜像。
 ## Docker contract
 
 Bootstrap 验证：
@@ -115,6 +139,19 @@ Bootstrap 只读取固定 Controller：
 Bootstrap 不启动或停止 Gateway Worker；Worker 生命周期由 fresh QR/stop 脚本通过
 Controller `stop/start/status` 管理。
 
+## New-device acceptance checklist
+
+以下项目用于未来新设备或重新部署，现场执行前保持未勾选：
+
+- [ ] 批准 Commit、Controller v1 和固定路径通过能力门禁。
+- [ ] 镜像为批准 digest，Compose 为 `restart: "no"`、loopback-only。
+- [ ] `docker/.env` 受控且不含 Token；旧进程路径变量不能覆盖管理值。
+- [ ] secrets 为 `0:0:700`，Token 为 `10001:10001:600:1`。
+- [ ] Bootstrap 未启动 Agent、未显示 QR、未调用 Controller start/stop/status。
+- [ ] Host reboot 后先显式 Controller stop/confirm，再执行 fresh QR。
+- [ ] SSH TTY 显示当前二维码，随后 11 项 status 全部通过。
+- [ ] Archive 未覆盖、未恢复为 active Session，Token 未进入 Runtime/Archive。
+- [ ] 失败场景保持 Poll/Delivery Gate 关闭并保留脱敏证据。
 ## Retry and completion
 
 Bootstrap 可在配置修复后重复执行。它可能准备管理目录、Token 和 external network，

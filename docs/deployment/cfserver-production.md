@@ -284,6 +284,30 @@ sudo -n docker compose \
 Archive payload 本身可能含敏感 Session 与消息 metadata，访问、保留、备份和销毁由
 外部运维策略管理。
 
+## Production configuration reference
+
+固定代码与管理入口：
+
+~~~text
+/opt/cf-agent-wechat/
+├── docker/
+│   ├── compose.cfserver.yaml
+│   └── .env
+└── scripts/
+    ├── bootstrap-cfserver.sh
+    ├── start-qr-login.sh
+    ├── stop-qr-runtime.sh
+    └── status.sh
+~~~
+
+受控 `docker/.env` 只接受批准键：Compose project、digest-pinned image、固定容器名、
+storage/runtime/archive、loopback bind、端口、无认证 proxy 与受限 `RUST_LOG`。
+旧的进程级 storage/runtime/archive/token 变量不是生产输入；Gateway Worker 也不通过
+Compose 路径变量管理，只通过固定 Runtime Controller v1。
+
+每个 Archive manifest 记录 UTC 时间、来源布局、原权限、流程 phase/result 和脱敏
+cleanup 结果，不包含 Token、二维码、账号、Chat ID 或正文。生命周期脚本不自动删除
+Archive；保留期、容量、备份和审批销毁由外部治理。
 ## Do not do
 
 - 不执行 `docker compose up`、`restart` 或 `down` 替代生命周期脚本。
