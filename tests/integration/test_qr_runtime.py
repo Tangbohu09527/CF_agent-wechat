@@ -140,7 +140,7 @@ class RuntimeFixture:
                     f"CF_AGENT_WECHAT_ARCHIVE_ROOT={self.archive}",
                     "AGENT_WECHAT_BIND_IP=127.0.0.1",
                     "AGENT_WECHAT_PORT=6174",
-                    f"PROXY=http://{self.agent_env_sentinel}.invalid",
+                    f"PROXY=http://{self.agent_env_sentinel}.invalid:8080",
                     "RUST_LOG=info",
                     "",
                 )

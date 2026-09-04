@@ -150,7 +150,7 @@ printf '%s\n' \
   'CF_AGENT_WECHAT_ARCHIVE_ROOT=/srv/storage/cf-agent-wechat/session-archive' \
   'AGENT_WECHAT_BIND_IP=127.0.0.1' \
   'AGENT_WECHAT_PORT=6174' \
-  "PROXY=http://${AGENT_ENV_SENTINEL}.invalid" \
+  "PROXY=http://${AGENT_ENV_SENTINEL}.invalid:8080" \
   'RUST_LOG=info' > "$AGENT_ENV_FILE"
 chown root:root "$AGENT_COMPOSE_FILE" "$AGENT_ENV_FILE"
 chmod 600 "$AGENT_COMPOSE_FILE" "$AGENT_ENV_FILE"
