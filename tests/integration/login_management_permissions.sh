@@ -17,7 +17,9 @@ AUDIT_LOG=""
 AUDIT_PATH=""
 REAL_DOCKER=""
 REAL_SUDO=""
-
+GATEWAY_RUNTIME_CONTROL="/opt/cf-agent-gateway/deploy/wechat-runtime-control"
+CONTROLLER_STATE_DIR="/opt/cf-agent-gateway/deploy/.wechat-runtime-control-test-state"
+CONTROLLER_CREATED=0
 fail() {
   printf 'FAIL: %s\n' "$*" >&2
   exit 1
@@ -37,6 +39,16 @@ cleanup() {
     docker rm -f "$TEST_CONTAINER" >/dev/null 2>&1
   fi
   rm -f "$SUDOERS_FILE"
+  if [ "$CONTROLLER_CREATED" -eq 1 ]; then
+    case "$CONTROLLER_STATE_DIR" in
+      /opt/cf-agent-gateway/deploy/.wechat-runtime-control-test-state)
+        rm -rf -- "$CONTROLLER_STATE_DIR"
+        ;;
+    esac
+    rm -f -- "$GATEWAY_RUNTIME_CONTROL"
+    rmdir /opt/cf-agent-gateway/deploy 2>/dev/null
+    rmdir /opt/cf-agent-gateway 2>/dev/null
+  fi
   userdel --force --remove "$TEST_USER" >/dev/null 2>&1
   userdel --force --remove "$NO_SUDO_USER" >/dev/null 2>&1
   if [ -n "$TEST_ROOT" ]; then
@@ -66,6 +78,12 @@ fi
 if [ -e "$SUDOERS_FILE" ]; then
   fail "temporary sudoers file already exists: ${SUDOERS_FILE}"
 fi
+if [ -e "$GATEWAY_RUNTIME_CONTROL" ] || [ -L "$GATEWAY_RUNTIME_CONTROL" ]; then
+  fail "refusing to replace an existing fixed Controller path"
+fi
+if [ -e "$CONTROLLER_STATE_DIR" ] || [ -L "$CONTROLLER_STATE_DIR" ]; then
+  fail "refusing to replace an existing Controller test state path"
+fi
 for command_name in docker openssl python3 sudo useradd visudo; do
   command -v "$command_name" >/dev/null 2>&1 || fail "missing command: ${command_name}"
 done
@@ -91,14 +109,9 @@ AUDIT_PATH="${AUDIT_BIN}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin
 AGENT_COMPOSE_FILE="${TEST_ROOT}/agent-compose.yaml"
 AGENT_ENV_FILE="${TEST_ROOT}/agent.env"
 AGENT_ENV_SENTINEL="agent-env-fixture-sensitive-permissions-$$"
-GATEWAY_PROJECT_DIR="${TEST_ROOT}/gateway"
-GATEWAY_COMPOSE_FILE="${GATEWAY_PROJECT_DIR}/compose.yaml"
-GATEWAY_ENV_FILE="${GATEWAY_PROJECT_DIR}/.env"
-GATEWAY_ENV_SENTINEL="gateway-env-fixture-sensitive-permissions-$$"
-GATEWAY_HEARTBEAT_COMMAND="${GATEWAY_PROJECT_DIR}/check-wechat-worker-heartbeat"
 AGENT_STATE_FILE="${TEST_ROOT}/agent-state"
 
-install -d -o root -g root -m 755 "${TEST_REPO}/scripts"
+install -d -o root -g root -m 755 "${TEST_REPO}/scripts" "${TEST_REPO}/docker"
 install -o root -g root -m 755 \
   "${REPO_ROOT}/scripts/common.sh" \
   "${REPO_ROOT}/scripts/qr-runtime-common.sh" \
@@ -115,7 +128,18 @@ install -o root -g root -m 755 \
   "${REPO_ROOT}/tests/helpers/audit_docker.sh" "${AUDIT_BIN}/docker"
 install -o root -g root -m 755 \
   "${REPO_ROOT}/tests/helpers/audit_sudo.sh" "${AUDIT_BIN}/sudo"
-install -d -o root -g root -m 755 "$GATEWAY_PROJECT_DIR"
+install -d -o root -g root -m 755 /opt/cf-agent-gateway/deploy
+install -o root -g root -m 755 \
+  "${REPO_ROOT}/tests/helpers/mock_gateway_runtime_control.sh" \
+  "$GATEWAY_RUNTIME_CONTROL"
+CONTROLLER_CREATED=1
+install -d -o root -g root -m 755 "$CONTROLLER_STATE_DIR"
+: > "$CONTROLLER_STATE_DIR/controller.log"
+: > "$CONTROLLER_STATE_DIR/mutations.log"
+printf '%s\n' '1' > "$CONTROLLER_STATE_DIR/gateway_running"
+printf '%s\n' 'true' > "$CONTROLLER_STATE_DIR/token_contract_valid"
+printf '%s\n' 'healthy' > "$CONTROLLER_STATE_DIR/worker_health"
+printf '%s\n' 'healthy' > "$CONTROLLER_STATE_DIR/delivery_health"
 printf '%s\n' 'services:' '  agent-wechat: {}' > "$AGENT_COMPOSE_FILE"
 printf '%s\n' \
   'COMPOSE_PROJECT_NAME=cf-agent-wechat' \
@@ -126,22 +150,20 @@ printf '%s\n' \
   'CF_AGENT_WECHAT_ARCHIVE_ROOT=/srv/storage/cf-agent-wechat/session-archive' \
   'AGENT_WECHAT_BIND_IP=127.0.0.1' \
   'AGENT_WECHAT_PORT=6174' \
-  "PROXY=http://${AGENT_ENV_SENTINEL}.invalid" \
+  "PROXY=http://${AGENT_ENV_SENTINEL}.invalid:8080" \
   'RUST_LOG=info' > "$AGENT_ENV_FILE"
-printf '%s\n' 'services:' '  wechat-worker: {}' > "$GATEWAY_COMPOSE_FILE"
-chmod 600 "$AGENT_COMPOSE_FILE" "$GATEWAY_COMPOSE_FILE"
-printf '%s\n' "$GATEWAY_ENV_SENTINEL" > "$GATEWAY_ENV_FILE"
-chown root:root "$AGENT_ENV_FILE" "$GATEWAY_ENV_FILE"
-chmod 600 "$AGENT_ENV_FILE" "$GATEWAY_ENV_FILE"
-printf '%s\n' '#!/bin/sh' 'exit 0' > "$GATEWAY_HEARTBEAT_COMMAND"
-chown root:root "$GATEWAY_HEARTBEAT_COMMAND"
-chmod 755 "$GATEWAY_HEARTBEAT_COMMAND"
+chown root:root "$AGENT_COMPOSE_FILE" "$AGENT_ENV_FILE"
+chmod 600 "$AGENT_COMPOSE_FILE" "$AGENT_ENV_FILE"
 printf '%s\n' 'running' > "$AGENT_STATE_FILE"
 
 useradd --create-home --home-dir "$TEST_HOME" --shell /bin/bash "$TEST_USER"
 useradd --create-home --home-dir "$NO_SUDO_HOME" --shell /bin/bash "$NO_SUDO_USER"
-chown "$TEST_USER:$TEST_USER" "$AGENT_STATE_FILE"
-chmod 600 "$AGENT_STATE_FILE"
+chown "$TEST_USER:$TEST_USER" "$AGENT_STATE_FILE" \
+  "$CONTROLLER_STATE_DIR/controller.log" \
+  "$CONTROLLER_STATE_DIR/mutations.log"
+chmod 600 "$AGENT_STATE_FILE" \
+  "$CONTROLLER_STATE_DIR/controller.log" \
+  "$CONTROLLER_STATE_DIR/mutations.log"
 : > "$AUDIT_LOG"
 chown "$TEST_USER:$TEST_USER" "$AUDIT_LOG"
 chmod 600 "$AUDIT_LOG"
@@ -156,8 +178,10 @@ SECRETS_CREATED=1
 install -d -o root -g root -m 755 "$DEPLOYMENT_DIR"
 install -d -o root -g root -m 700 "$SECRETS_DIR"
 umask 077
-openssl rand -hex 32 > "$TOKEN_FILE"
-chown root:root "$TOKEN_FILE"
+TOKEN_VALUE="$(openssl rand -hex 32)"
+printf '%s' "$TOKEN_VALUE" > "$TOKEN_FILE"
+unset TOKEN_VALUE
+chown 10001:10001 "$TOKEN_FILE"
 chmod 600 "$TOKEN_FILE"
 printf 'logged_in\n' > "$STATE_FILE"
 reset_audit() {
@@ -165,13 +189,27 @@ reset_audit() {
     grep -Fq -- "$AGENT_ENV_SENTINEL" "$AUDIT_LOG"; then
     fail "agent-wechat environment sentinel leaked into the audit log"
   fi
-  if [ -s "$AUDIT_LOG" ] &&
-    grep -Fq -- "$GATEWAY_ENV_SENTINEL" "$AUDIT_LOG"; then
-    fail "Gateway environment sentinel leaked into the audit log"
-  fi
   : > "$AUDIT_LOG"
+  rm -f -- \
+    "$CONTROLLER_STATE_DIR/contract_mode" \
+    "$CONTROLLER_STATE_DIR/stop_mode" \
+    "$CONTROLLER_STATE_DIR/start_mode" \
+    "$CONTROLLER_STATE_DIR/status_mode" \
+    "$CONTROLLER_STATE_DIR/gateway_ready"
+  printf '%s\n' '1' > "$CONTROLLER_STATE_DIR/gateway_running"
+  printf '%s\n' 'true' > "$CONTROLLER_STATE_DIR/token_contract_valid"
+  printf '%s\n' 'healthy' > "$CONTROLLER_STATE_DIR/worker_health"
+  printf '%s\n' 'healthy' > "$CONTROLLER_STATE_DIR/delivery_health"
+  : > "$CONTROLLER_STATE_DIR/controller.log"
+  : > "$CONTROLLER_STATE_DIR/mutations.log"
 }
 
+controller_count() {
+  awk -v expected="$1" '
+    $0 == expected { count++ }
+    END { print count + 0 }
+  ' "$CONTROLLER_STATE_DIR/controller.log"
+}
 audit_count() {
   awk -F '\t' -v category="$1" -v kind="$2" '
     $1 == category && $2 == kind { count++ }
@@ -233,7 +271,6 @@ assert_runtime_mock_requires_sudo() {
     CF_AUDIT_LOG="$AUDIT_LOG" \
     CF_AUDIT_REAL_DOCKER="$REAL_DOCKER" \
     CF_AUDIT_AGENT_ENV_FILE="$AGENT_ENV_FILE" \
-    CF_AUDIT_GATEWAY_ENV_FILE="$GATEWAY_ENV_FILE" \
     CF_AUDIT_DOCKER_RUNTIME_MOCK=1 \
     CF_AUDIT_DOCKER_VIA_SUDO=0 \
     docker "$@" > /dev/null 2> "$error_file"; then
@@ -251,12 +288,16 @@ assert_status_sudo_paths() {
     fail "status.sh did not inspect Docker availability, security, and live-restore"
   [ "$(audit_count sudo docker-context)" -eq 2 ] || \
     fail "status.sh did not inspect the Docker context and socket"
-  [ "$(audit_count sudo docker-compose)" -eq 4 ] || \
+  [ "$(audit_count sudo docker-compose)" -eq 2 ] || \
     fail "status.sh used an unexpected Compose query sequence"
   [ "$(audit_count sudo docker-exec)" -eq 2 ] || \
     fail "status.sh did not attest a stable WeChat process"
-  [ "$(audit_count sudo docker-inspect)" -eq 3 ] || \
-    fail "status.sh did not inspect Agent/Worker health and runtime mounts"
+  [ "$(audit_count sudo docker-inspect)" -eq 2 ] ||
+    fail "status.sh did not inspect Agent health and runtime mounts"
+  [ "$(controller_count 'gateway controller contract')" -eq 1 ] ||
+    fail "status.sh did not validate Controller contract exactly once"
+  [ "$(controller_count 'gateway controller status')" -eq 1 ] ||
+    fail "status.sh did not query Controller status exactly once"
   assert_token_read_once "status.sh"
   assert_sudo_contract "status.sh"
 }
@@ -265,57 +306,51 @@ assert_status_sudo_paths() {
 printf '%s\n' '{}' > "$SCENARIO_FILE"
 
 assert_secret_permissions() {
-  [ "$(stat -c '%U:%G %a' "$SECRETS_DIR")" = "root:root 700" ] || \
+  [ "$(stat -c '%u:%g %a' "$SECRETS_DIR")" = "0:0 700" ] ||
     fail "secrets directory permissions changed"
-  [ "$(stat -c '%U:%G %a' "$TOKEN_FILE")" = "root:root 600" ] || \
+  [ "$(stat -c '%u:%g %a' "$TOKEN_FILE")" = "10001:10001 600" ] ||
     fail "auth-token permissions changed"
-  [ "$(stat -c '%U:%G %a' "$AGENT_ENV_FILE")" = "root:root 600" ] || \
+  [ "$(stat -c '%u:%g %a' "$AGENT_ENV_FILE")" = "0:0 600" ] ||
     fail "agent-wechat environment file permissions changed"
-  [ "$(stat -c '%U:%G %a' "$AGENT_COMPOSE_FILE")" = "root:root 600" ] || \
+  [ "$(stat -c '%u:%g %a' "$AGENT_COMPOSE_FILE")" = "0:0 600" ] ||
     fail "agent-wechat Compose permissions changed"
-  [ "$(stat -c '%U:%G %a' "$GATEWAY_COMPOSE_FILE")" = "root:root 600" ] || \
-    fail "Gateway Compose permissions changed"
-  [ "$(stat -c '%U:%G %a' "$GATEWAY_ENV_FILE")" = "root:root 600" ] || \
-    fail "Gateway environment file permissions changed"
-  [ "$(stat -c '%U:%G %a' "$GATEWAY_HEARTBEAT_COMMAND")" = "root:root 755" ] || \
-    fail "Gateway heartbeat checker permissions changed"
+  [ ! -L "$GATEWAY_RUNTIME_CONTROL" ] &&
+    [ -f "$GATEWAY_RUNTIME_CONTROL" ] &&
+    [ -x "$GATEWAY_RUNTIME_CONTROL" ] ||
+    fail "Gateway Runtime Controller is not a regular executable"
+  [ "$(stat -c '%u:%g:%a:%h' "$GATEWAY_RUNTIME_CONTROL")" = "0:0:755:1" ] ||
+    fail "Gateway Runtime Controller metadata changed"
 }
 
 assert_file_has_no_token() {
-  python3 - "$TOKEN_FILE" "$AGENT_ENV_SENTINEL" \
-    "$GATEWAY_ENV_SENTINEL" "$1" <<'PY'
+  python3 - "$TOKEN_FILE" "$AGENT_ENV_SENTINEL" "$1" <<'PY'
 import sys
 from pathlib import Path
 
-token = Path(sys.argv[1]).read_bytes().rstrip(b"\n")
+token = Path(sys.argv[1]).read_bytes()
 agent_env_sentinel = sys.argv[2].encode()
-gateway_env_sentinel = sys.argv[3].encode()
-content = Path(sys.argv[4]).read_bytes()
+content = Path(sys.argv[3]).read_bytes()
 for name, sensitive in (
     ("token", token),
     ("agent-wechat environment sentinel", agent_env_sentinel),
-    ("Gateway environment sentinel", gateway_env_sentinel),
 ):
     if sensitive in content:
-        raise SystemExit(f"{name} leaked into {sys.argv[4]}")
+        raise SystemExit(f"{name} leaked into {sys.argv[3]}")
 PY
 }
 
 print_redacted_file() {
-  python3 - "$TOKEN_FILE" "$AGENT_ENV_SENTINEL" \
-    "$GATEWAY_ENV_SENTINEL" "$1" <<'PY'
+  python3 - "$TOKEN_FILE" "$AGENT_ENV_SENTINEL" "$1" <<'PY'
 import sys
 from pathlib import Path
 
-token = Path(sys.argv[1]).read_bytes().rstrip(b"\n")
+token = Path(sys.argv[1]).read_bytes()
 agent_env_sentinel = sys.argv[2].encode()
-gateway_env_sentinel = sys.argv[3].encode()
-path = Path(sys.argv[4])
+path = Path(sys.argv[3])
 content = path.read_bytes() if path.exists() else b"<missing output>\n"
 for sensitive, replacement in (
     (token, b"<redacted-token>"),
     (agent_env_sentinel, b"<redacted-agent-env>"),
-    (gateway_env_sentinel, b"<redacted-gateway-env>"),
     (b"account-fixture-not-for-output", b"<redacted-account>"),
     (b"chat-fixture-not-for-output", b"<redacted-chat>"),
 ):
@@ -418,14 +453,9 @@ run_script_as() {
     CF_AUDIT_DOCKER_RUNTIME_MOCK=1 \
     CF_AUDIT_DOCKER_VIA_SUDO=0 \
     CF_AUDIT_AGENT_ENV_FILE="$AGENT_ENV_FILE" \
-    CF_AUDIT_GATEWAY_ENV_FILE="$GATEWAY_ENV_FILE" \
     CONTAINER_NAME="$TEST_CONTAINER" \
     CF_AGENT_WECHAT_COMPOSE_FILE="$AGENT_COMPOSE_FILE" \
     CF_AGENT_WECHAT_ENV_FILE="$AGENT_ENV_FILE" \
-    CF_AGENT_GATEWAY_COMPOSE_FILE="$GATEWAY_COMPOSE_FILE" \
-    CF_AGENT_GATEWAY_PROJECT_DIR="$GATEWAY_PROJECT_DIR" \
-    CF_AGENT_GATEWAY_ENV_FILE="$GATEWAY_ENV_FILE" \
-    CF_AGENT_GATEWAY_HEARTBEAT_COMMAND="$GATEWAY_HEARTBEAT_COMMAND" \
     "$@" \
     /bin/bash -c '
 cd "$1"
@@ -434,7 +464,233 @@ exec "./scripts/$2"
     cf-agent-wechat-test "$TEST_REPO" "$script_name"
 }
 
+run_gateway_library_as() {
+  local action="$1"
+  shift
+  "$REAL_SUDO" -u "$TEST_USER" -H env \
+    PATH="$AUDIT_PATH" \
+    CF_AUDIT_LOG="$AUDIT_LOG" \
+    CF_AUDIT_REAL_SUDO="$REAL_SUDO" \
+    PYTHON_BIN=python3 \
+    COMPOSE_COMMAND_TIMEOUT=1 \
+    "$@" \
+    /bin/bash -c '
+cd "$1"
+source scripts/common.sh
+source scripts/qr-runtime-common.sh
+action=$2
+case "$action" in
+  contract)
+    gateway_validate_runtime_contract
+    ;;
+  stop)
+    gateway_validate_runtime_contract &&
+      runtime_authorize_sudo &&
+      stop_gateway_workers
+    ;;
+  start)
+    gateway_validate_runtime_contract &&
+      runtime_authorize_sudo &&
+      start_gateway_workers
+    ;;
+  summary)
+    gateway_validate_runtime_contract &&
+      runtime_authorize_sudo &&
+      gateway_status_summary
+    ;;
+  ready)
+    gateway_validate_runtime_contract &&
+      runtime_authorize_sudo &&
+      status_json="$(gateway_runtime_control status 2>/dev/null)" &&
+      gateway_status_json_is_ready "$status_json"
+    ;;
+  *)
+    LAST_ERROR="unsupported permission test action"
+    false
+    ;;
+esac
+status=$?
+if [ "$status" -ne 0 ]; then
+  printf "%s\n" "${LAST_ERROR:-Gateway Runtime Contract test action failed.}" >&2
+fi
+exit "$status"
+' cf-agent-wechat-controller-test "$TEST_REPO" "$action"
+}
+
+run_gateway_library_root() {
+  local action="$1"
+  env \
+    PATH="$AUDIT_PATH" \
+    CF_AUDIT_LOG="$AUDIT_LOG" \
+    CF_AUDIT_REAL_SUDO="$REAL_SUDO" \
+    PYTHON_BIN=python3 \
+    COMPOSE_COMMAND_TIMEOUT=1 \
+    /bin/bash -c '
+cd "$1"
+source scripts/common.sh
+source scripts/qr-runtime-common.sh
+case "$2" in
+  contract)
+    gateway_validate_runtime_contract
+    ;;
+  status)
+    gateway_validate_runtime_contract &&
+      gateway_runtime_control status
+    ;;
+  *)
+    LAST_ERROR="unsupported root permission test action"
+    false
+    ;;
+esac
+status=$?
+if [ "$status" -ne 0 ]; then
+  printf "%s\n" "${LAST_ERROR:-Gateway Runtime Contract root action failed.}" >&2
+fi
+exit "$status"
+' cf-agent-wechat-controller-root-test "$TEST_REPO" "$action"
+}
+
+restore_controller() {
+  rm -f -- "$GATEWAY_RUNTIME_CONTROL"
+  install -o root -g root -m 755 \
+    "${REPO_ROOT}/tests/helpers/mock_gateway_runtime_control.sh" \
+    "$GATEWAY_RUNTIME_CONTROL"
+}
+
 assert_secret_permissions
+
+reset_audit
+run_gateway_library_as contract >/dev/null ||
+  fail "ordinary user could not validate Runtime Contract v1"
+[ "$(controller_count 'gateway controller contract')" -eq 1 ] ||
+  fail "contract operation was not recorded exactly once"
+assert_no_sudo_calls "ordinary-user Controller contract validation"
+printf 'PASS ordinary user validates fixed Runtime Contract v1 directly\n'
+
+reset_audit
+run_gateway_library_as stop >/dev/null ||
+  fail "ordinary-user Controller stop failed"
+[ "$(cat "$CONTROLLER_STATE_DIR/gateway_running")" = 0 ] ||
+  fail "Controller stop did not close the Poll/Delivery gate"
+[ "$(audit_count sudo gateway-controller-stop)" -eq 1 ] ||
+  fail "ordinary-user stop did not use the controlled sudo Controller path"
+assert_sudo_contract "ordinary-user Controller stop"
+printf 'PASS ordinary user stops controlled workers through sudo -n\n'
+
+reset_audit
+run_gateway_library_as start >/dev/null ||
+  fail "ordinary-user Controller start/status failed"
+[ "$(controller_count 'gateway controller start')" -eq 1 ] ||
+  fail "Controller start was not recorded exactly once"
+[ "$(controller_count 'gateway controller status')" -eq 1 ] ||
+  fail "Controller status was not checked after start"
+[ "$(audit_count sudo gateway-controller-start)" -eq 1 ] ||
+  fail "ordinary-user start did not use the controlled sudo Controller path"
+[ "$(audit_count sudo gateway-controller-status)" -eq 1 ] ||
+  fail "ordinary-user post-start status did not use sudo Controller path"
+assert_sudo_contract "ordinary-user Controller start/status"
+printf 'PASS ordinary user starts and verifies both controlled workers\n'
+
+reset_audit
+READY_SUMMARY="$(run_gateway_library_as summary)" ||
+  fail "ready Controller status could not be summarized"
+[ "$READY_SUMMARY" = $'true\ttrue\thealthy\thealthy' ] ||
+  fail "ready Controller status summary was invalid"
+printf 'PASS ready Controller status JSON is accepted\n'
+
+reset_audit
+printf '%s\n' false > "$CONTROLLER_STATE_DIR/gateway_ready"
+printf '%s\n' stopped > "$CONTROLLER_STATE_DIR/worker_health"
+printf '%s\n' stopped > "$CONTROLLER_STATE_DIR/delivery_health"
+GATED_SUMMARY="$(run_gateway_library_as summary)" ||
+  fail "gated Controller status could not be summarized"
+[ "$GATED_SUMMARY" = $'false\ttrue\tstopped\tstopped' ] ||
+  fail "gated Controller status summary was invalid"
+printf 'PASS gated Controller status JSON remains explicit and fail-closed\n'
+
+for mode in malformed nonzero timeout; do
+  reset_audit
+  printf '%s\n' "$mode" > "$CONTROLLER_STATE_DIR/contract_mode"
+  CONTRACT_ERROR="$TEST_ROOT/controller-contract-$mode.error"
+  STARTED=$SECONDS
+  if run_gateway_library_as contract > /dev/null 2> "$CONTRACT_ERROR"; then
+    fail "Controller contract mode $mode unexpectedly succeeded"
+  fi
+  ELAPSED=$((SECONDS - STARTED))
+  [ "$mode" != timeout ] || [ "$ELAPSED" -le 5 ] ||
+    fail "Controller contract timeout exceeded five seconds"
+  assert_file_has_no_token "$CONTRACT_ERROR"
+done
+printf 'PASS malformed, non-zero, and timed-out Controller contracts fail closed\n'
+
+for mode in malformed nonzero; do
+  reset_audit
+  printf '%s\n' "$mode" > "$CONTROLLER_STATE_DIR/status_mode"
+  STATUS_ERROR="$TEST_ROOT/controller-status-$mode.error"
+  if run_gateway_library_as summary > /dev/null 2> "$STATUS_ERROR"; then
+    fail "Controller status mode $mode unexpectedly succeeded"
+  fi
+  assert_file_has_no_token "$STATUS_ERROR"
+done
+printf 'PASS malformed and non-zero Controller status responses fail closed\n'
+
+for state_name in token_contract_valid worker_health delivery_health; do
+  reset_audit
+  case "$state_name" in
+    token_contract_valid) printf '%s\n' false > "$CONTROLLER_STATE_DIR/$state_name" ;;
+    *) printf '%s\n' unhealthy > "$CONTROLLER_STATE_DIR/$state_name" ;;
+  esac
+  READY_ERROR="$TEST_ROOT/controller-ready-$state_name.error"
+  if run_gateway_library_as ready > /dev/null 2> "$READY_ERROR"; then
+    fail "Controller accepted invalid $state_name"
+  fi
+  assert_file_has_no_token "$READY_ERROR"
+done
+printf 'PASS Token Contract, Poll Worker, and Delivery Worker health gate readiness\n'
+
+reset_audit
+ROOT_STATUS="$(run_gateway_library_root status)" ||
+  fail "root direct Controller status failed"
+case "$ROOT_STATUS" in
+  *'"ready":true'*) ;;
+  *) fail "root direct Controller status did not return ready JSON" ;;
+esac
+assert_no_sudo_calls "root direct Controller status"
+[ "$(controller_count 'gateway controller contract')" -eq 1 ] ||
+  fail "root did not validate Controller contract directly"
+[ "$(controller_count 'gateway controller status')" -eq 1 ] ||
+  fail "root did not query Controller status directly"
+printf 'PASS root uses the fixed Controller directly without sudo\n'
+
+reset_audit
+rm -f -- "$GATEWAY_RUNTIME_CONTROL"
+MISSING_CONTROLLER_ERROR="$TEST_ROOT/controller-missing.error"
+if run_gateway_library_root contract > /dev/null 2> "$MISSING_CONTROLLER_ERROR"; then
+  fail "missing fixed Controller unexpectedly passed validation"
+fi
+grep -Fq 'unavailable at the fixed path' "$MISSING_CONTROLLER_ERROR" ||
+  fail "missing fixed Controller did not fail closed"
+restore_controller
+
+reset_audit
+SYMLINK_TARGET="$TEST_ROOT/controller-symlink-target"
+install -o root -g root -m 755 \
+  "${REPO_ROOT}/tests/helpers/mock_gateway_runtime_control.sh" \
+  "$SYMLINK_TARGET"
+rm -f -- "$GATEWAY_RUNTIME_CONTROL"
+ln -s -- "$SYMLINK_TARGET" "$GATEWAY_RUNTIME_CONTROL"
+SYMLINK_CONTROLLER_ERROR="$TEST_ROOT/controller-symlink.error"
+if run_gateway_library_root contract > /dev/null 2> "$SYMLINK_CONTROLLER_ERROR"; then
+  fail "symlink fixed Controller unexpectedly passed validation"
+fi
+grep -Fq 'unavailable at the fixed path' "$SYMLINK_CONTROLLER_ERROR" ||
+  fail "symlink fixed Controller did not fail closed"
+restore_controller
+assert_secret_permissions
+printf 'PASS missing and symlink Controller paths fail closed\n'
+
+assert_file_has_no_token "$CONTROLLER_STATE_DIR/controller.log"
+assert_file_has_no_token "$CONTROLLER_STATE_DIR/mutations.log"
 [ "$(/bin/bash -c 'source "$1"; printf "%s" "$CONTAINER_NAME"' \
   cf-agent-wechat-test "${TEST_REPO}/scripts/common.sh")" = "cf-agent-wechat" ] || \
   fail "default container name is not cf-agent-wechat"
@@ -486,7 +742,6 @@ if ! "$REAL_SUDO" -u "$TEST_USER" -H env \
   CF_AUDIT_DOCKER_RUNTIME_MOCK=1 \
   CF_AUDIT_DOCKER_VIA_SUDO=0 \
   CF_AUDIT_AGENT_ENV_FILE="$AGENT_ENV_FILE" \
-  CF_AUDIT_GATEWAY_ENV_FILE="$GATEWAY_ENV_FILE" \
   CONTAINER_NAME="$TEST_CONTAINER" /bin/bash -c \
   'cd "$1"; source scripts/common.sh; get_wechat_process_identity' \
   cf-agent-wechat-test "$TEST_REPO" \
@@ -544,7 +799,6 @@ if ! CLEANUP_OUTPUT="$("$REAL_SUDO" -u "$TEST_USER" -H env \
   CF_AUDIT_DOCKER_RUNTIME_MOCK=1 \
   CF_AUDIT_DOCKER_VIA_SUDO=0 \
   CF_AUDIT_AGENT_ENV_FILE="$AGENT_ENV_FILE" \
-  CF_AUDIT_GATEWAY_ENV_FILE="$GATEWAY_ENV_FILE" \
   CF_AUDIT_AGENT_STATE_FILE="$AGENT_STATE_FILE" \
   CF_AGENT_WECHAT_COMPOSE_FILE="$AGENT_COMPOSE_FILE" \
   CF_AGENT_WECHAT_ENV_FILE="$AGENT_ENV_FILE" \
@@ -604,6 +858,10 @@ done
 [ -s "$READY_FILE" ] || fail "mock server did not become ready"
 HTTP_PORT="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["http_port"])' "$READY_FILE")"
 WS_PORT="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["ws_port"])' "$READY_FILE")"
+sed -i \
+  "s|^AGENT_WECHAT_PORT=.*|AGENT_WECHAT_PORT=$HTTP_PORT|" \
+  "$AGENT_ENV_FILE"
+chmod 600 "$AGENT_ENV_FILE"
 
 reset_audit
 STATUS_OUTPUT="${TEST_ROOT}/status.out"
@@ -640,14 +898,9 @@ if sudo -u "$TEST_USER" -H env \
   CF_AUDIT_DOCKER_RUNTIME_MOCK=1 \
   CF_AUDIT_DOCKER_VIA_SUDO=0 \
   CF_AUDIT_AGENT_ENV_FILE="$AGENT_ENV_FILE" \
-  CF_AUDIT_GATEWAY_ENV_FILE="$GATEWAY_ENV_FILE" \
   CONTAINER_NAME="$TEST_CONTAINER" \
   CF_AGENT_WECHAT_COMPOSE_FILE="$AGENT_COMPOSE_FILE" \
   CF_AGENT_WECHAT_ENV_FILE="$AGENT_ENV_FILE" \
-  CF_AGENT_GATEWAY_COMPOSE_FILE="$GATEWAY_COMPOSE_FILE" \
-  CF_AGENT_GATEWAY_PROJECT_DIR="$GATEWAY_PROJECT_DIR" \
-  CF_AGENT_GATEWAY_ENV_FILE="$GATEWAY_ENV_FILE" \
-  CF_AGENT_GATEWAY_HEARTBEAT_COMMAND="$GATEWAY_HEARTBEAT_COMMAND" \
   NO_PROXY=127.0.0.1,localhost \
   /bin/bash -x "${TEST_REPO}/scripts/status.sh" > "$TRACE_OUTPUT" 2>&1; then
   :
@@ -828,9 +1081,6 @@ if ! "$REAL_SUDO" -u "$TEST_USER" -H env \
   CF_AUDIT_REAL_SUDO="$REAL_SUDO" \
   CF_AGENT_WECHAT_COMPOSE_FILE="$AGENT_COMPOSE_FILE" \
   CF_AGENT_WECHAT_ENV_FILE="$AGENT_ENV_FILE" \
-  CF_AGENT_GATEWAY_COMPOSE_FILE="$GATEWAY_COMPOSE_FILE" \
-  CF_AGENT_GATEWAY_PROJECT_DIR="$GATEWAY_PROJECT_DIR" \
-  CF_AGENT_GATEWAY_ENV_FILE="$GATEWAY_ENV_FILE" \
   /bin/bash -c '
 cd "$1"
 source scripts/common.sh
@@ -839,8 +1089,6 @@ runtime_authorize_sudo
 runtime_validate_management_file "$AGENT_COMPOSE_FILE" "agent Compose" "600"
 runtime_validate_management_file "$AGENT_ENV_FILE" "agent env" "600"
 runtime_load_management_environment
-runtime_validate_management_file "$GATEWAY_COMPOSE_FILE" "Gateway Compose" "600"
-runtime_validate_management_file "$GATEWAY_ENV_FILE" "Gateway env" "600"
 printf "%s\n" "$CONTAINER_NAME"
 ' cf-agent-wechat-test "$TEST_REPO" > "$ROOT_CONFIG_OUTPUT" 2> "$ROOT_CONFIG_ERROR"; then
   print_redacted_file "$ROOT_CONFIG_ERROR"

@@ -118,15 +118,6 @@ if [ "${CF_AUDIT_DOCKER_RUNTIME_MOCK:-}" = "1" ]; then
           esac
           exit 0
           ;;
-        wechat-worker)
-          [ "$compose_command" = "ps" ] || exit 64
-          if [ "$compose_env_file" != "${CF_AUDIT_GATEWAY_ENV_FILE:?}" ]; then
-            printf '%s\n' 'Gateway env-file argument mismatch' >&2
-            exit 67
-          fi
-          printf 'runtime-fixture-%s\n' "$service"
-          exit 0
-          ;;
         *)
           printf '%s\n' 'unexpected runtime Compose service' >&2
           exit 65

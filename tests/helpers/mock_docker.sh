@@ -120,8 +120,19 @@ case "${1:-}" in
         ;;
     esac
     ;;
+  image)
+    record "docker image inspect"
+    [ "${2:-}" = inspect ] || exit 64
+    printf 'sha256:%064d\n' 1
+    exit 0
+    ;;
   inspect)
     record "docker inspect"
+    if printf '%s\n' "$@" | grep -q 'HostConfig.RestartPolicy.Name'; then
+      printf '/agent-wechat-fixture|ghcr.io/example/agent-wechat@sha256:%064d|' 0
+      printf 'sha256:%064d|no\n' 1
+      exit 0
+    fi
     if printf '%s\n' "$@" | grep -q '.State.Health'; then
       if [ "$(state_get container_health healthy)" = "healthy" ]; then
         printf '%s\n' 'healthy'
@@ -138,7 +149,7 @@ case "${1:-}" in
       fi
       exit 0
     fi
-    runtime_root="${CF_AGENT_WECHAT_RUNTIME_ROOT:?}"
+    runtime_root="${CF_AGENT_WECHAT_RUNTIME_ROOT:-${MOCK_RUNTIME_ROOT:?}}"
     printf '[{"Mounts":['
     printf '{"Source":"%s/data","Destination":"/data","RW":true},' \
       "$runtime_root"
@@ -165,7 +176,7 @@ while [ "$#" -gt 0 ]; do
       compose_env_file="$2"
       shift 2
       ;;
-    --project-directory)
+    --project-directory|--project-name)
       shift 2
       ;;
     -f)
@@ -181,31 +192,28 @@ done
 command_name="${1:-}"
 [ -n "$command_name" ] || exit 64
 shift
-if [ "$compose_file" = "${MOCK_GATEWAY_COMPOSE_FILE:?}" ]; then
-  compose_kind="gateway"
-  if [ "$compose_env_file" != "${MOCK_GATEWAY_ENV_FILE:?}" ]; then
-    record "gateway compose env-file invalid"
-    exit 67
-  fi
-  record "gateway compose env-file verified"
-else
-  compose_kind="agent"
-  if [ "$compose_env_file" != "${MOCK_AGENT_ENV_FILE:?}" ]; then
-    record "agent compose env-file invalid"
-    exit 67
-  fi
-  record "agent compose env-file verified"
+compose_kind="agent"
+if [ "$compose_file" != "${MOCK_AGENT_COMPOSE_FILE:?}" ] ||
+  [ "$compose_env_file" != "${MOCK_AGENT_ENV_FILE:?}" ]; then
+  record "agent compose inputs invalid"
+  exit 67
 fi
-
+record "agent compose env-file verified"
 case "$command_name" in
   config)
     record "$compose_kind compose config"
     if [ "$compose_kind" = "agent" ] &&
       [ "$*" = "--format json" ]; then
-      printf '{"services":{"agent-wechat":{'
+      published_port="$(awk -F= '
+        $1 == "AGENT_WECHAT_PORT" { print substr($0, index($0, "=") + 1) }
+      ' "$compose_env_file")"
+      [ -n "$published_port" ] || exit 68
+      printf '{"name":"cf-agent-wechat","services":{"agent-wechat":{'
       printf '"image":"ghcr.io/example/agent-wechat@sha256:%064d",' 0
+      printf '"container_name":"agent-wechat-fixture",'
       printf '"restart":"no",'
-      printf '"ports":[{"target":6174,"published":"6174","host_ip":"127.0.0.1","protocol":"tcp"}],'
+      printf '"ports":[{"target":6174,"published":"%s","host_ip":"127.0.0.1","protocol":"tcp"}],' \
+        "$published_port"
       printf '"networks":{"cf-internal":{"aliases":["cf-agent-wechat"]}},'
       printf '"environment":{"ENABLE_VNC":"0"},'
       printf '"healthcheck":{'
@@ -222,25 +230,13 @@ case "$command_name" in
       printf '{"type":"bind","source":"%s","target":"/data/auth-token","read_only":true}' \
         "${TOKEN_FILE:?}"
       printf '%s\n' ']}},"networks":{"cf-internal":{"external":true,"name":"cf-internal"}}}'
-    elif printf '%s\n' "$@" | grep -qx -- '--services'; then
-      printf '%s\n' 'wechat-worker'
     fi
     ;;
   ps)
     record "$compose_kind compose ps"
     service="${*: -1}"
-    if [ "$compose_kind" = "gateway" ]; then
-      [ "$service" = "wechat-worker" ] || exit 65
-      if [ "$(state_get gateway_ps_error 0)" = "1" ]; then
-        record "gateway compose ps error"
-        exit 70
-      fi
-      if [ "$(state_get gateway_running 1)" = "1" ]; then
-        printf '%s\n' 'gateway-worker-fixture'
-      fi
-    elif [ "$service" != "agent-wechat" ]; then
-      exit 65
-    elif [ "$(state_get agent_ps_error 0)" = "1" ]; then
+    [ "$service" = "agent-wechat" ] || exit 65
+    if [ "$(state_get agent_ps_error 0)" = "1" ]; then
       record "agent compose ps error"
       exit 70
     elif printf '%s\n' "$@" | grep -qx -- '--all'; then
@@ -252,21 +248,15 @@ case "$command_name" in
     fi
     ;;
   stop)
-    if [ "$compose_kind" = "gateway" ]; then
-      [ "${*: -1}" = "wechat-worker" ] || exit 65
-      mutate "gateway worker stop"
-      state_set gateway_running 0
-    else
-      [ "${*: -1}" = "agent-wechat" ] || exit 65
-      if [ "$(state_get agent_started_once 0)" = "1" ] &&
-        [ "$(state_get agent_cleanup_stop_error 0)" = "1" ]; then
-        state_set agent_running 0
-        record "agent container cleanup stop failed"
-        exit 73
-      fi
-      mutate "agent container stop"
+    [ "${*: -1}" = "agent-wechat" ] || exit 65
+    if [ "$(state_get agent_started_once 0)" = "1" ] &&
+      [ "$(state_get agent_cleanup_stop_error 0)" = "1" ]; then
       state_set agent_running 0
+      record "agent container cleanup stop failed"
+      exit 73
     fi
+    mutate "agent container stop"
+    state_set agent_running 0
     ;;
   rm)
     [ "$compose_kind" = "agent" ] || exit 65
@@ -281,25 +271,15 @@ case "$command_name" in
     state_set agent_running 0
     ;;
   up)
-    if [ "$compose_kind" = "gateway" ]; then
-      [ "${*: -1}" = "wechat-worker" ] || exit 65
-      if [ "$(state_get gateway_start_error 0)" = "1" ]; then
-        record "gateway worker start failed"
-        exit 75
-      fi
-      mutate "gateway worker start"
-      state_set gateway_running 1
-    else
-      [ "${*: -1}" = "agent-wechat" ] || exit 65
-      mutate "agent container start"
-      state_set agent_exists 1
-      state_set agent_running 1
-      state_set agent_started_once 1
-      state_set wechat_calls 0
-      printf '%s\n' 'logged_out' > "${MOCK_AUTH_STATE_FILE:?}"
-      printf '%s\n' 'agent runtime evidence' > \
-        "${CF_AGENT_WECHAT_RUNTIME_ROOT:?}/data/agent-runtime.log"
-    fi
+    [ "${*: -1}" = "agent-wechat" ] || exit 65
+    mutate "agent container start"
+    state_set agent_exists 1
+    state_set agent_running 1
+    state_set agent_started_once 1
+    state_set wechat_calls 0
+    printf '%s\n' 'logged_out' > "${MOCK_AUTH_STATE_FILE:?}"
+    printf '%s\n' 'agent runtime evidence' > \
+      "${CF_AGENT_WECHAT_RUNTIME_ROOT:?}/data/agent-runtime.log"
     ;;
   down)
     mutate "forbidden compose down"

@@ -39,23 +39,37 @@ class AgentRuntimeContractTests(unittest.TestCase):
         )
 
     def test_agent_compose_uses_env_file_for_direct_and_sudo_docker(self) -> None:
-        self.assertIn(
-            'sudo -n -- env "CF_AGENT_WECHAT_RUNTIME_ROOT=$RUNTIME_ROOT" '
-            "docker compose",
-            self.content,
-        )
-        self.assertIn(
-            'env "CF_AGENT_WECHAT_RUNTIME_ROOT=$RUNTIME_ROOT" docker compose',
-            self.content,
-        )
-        self.assertEqual(self.content.count('--env-file "$AGENT_ENV_FILE"'), 2)
+        body = function_body(self.content, "agent_compose")
+        self.assertIn('local -a clean_environment=(', body)
+        for variable in (
+            "AGENT_WECHAT_IMAGE",
+            "AGENT_WECHAT_BIND_IP",
+            "AGENT_WECHAT_PORT",
+            "AGENT_WECHAT_CONTAINER_NAME",
+            "COMPOSE_PROJECT_NAME",
+            "CF_AGENT_WECHAT_STORAGE_ROOT",
+            "CF_AGENT_WECHAT_RUNTIME_ROOT",
+            "CF_AGENT_WECHAT_ARCHIVE_ROOT",
+            "CF_AGENT_WECHAT_TOKEN_FILE",
+            "PROXY",
+            "RUST_LOG",
+        ):
+            self.assertIn(f"-u {variable}", body)
+        self.assertIn('sudo -n -- "${clean_environment[@]}"', body)
         self.assertEqual(
-            self.content.count('--project-directory "$RUNTIME_REPO_ROOT"'),
+            body.count(
+                '"CF_AGENT_WECHAT_RUNTIME_ROOT=$RUNTIME_ROOT" docker compose'
+            ),
             2,
         )
-        self.assertGreaterEqual(
-            self.content.count('runtime_with_timeout "$COMPOSE_COMMAND_TIMEOUT"'),
-            4,
+        self.assertEqual(body.count('--env-file "$AGENT_ENV_FILE"'), 2)
+        self.assertEqual(
+            body.count('--project-directory "$RUNTIME_REPO_ROOT"'),
+            2,
+        )
+        self.assertEqual(
+            body.count('runtime_with_timeout "$COMPOSE_COMMAND_TIMEOUT"'),
+            2,
         )
 
     def test_start_and_stop_validate_agent_env_before_compose(self) -> None:

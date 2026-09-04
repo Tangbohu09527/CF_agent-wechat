@@ -13,11 +13,11 @@ DEFAULT_AGENT_ROOT="$(CDPATH='' cd -- "${SCRIPT_DIR}/.." && pwd -P)"
 AGENT_ROOT="${CF_AGENT_WECHAT_ROOT:-$DEFAULT_AGENT_ROOT}"
 AGENT_COMPOSE_FILE="${CF_AGENT_WECHAT_COMPOSE_FILE:-${AGENT_ROOT}/docker/compose.cfserver.yaml}"
 AGENT_ENV_FILE="${CF_AGENT_WECHAT_ENV_FILE:-${AGENT_ROOT}/docker/.env}"
-STORAGE_ROOT="${CF_AGENT_WECHAT_STORAGE_ROOT:-/srv/storage/cf-agent-wechat}"
-RUNTIME_ROOT="${CF_AGENT_WECHAT_RUNTIME_ROOT:-${STORAGE_ROOT}/runtime}"
-ARCHIVE_ROOT="${CF_AGENT_WECHAT_ARCHIVE_ROOT:-${STORAGE_ROOT}/session-archive}"
+STORAGE_ROOT="/srv/storage/cf-agent-wechat"
+RUNTIME_ROOT="${STORAGE_ROOT}/runtime"
+ARCHIVE_ROOT="${STORAGE_ROOT}/session-archive"
 SECRETS_ROOT="/srv/storage/cf-agent-wechat/secrets"
-TOKEN_FILE="${CF_AGENT_WECHAT_TOKEN_FILE:-${SECRETS_ROOT}/auth-token}"
+TOKEN_FILE="${SECRETS_ROOT}/auth-token"
 LEGACY_DATA_ROOT="${STORAGE_ROOT}/data"
 LEGACY_HOME_ROOT="${STORAGE_ROOT}/wechat-home"
 
@@ -368,6 +368,11 @@ validate_docker_socket() {
 
 reject_environment_overrides() {
   local variable
+
+  # Legacy process-level management paths are not production inputs.
+  unset CF_AGENT_WECHAT_STORAGE_ROOT CF_AGENT_WECHAT_RUNTIME_ROOT
+  unset CF_AGENT_WECHAT_ARCHIVE_ROOT CF_AGENT_WECHAT_TOKEN_FILE
+
   for variable in DOCKER_HOST DOCKER_CONTEXT DOCKER_TLS_VERIFY DOCKER_CERT_PATH; do
     if [[ -v $variable ]]; then
       die "$variable cannot override the production local Docker daemon"
@@ -375,9 +380,7 @@ reject_environment_overrides() {
   done
   for variable in \
     AGENT_WECHAT_IMAGE AGENT_WECHAT_BIND_IP AGENT_WECHAT_PORT \
-    AGENT_WECHAT_CONTAINER_NAME COMPOSE_PROJECT_NAME \
-    CF_AGENT_WECHAT_STORAGE_ROOT CF_AGENT_WECHAT_RUNTIME_ROOT \
-    CF_AGENT_WECHAT_ARCHIVE_ROOT CF_AGENT_WECHAT_TOKEN_FILE PROXY RUST_LOG; do
+    AGENT_WECHAT_CONTAINER_NAME COMPOSE_PROJECT_NAME PROXY RUST_LOG; do
     if [[ -v $variable ]]; then
       die "$variable must come from the authoritative docker/.env file"
     fi

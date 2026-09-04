@@ -166,6 +166,7 @@ import sys
 
 image, port, runtime, token, restart_policy = sys.argv[1:]
 print(json.dumps({
+    "name": "cf-agent-wechat",
     "services": {
         "agent-wechat": {
             "image": image,
