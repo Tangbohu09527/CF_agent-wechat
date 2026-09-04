@@ -1,120 +1,96 @@
 # Recovery Guide
 
-生产恢复的含义是“重新建立一套经过 fresh QR 验证的 Runtime”，不是恢复旧微信 session。
-所有恢复场景最终都回到 `start-qr-login.sh`。
+恢复的目标是重新建立一套经过 fresh QR 验证的 Runtime，不是恢复旧微信 Session。
+所有场景遵循：
 
-## 恢复模型
+~~~text
+检查 -> 判断 -> 操作 -> 验证 -> 失败回退
+~~~
 
-| 场景 | Agent 自动行为 | 正确恢复 |
-| --- | --- | --- |
-| 容器进程 crash | `restart: "no"`，不自动重启 | 停止 Worker，运行完整 fresh-QR 入口 |
-| Docker daemon 重启 | Agent 不自动恢复 | 确认 Worker stopped，运行完整 fresh-QR 入口 |
-| Debian/Host 重启 | Agent 保持停止 | 验证 Gateway boot stop gate，再扫码 |
-| Compose recreate | 不能作为 session recovery | 归档旧 runtime，创建全新 runtime 并扫码 |
-| 镜像或代码升级 | 不继承活跃微信会话 | 必要时重跑 Bootstrap，再扫码 |
-| 回滚 | 只回滚受控代码/镜像 | 仍创建全新 runtime 并扫码 |
-| QR/API 验证失败 | Worker 保持停止 | 保留现场，修复后重新执行完整入口 |
+详细命令以 [CFserver 生产 Runbook](deployment/cfserver-production.md) 为准。
 
-旧 archive 只用于受控审计、故障分析和外部保留策略。任何 archive 都不得挂回生产
-`data` 或 `wechat-home` 作为常规恢复目标。Archive payload 可能包含微信 session、
-账号标识、聊天标识、消息元数据、缓存和数据库内容，必须保持 root-protected。
-Archive manifest 只记录脱敏运行元数据，不得包含 Token、微信账号、Chat ID 或消息正文。
+## Baseline checks
 
-## 标准恢复步骤
+~~~bash
+cd /opt/cf-agent-wechat
+./scripts/status.sh
+~~~
 
-1. 停止业务消息。
-2. 部署输入变化时运行 `sudo ./scripts/bootstrap-cfserver.sh`。
-3. 在受控 SSH TTY 运行 `./scripts/start-qr-login.sh`；非 root 用户只在变更前执行一次
-   `sudo -v`，后续 Gateway 控制均使用 `sudo -n`。
-4. 脚本先直接调用固定 controller 的 `contract`，严格验证 Contract v1；不匹配时在
-   任何变更、归档或二维码显示前 fail closed。
-5. 脚本通过 controller `stop` 停止 `worker` 和 `delivery-worker`，确认成功后才停止
-   Agent、归档旧 runtime 并创建全新 runtime。
-6. 扫描当前终端显示的新二维码。
-7. 等待 process、Docker health、auth、chats 和 messages 验证。
-8. 脚本通过 controller `start` 和 `status` 放行双 Worker，并要求 `ready=true`、Token
-   合同有效且两个 Worker 均为 healthy，随后才恢复业务消息。
+需要更多信息时，只查看 Compose `ps`、必要日志、目录/文件元数据和 Controller
+`contract/status`。不要读取 Token、Archive payload、账号或消息正文。
 
-Bootstrap 只准备部署，不登录、不启动 Agent 或 Worker。没有配置变化时，也不能用
-Bootstrap 代替扫码启动。
+## Recovery matrix
 
-## Crash
+| 场景 | 检查与判断 | 安全操作 | 验证 | 失败回退 |
+| --- | --- | --- | --- | --- |
+| Container absent/stopped | `Container=absent/stopped`；确认是否计划内 | 确认 Gate 后运行完整 fresh QR | 11 项状态全过 | 保留现场，Controller stop，不裸 `up` |
+| Docker health unhealthy | Container running 但 health 非 healthy；看轮转日志 | 运行完整 fresh QR，不直接 restart | Docker health、进程、API、Gateway 全过 | 保留 Runtime/Archive，查镜像/资源/挂载 |
+| Agent Server unreachable | `Agent Server=unavailable`；health 可能也失败 | 完整 fresh QR | `/health` 与完整 status | 不延长为无限超时，不手工启动 Worker |
+| WeChat process missing/replaced | `not_running` 或 `exited_or_replaced` | 完整 fresh QR | 同一 `PID:start_time` 稳定 | 保留日志，查上游进程/Xvfb/资源 |
+| Auth logged_out | status 退出 `2` | 完整 fresh QR | Auth + chats/messages + Gateway | 不执行 UI logout，不只调用登录 API |
+| Chats unreadable/empty | Auth 可为 logged_in，但 Message API 失败 | 完整 fresh QR | chats 非空且 messages 可读 | 不硬编码 Chat ID，不从数据库替代验证 |
+| Messages unreadable | chats 已返回 ID，但 messages 校验失败 | 完整 fresh QR | 对 API 返回的聊天读取成功 | 不跳过该门槛，不手工放行 Worker |
+| Gateway ready=false | Agent 层可能正常；Controller status 未就绪 | 交给 Gateway 运维修复 Contract/Worker 后复核 | ready/token/两 Worker 全过 | 保持 Gate 关闭，不改 Gateway 数据库 |
+| Poll/Delivery stopped | 若 Agent 在线，判断是计划停止还是 Gateway 故障 | 只通过 Controller/正式流程恢复 | 两项 health 为 healthy | 不手工运行 Compose service |
+| Runtime mode legacy_or_unknown | mount 不匹配 fresh Runtime/Token 契约 | 先停止 Gate，保留现场，修复受控输入后 fresh QR | `QR Runtime Mode=fresh` | 不删除或挂回 Archive |
+| Failed Archive manifest | 查看 manifest 是否为 failed、phase 与 cleanup 结果 | 保留 Archive，修复根因后完整重试 | 新流程成功且旧证据仍在 | 不改写旧结果，不把 manifest 当 payload 无敏感证明 |
+| Mixed layout | 新 Runtime 与 legacy data/HOME 同时存在 | fail closed；确认受控来源并走独立人工处置 | 重新校验无 mixed layout 后 Bootstrap/fresh QR | 不合并、不删除任一目录掩盖状态 |
+| Token metadata invalid | 只用 `stat` 查 type/owner/mode/link | 保留文件，离线修复到当前契约后重跑 Bootstrap | Bootstrap/状态安全加载 Token | 不读取、重生成替换或复制 Token |
+| Docker daemon reboot | Agent 应保持停止 | 确认 Gate，再完整 fresh QR | status 全过 | 若 Agent 自动恢复，先修复 restart/live-restore 偏差 |
+| CFserver reboot | Agent 停止，但 Worker 可能 running | 强制 Controller `stop --timeout-seconds 30`，再 fresh QR | status 全过 | 不依赖 automatic boot stop gate |
+| Interrupted QR flow | start 返回 `130` 或连接中断 | 等待 cleanup/锁释放，确认 Gate，再重新运行完整流程 | 新 QR 实际显示并完整就绪 | 不复用旧 QR，不删除锁文件 |
+| Container stop/remove failed | 查看 cleanup 的 stop/remove 脱敏结果 | 保留容器和持久数据，人工确认容器已停止/移除后再重试 | 容器状态明确且新流程全过 | 确认前不重启 Docker/Host |
+| Archive exists, active Runtime missing | 判断是否中断在 archive 与 create 之间 | 不恢复 Archive；确认 Gate 后重新运行 fresh QR 创建新 Runtime | 新 Runtime fresh、旧 Archive 保留 | 不把 Archive 移回 active path |
+| Gateway-only deployment | Agent 未被重启/删除时 Session 可保持 | 不运行 fresh QR；由 Gateway 运维恢复后复核 status | Agent 与 Gateway 状态全过 | 若 Agent 实际被动过，改走 fresh QR |
+| AI/Hermes host restart | CFserver/Agent 未重启 | 不轮换 Agent；恢复外部连通性 | 本仓库 status 与下游独立验证 | 不把下游故障归为微信 Session 故障 |
 
-生产 Compose 为 `restart: "no"`。容器进程退出后，Docker 不应自动拉起
-`agent-wechat`。外部监控发现 Agent 停止时，应确保 `worker` 和 `delivery-worker`
-不再消费该 Runtime；失败处理可以 best-effort 再次调用 controller `stop`。
+## Container and API failures
 
-保留失败现场后重新运行完整 fresh-QR 入口。不要先执行 `docker restart`，也不要把
-旧 `logged_in` 当作恢复证据。
+Docker health 只证明 `/health`，不能证明 WeChat、chats/messages 或 Gateway。任何需要
+重建 Agent 的场景都使用 `start-qr-login.sh`；该脚本负责 stop/remove、Archive、fresh
+Runtime、QR 和 Worker gate。禁止 `docker restart`、裸 Compose `up/restart/down`。
 
-## Docker Daemon 或 Host 重启
+## Runtime and Archive failures
 
-Docker 必须保持 local rootful、固定 `unix:///var/run/docker.sock` endpoint、真实
-非符号链接 socket 和 `live-restore=false`；任一条件偏离都先修复再恢复。
+- Archive 由旧 Runtime 原子移动产生，不是自动恢复点。
+- 历史 Archive 不覆盖、不删除；新流程使用新 UTC 目录。
+- legacy `data` 与 `wechat-home` 必须进入同一个 Archive。
+- mixed layout 在任何状态变更前 fail closed。
+- Archive payload 可能含 Session、账号/Chat 标识、消息 metadata、cache 和数据库内容。
+- 不得删除 Runtime、跳过 Token scan 或把 Archive 挂回 active path。
 
-重启后预期：
+## Token failures
 
-- `agent-wechat` 不存在或保持停止；
-- 旧 runtime 仍在存储上，但不是可恢复的活跃 session；
-- `worker` 和 `delivery-worker` 由 Gateway boot stop gate 保持停止；
-- PostgreSQL、Gateway 和其他 Worker 按各自批准规则处理，本仓库不干预。
+完整契约见 [生产状态](production-status.md#storage-and-token)。只允许查看元数据；未知
+格式必须保留并离线修复。Bootstrap 只自动迁移精确定义的单一 legacy 格式，不能用新
+Token 替换已有数据库关联 Token。
 
-如果 Agent 自动启动，说明生产 Compose 或外部服务偏离 `restart: "no"`，必须先停止
-并修复配置，不能继续验证。随后人工运行 `start-qr-login.sh` 并扫描新二维码。
+## Gateway failures
 
-## Recreate、升级与回滚
+只使用：
 
-`docker compose up --force-recreate` 后 bind mount 仍存在，只能证明文件持久化，不
-证明微信 session 可恢复。生产操作不得直接以 recreate 投入工作。
+~~~text
+/opt/cf-agent-gateway/deploy/wechat-runtime-control
+~~~
 
-升级或回滚步骤：
+- `contract` 验证 version 1。
+- `stop` 关闭 Poll/Delivery Gate。
+- `start/status` 只在 Agent 完整就绪后使用。
 
-1. 在旧的已批准代码、Compose 和环境输入下运行 `stop-qr-runtime.sh`，确认 Agent、
-   `worker` 和 `delivery-worker` 均已停止。
-2. 修改到新的已批准代码 Commit、Compose、环境输入和镜像 digest。
-3. 运行 Bootstrap 验证新输入、权限、网络和 Token，不启动服务。
-4. 运行 forced fresh QR 入口。
-5. 完整验证后再放行 Worker。
+不得绕过 Controller，也不得修改 Gateway、PostgreSQL、Checkpoint 或 Hermes 数据。
+`ready=false`、Token Contract invalid 或任一 Worker health 非 healthy 都是完整状态
+失败，即使 Agent Auth 为 `logged_in`。
 
-`seccomp=unconfined` 和 `SYS_PTRACE` 是当前上游镜像要求。每次镜像变化必须重新
-审查，不能因为旧版本需要就永久豁免。
+## Verification and fallback
 
-## 数据与 Token
+恢复成功必须由 `./scripts/status.sh` 退出 `0` 证明。失败时：
 
-- 旧 runtime 和失败 runtime 保留，不自动删除。
-- archive root 保持 root-protected，因为归档可能包含历史 session、缓存和消息数据；
-  这些数据不得挂回生产。
-- Token 固定在 `/srv/storage/cf-agent-wechat/secrets/auth-token`：普通文件、非 symlink、
-  hard link count=1、owner `10001:10001`、mode `0600`，内容为无尾随换行的 64 位小写
-  十六进制值。
-- Bootstrap 只自动迁移明确旧格式：`root:root`、`0600`、link count 1、64 位小写
-  十六进制值加单个 LF；迁移不改变逻辑 Token 值，其他格式 fail closed。
-- Token 不进入 runtime、archive、manifest、日志、argv 或备份说明。
-- archive 到期处置只能由本项目之外的审批流程执行。
-- 不通过 PostgreSQL、Checkpoint、`bootstrap_mode=latest` 或 localId 回退修复微信
-  Runtime。
+1. 保留原退出码和失败 phase。
+2. 保留 Runtime、Archive、manifest 与必要轮转日志。
+3. 确认 Gate 关闭；不确定时再次 Controller stop。
+4. 确认失败 Agent 容器是否仍存在。
+5. 不删除未知状态，不恢复旧 Session，不手工启动 Worker。
+6. 修复根因后重新执行完整 fresh QR。
 
-## Gateway 边界
-
-本仓库只调用固定入口
-`/opt/cf-agent-gateway/deploy/wechat-runtime-control` 的 `contract`、`stop`、`start` 和
-`status`。Contract v1 来自 Gateway Commit
-`2db9dff6ece65004cc75723e1243215a5d04b304`（分支
-`codex/v2-runtime-production-hardening`）。本仓库不猜测 Gateway Compose、服务容器名、
-heartbeat 文件或数据库状态。
-
-controller 只控制 `worker` 和 `delivery-worker`。本仓库不启停 `gateway`、
-`dispatch-worker`、`postgres` 或 migration，也不修改 Gateway 代码或数据库。
-Controller、Token 合同、Docker/Host 重启行为和完整 forced fresh QR 流程尚待在真实
-CFserver 验证；本仓库的基础静态检查不构成生产验收。
-
-## 时间与记录
-
-CFserver Host 使用 `Asia/Shanghai`；容器、日志、archive manifest 和原始审计证据
-使用 UTC。记录转换后的展示时间时必须标明时区。
-
-故障材料只能包含 Commit、镜像 digest、UTC 时间、脱敏状态、退出码和 archive path，
-不得包含 Token、二维码、账号、联系人、聊天 ID 或消息正文。Archive payload 本身是
-受限敏感资产，不得因 manifest 脱敏而视为无敏感数据。
-
-操作细节见[生产运维](operations.md)和[故障排查](troubleshooting.md)。
+状态与证据不得包含 Token、二维码、账号、联系人、群名、Chat ID、消息正文、内网 IP
+或数据库连接信息。

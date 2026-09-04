@@ -1,11 +1,12 @@
 # 2026-08-13 CFserver 生产验证记录
 
 > [!CAUTION]
-> 本页是基线 Commit `fe3c963` 的历史证据，包含已被废弃的 `login.sh`
-> `logged_in` short-circuit 行为。它不是当前生产 runbook，也不能证明 forced fresh
-> QR、`restart: "no"`、全新 runtime 或 Worker gating 已完成实机验证。当前要求以
-> [CFserver 正式部署](../deployment/cfserver-production.md)和
-> [验证总览](../validation.md)为准。
+> **Historical / Archived.** 本页只适用于 2026-08-13、基线 Commit `fe3c963`，
+> 包含已废弃的可信设备确认和 `logged_in` short-circuit。它不是当前生产 Runbook。
+> 仍有效的是当时容器、无 VNC 链路和基础 API 观察；不能外推到 forced fresh QR、
+> Runtime 轮换、Gateway Contract 或当前镜像。当前事实见
+> [生产状态](../production-status.md)，当前验收见
+> [2026-09-03 R2 记录](2026-09-03-forced-qr-r2-production.md)。
 
 ## 记录边界
 

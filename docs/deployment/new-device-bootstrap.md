@@ -1,143 +1,131 @@
-# 新设备部署引导
+# 新设备 Bootstrap
 
-本文只说明 CFserver 的基础部署准备。Bootstrap 不是微信登录脚本，也不是 Runtime
-恢复脚本。
+本文说明首次 CFserver 部署或部署输入变化后的基础准备。Bootstrap 不是登录流程、启动
+流程或 Session 恢复流程。
 
-## 结果定义
+## Result definition
 
-成功执行：
-
-```bash
+~~~bash
 cd /opt/cf-agent-wechat
 sudo ./scripts/bootstrap-cfserver.sh
-```
+~~~
 
-只表示：
+成功只表示：
 
-> 基础部署准备完成。下一步由人工在受控 SSH TTY 运行
-> `./scripts/start-qr-login.sh`。
+~~~text
+部署输入和管理边界已准备完成；Agent 仍停止，尚未创建微信 Session。
+~~~
 
-它不表示微信已登录、session 已恢复、Runtime 已上线或 `wechat-worker` 已启动。
+下一步由人工在受控 SSH TTY 运行 `./scripts/start-qr-login.sh`。
 
-## 前置条件
+## Required platform and tools
 
-- Debian Host 使用 systemd。
-- 生产工具使用 Debian 固定系统路径；测试替身只能在显式测试模式使用。
-- Docker 是本机 rootful daemon，不是 rootless 或 remote context；context endpoint
-  必须为 `unix:///var/run/docker.sock`。
-- `/var/run/docker.sock` 必须是真实 Unix socket，且不能是符号链接。
-- Docker daemon 必须配置 `live-restore=false`。
-- Docker Compose v2 可用。
-- 仓库位于批准的生产路径和 Commit。
-- Gateway 生产 Compose/config 路径已由 CFserver 运维提供。
-- Gateway 已提供固定 heartbeat checker，见下文契约。
-- 镜像已批准并以完整 digest 配置。
-- CFserver Host 时区为 `Asia/Shanghai`；容器和日志使用 UTC。
+- Debian/Ubuntu family Host，systemd 为 running 或 degraded。
+- `docker.service` active 且 enabled；`cf-agent-wechat.service` 不得 boot-enabled。
+- 固定系统工具包括 `/usr/bin/docker`、`/usr/bin/systemctl`、
+  `/usr/bin/openssl`、`/usr/bin/timeout`。
+- 还需要 `apt-get`、`awk`、`chmod`、`chown`、`curl`、`dirname`、
+  `dpkg-query`、`env`、`flock`、`grep`、`id`、`install`、`mktemp`、
+  `mv`、`python3`、`readlink`、`realpath`、`rm`、`stat` 和 `wc`。
+- Python 3 必须提供 `json` 与 `venv`；Docker Compose v2 必须可用。
 
-Bootstrap 不修改真实微信账号、Gateway 数据库、PostgreSQL、Checkpoint 或其他仓库。
+生产模式拒绝测试替身或 PATH 中可被普通用户替换的关键工具。
 
-## 校验范围
+## Docker contract
 
-Bootstrap 按阶段 fail closed：
+Bootstrap 验证：
 
-1. 检查 Debian 必需工具和 systemd。
-2. 检查 Docker service 为 running。
-3. 检查 Docker context、非符号链接 Unix socket、endpoint 和
-   `live-restore=false`，拒绝 rootless/remote daemon。
-4. 检查 Docker Compose v2。
-5. 校验仓库路径、owner、mode、符号链接和 hardlink。
-6. 校验 `docker/compose.cfserver.yaml`。
-7. 安全解析 `docker/.env`，不执行任意 shell 内容。
-8. 校验 runtime、archive 和 secrets root。
-9. 校验目录和文件的 owner、mode、symlink 与 link count。
-10. 校验镜像引用是 `@sha256:<64-hex>`。
-11. 校验 6174 只绑定 loopback。
-12. 校验外部 `cf-internal` 和固定 alias `cf-agent-wechat`。
-13. 校验 Token 是 root-only 普通文件，且只读挂载到容器。
-14. 校验 Gateway Compose/config 和固定 heartbeat checker 存在、可读且权限安全。
-15. 创建必要的管理目录。
-16. 创建或复用独立的 agent-wechat API auth Token。
-17. 渲染生产 Compose，并确认 `restart: "no"`。
-18. 确认 `agent-wechat` 没有被 Bootstrap 作为长期服务运行。
-19. 确认 `wechat-worker` 不会读取未验证的 fresh runtime。
+- `/var/run/docker.sock` 是真实、非 symlink 的 Unix socket；
+- Docker context 为 `default`；
+- endpoint 为 `unix:///var/run/docker.sock`；
+- daemon 为本机 rootful，不是 rootless 或 remote；
+- `live-restore=false`；
+- Docker/Compose 调用有硬超时。
 
-Docker、Compose 和 curl/API 探测必须有 connect/total 或 hard timeout。普通用户管理路径
-需要提权时，先通过 `sudo -v` 获得授权，后续只使用 `sudo -n`；不得让自动步骤无限
-等待密码。
+任一不满足都 fail closed。不要用环境变量覆盖到远端 daemon 或其他 context。
 
-固定 checker 路径为：
+## Repository and environment
 
-```text
-/opt/cf-agent-gateway/deploy/check-wechat-worker-heartbeat
-```
+- repository：`/opt/cf-agent-wechat`
+- Compose：`/opt/cf-agent-wechat/docker/compose.cfserver.yaml`
+- environment：`/opt/cf-agent-wechat/docker/.env`
+- Compose project：`cf-agent-wechat`
 
-它由 Gateway 部署提供，本仓库不创建或修改。它必须是无符号链接、无额外 hardlink、
-owner/mode 合规且由管理用户直接执行的普通文件；脚本不得通过 `sudo` 执行它。checker
-无参数运行，只在当前 `wechat-worker` 应用 heartbeat 可用时返回 `0`，且不输出敏感值。
+`docker/.env` 必须是已存在的普通非 symlink 文件，owner 为 root 或固定管理用户，mode
+为 `0600` 或 `0640`，且无额外 hard link。脚本只解析批准的字面量键值，不执行
+shell 语法；禁止任何 Token/Password/Secret 键。镜像必须是不可变
+`@sha256:<64-hex>` 引用，bind IP 必须为 `127.0.0.1`。
 
-## Token
+不要打印完整 `.env`、代理凭据或完整 Compose render。
 
-Token 路径：
+## Storage and permissions
 
-```text
-/srv/storage/cf-agent-wechat/secrets/auth-token
-```
+Bootstrap 创建或验证：
 
-要求：
+| 路径 | 契约 |
+| --- | --- |
+| `/srv/storage/cf-agent-wechat` | root 管理的 storage root |
+| `session-archive` | root-protected，mode `0700` |
+| `secrets` | `root:root 0700` |
+| existing Runtime/legacy directories | 必须匹配配置的 UID/GID/mode，默认 `1000:1000/0700` |
 
-- secrets 目录为 `root:root 700`。
-- Token 为 `root:root 600` 的普通非符号链接文件。
-- Token 不得有额外 hardlink。
-- Token 不进入 `docker/.env`、runtime、archive、manifest、日志、命令行或 CI。
-- 重试 Bootstrap 可以复用同一 API Token，但不能复用微信 session。
-- Bootstrap 只验证 Token 元数据和受控读取路径，不输出内容、摘要或指纹。
+Bootstrap 不创建 `runtime/data` 或 `runtime/wechat-home` 作为新 Session；这些只由
+fresh QR start 创建。若新 Runtime 与 legacy `data`/`wechat-home` 同时存在，
+Bootstrap fail closed，不猜测、不合并。
 
-旧 runtime archive 可能包含历史 session、缓存和消息数据，因此 archive root 必须保持
-root-protected。只有 Token 被明确禁止进入 archive；旧 session 数据仍不得挂回生产复用。
+## Token migration boundary
 
-## Compose 结果
+完整 Token 契约见 [当前生产状态](../production-status.md#storage-and-token)。Bootstrap
+只允许三种结果：
 
-Bootstrap 渲染后必须确认：
+1. 当前格式已合规：原样复用。
+2. Token 不存在：安全生成新 Token。
+3. 唯一受支持 legacy 格式：`root:root 0600`、link count 1、64 位小写十六进制加
+   单个 LF；迁移为当前 `10001:10001 0600`、无尾随 LF，逻辑值不变。
 
-- `restart: "no"`；
-- digest-pinned image；
-- fresh runtime 的 `data` 和 `wechat-home` bind；
-- Token 独立只读 bind；
-- loopback port；
-- 外部 `cf-internal`；
-- alias `cf-agent-wechat`；
-- healthcheck 和日志轮转；
-- 当前上游镜像所需的 `seccomp=unconfined` 与 `SYS_PTRACE`。
+其他格式一律保留现场并 fail closed。Token 不写入 `.env`，也不进入 Runtime/Archive。
 
-`seccomp=unconfined` 与 `SYS_PTRACE` 必须持续安全审查。Healthcheck 只证明容器和
-Agent API 健康，不证明微信登录、chats/messages 或 Gateway 链路。
+## Network and Compose attestation
 
-## 明确禁止
+Bootstrap 创建或复用 external `cf-internal`，并确认它是 local bridge。Compose render
+必须精确满足：
 
-Bootstrap 不得：
+- service `agent-wechat`，container `cf-agent-wechat`
+- `restart: "no"`
+- 6174 loopback-only
+- alias `cf-agent-wechat`
+- 三个 bind：Runtime data、WeChat HOME、只读 Token
+- `ENABLE_VNC=0`
+- `seccomp=unconfined`、`SYS_PTRACE`
+- healthcheck 与 `json-file 20m × 3`
 
-- 启动并长期保持 `agent-wechat` 在线；
-- 启动 `wechat-worker`；
-- 启停 `dispatch-worker` 或 `delivery-worker`；
-- 创建、恢复或验证微信 session；
-- 把旧 `data` 或 `wechat-home` 作为活跃恢复目标；
-- 删除 archive；
-- 修改 Gateway 代码或数据库；
-- 伪造 initialized、logged-in 或 production-ready 状态。
+`cf-internal` 是外部共享网络，Bootstrap 可以在缺失时按契约创建，但本项目不得在日常
+操作中删除它。
 
-## 失败与重试
+## Gateway Contract
 
-任一阶段失败时返回非零，保留 archive 和现场，不泄露 Token，不启动 Worker。修复
-配置后重新运行同一个 Bootstrap 命令。对已运行部署变更配置前，必须先运行
-`./scripts/stop-qr-runtime.sh` 并确认 Agent/Worker 均已停止；Bootstrap 会拒绝活动中的
-Agent 或 Worker。分阶段结果不能被当作整体成功，失败后也不能通过手工启动 Compose
-跳过剩余检查。
+Bootstrap 只读取固定 Controller：
 
-成功后只执行：
+~~~text
+/opt/cf-agent-gateway/deploy/wechat-runtime-control
+~~~
 
-```bash
-./scripts/start-qr-login.sh
-```
+它必须是可执行的普通非 symlink 文件，并返回精确 Runtime Contract version 1。脚本
+动态核对 Poll/Delivery/Dispatch 服务名、file Token 模式及 Token container path。
+Bootstrap 不启动或停止 Gateway Worker；Worker 生命周期由 fresh QR/stop 脚本通过
+Controller `stop/start/status` 管理。
 
-扫码与放行流程见[QR Login Guide](../qr-login-guide.md)，完整部署契约见
-[CFserver 正式部署](cfserver-production.md)。
+## Retry and completion
+
+Bootstrap 可在配置修复后重复执行。它可能准备管理目录、Token 和 external network，
+但不会：
+
+- 创建或恢复微信 Session；
+- 创建 fresh Runtime data/HOME；
+- 启动 `agent-wechat`；
+- 显示二维码或登录；
+- 启动 Poll/Delivery Worker；
+- 宣称生产入口在线。
+
+完成后执行 [CFserver 生产 Runbook](cfserver-production.md)中的 “Normal fresh QR
+start”。若是已运行部署的配置变化，必须先按旧输入完成正式 stop。

@@ -1,122 +1,88 @@
 # QR Login Guide
 
-本文是生产 forced fresh QR 操作指南。生产环境每次启动都要求新的 runtime 和新的二维码，
-不检查旧 session 是否仍可复用。
+本文面向在 CFserver 交互式 SSH TTY 中执行 fresh QR 的 Operator。完整生命周期语义见
+[微信登录生命周期](login-management.md)。
 
-## 唯一入口
+## Before starting
 
-由人工在受控 SSH TTY 执行：
+1. 确认当前是受控 SSH TTY，stdin/stdout 都连接终端，宽度足以显示二维码。
+2. 关闭录屏、终端日志和会捕获二维码的会话共享。
+3. 确认没有其他 start/stop 操作持有运行锁。
+4. 若刚发生 CFserver reboot，先按
+   [Host reboot recovery](deployment/cfserver-production.md#cfserver-reboot-recovery)
+   显式执行 Controller `stop` 并确认。
+5. 不读取 `.env`、Token 或旧 Archive 内容。
 
-```bash
+可选预览：
+
+~~~bash
+cd /opt/cf-agent-wechat
+./scripts/start-qr-login.sh --dry-run
+~~~
+
+Dry run 不获取锁，也不改容器、Worker 或目录。
+
+## Start and scan
+
+~~~bash
 cd /opt/cf-agent-wechat
 ./scripts/start-qr-login.sh
-```
+~~~
 
-`scripts/login.sh` 只是无条件 `exec` 到上述入口的兼容包装，不提供第二套登录、
-诊断或恢复语义。首次部署时应先完成
-[Bootstrap](deployment/new-device-bootstrap.md)；已运行部署的输入变化时，应先用
-`stop-qr-runtime.sh` 受控停止 Agent/Worker，再执行 Bootstrap。Bootstrap 不会登录微信。
+保持终端打开：
 
-## 启动前
+1. 等待脚本完成 Contract、Gate、旧容器、Archive 和 fresh Runtime 操作。
+2. 等待 Docker health、Agent Server 与 WeChat 进程稳定。
+3. 看到“请使用手机微信扫描二维码”后扫描终端中**最后显示**的二维码。
+4. 在手机上确认登录。
+5. 等待脚本完成 auth、chats、messages 和 Gateway Controller 验证。
+6. 脚本返回 `0` 后运行 `./scripts/status.sh`。
 
-确认：
+不要截图、保存、转发或复制二维码内容。
 
-1. 当前 SSH 会话是受控 TTY，终端宽度足以显示二维码。
-2. 没有另一个 start/stop 流程持有并发锁。
-3. Gateway controller 来自 `CF_agent-gateway` 固定 SHA
-   `2db9dff6ece65004cc75723e1243215a5d04b304`，`contract` 严格匹配 version 1。
-4. 非 root 用户只在变更前执行一次 `sudo -v`；后续 controller 命令均为 `sudo -n`。
-5. 每次入口都重新检查 default context、本地 rootful Unix socket、
-   `live-restore=false`、`cf-agent-wechat.service` 未启用、render/actual
-   `restart=no`、批准 image digest 和 runtime UID/GID/mode。
-6. 终端、录屏、日志采集和 CI 不会捕获二维码。
+## QR acceptance rules
 
-## 权威状态机
+- fresh start 的 HTTP 与 WebSocket 均使用 `newAccount=true`。
+- 当前 WebSocket 必须实际提供并渲染至少一个 QR。
+- `phone_confirm` 只表示需要手机确认，不是最终成功。
+- 未显示 QR 的 `login_success` 会被拒绝。
+- existing `logged_in` 不会绕过 fresh start。
+- 文本 `qrBinaryData` 与 `qrData` 会在渲染前检查 Token。
+- PNG-only `qrDataUrl` 当前必须 fail closed，不允许保存图片后手工扫码。
+- WebSocket connect/recv/early-close、invalid JSON、non-UTF8、timeout 和 error 均失败。
 
-`start-qr-login.sh` 必须按顺序：
+## Readiness after phone confirmation
 
-1. 校验用户、TTY、配置和依赖。
-2. 获取独占锁。
-3. 直接执行 controller `contract`；不匹配时在任何变更前退出。
-4. 安全解析 `docker/.env`，创建/迁移并读取 Contract v1 Token。
-5. controller `stop` 必须返回 `{"stopped":true}`。
-6. 停止并移除旧 `agent-wechat` 容器，不删除 bind 数据。
-7. 原子归档旧 runtime，并写入脱敏 manifest。
-8. 创建全新的 `runtime/data` 和 `runtime/wechat-home`。
-9. 使用 `restart: "no"` 创建新容器。
-10. 请求 `newAccount=true` 的 fresh QR。
-11. 在当前 TTY 实际显示二维码后才接受后续成功事件。
-12. 等待手机扫码和确认。
-13. 验证 container running、Docker health 和 WeChat process 稳定。
-14. 验证 auth 为 `logged_in`、chats 可读且非空、messages 可读。
-15. 再次确认 WeChat process identity 稳定。
-16. 只有全部通过才执行 controller `start`，随后 `status` 必须满足：
-    `ready=true`、`token_contract_valid=true`、`worker_health=healthy`、
-    `delivery_health=healthy`。
+脚本不会在 `login_success` 后立即放行。它继续确认：
 
-如果新 runtime 的 API 在显示二维码前报告 `logged_in`，不得短路成功；流程必须
-fail closed，并保留现场。生产运行每次都必须看到新的二维码。
+- `/usr/bin/wechat` 仍是同一 `PID:start_time`；
+- Auth 为 `logged_in`；
+- chats 可读且至少有一个聊天；
+- 对 API 返回的一个聊天读取 messages 成功；
+- 最终 WeChat 进程身份未被替换；
+- Gateway ready、Token Contract、Poll/Delivery health 全部通过。
 
-## 二维码安全
+默认登录总时限为 `LOGIN_TIMEOUT_MS=300000`，登录后 API 就绪窗口为
+`POST_LOGIN_READY_TIMEOUT=120` 秒。超时保持 fail closed。
 
-- 二维码只输出到本次受控 TTY。
-- 不保存图片或文本文件。
-- 不进入 Docker 日志、shell trace、CI artifact、截图、工单或聊天。
-- 二维码刷新后只扫描当前终端最后显示的一张。
-- 未实际显示 QR 时，`login_success`、`phone_confirm` 或已有 `logged_in` 均无效。
-- WebSocket 外部错误必须去除 C0/DEL 控制字符、限制长度并隐藏 Token。
-- connect/recv/early-close、invalid JSON、non-UTF8 和 timeout 均返回非零。
-- forced production 只接受可先检查 Token 的文本 QR payload；PNG-only
-  `qrDataUrl` 必须在打印任何二维码前 fail closed。
+## Success
 
-## 放行门槛
+成功输出只包含脱敏结果类别和 Archive path。随后：
 
-Docker healthcheck 只证明容器和 Agent API 健康。生产放行还要求：
+~~~bash
+./scripts/status.sh
+~~~
 
-| 层级 | 通过条件 |
-| --- | --- |
-| Container | 正式容器 running |
-| Docker health | healthcheck 通过 |
-| WeChat | canonical executable 与同一 process identity 稳定 |
-| Auth | `logged_in` |
-| Chats | API 可读且至少一个聊天 |
-| Messages | 对 API 返回的一个聊天读取成功 |
-| Gateway | ready/token contract 有效，poll 与 delivery health 均为 healthy |
+只有 11 项状态全部通过且退出码为 `0`，才恢复业务消息。Docker health 或
+`logged_in` 单项都不够。
 
-固定入口为 `/opt/cf-agent-gateway/deploy/wechat-runtime-control`。本仓库不解析
-Gateway Compose、数据库或容器名；controller 自行验证 worker/delivery health、Token
-contract 和 heartbeat，并在 start 失败时重新停止两个受控 Worker。
+## Failure
 
-任何单项都不能替代完整门槛。验证不得输出账号、聊天 ID 或消息正文。
+1. 记录退出码、失败 phase 和脱敏 Archive path。
+2. 不手工启动 Gateway Worker，不执行裸 Compose restart/up/down。
+3. 不删除 Runtime、Archive 或锁文件，不恢复旧 Session。
+4. 等待当前流程结束并释放锁。
+5. 按 [Recovery Guide](recovery-guide.md) 处理根因后，重新运行完整 fresh QR。
 
-## 失败语义
-
-任一步失败：
-
-- `worker` 与 `delivery-worker` 保持停止，失败路径可 best-effort 再次 `stop`；
-- 当前失败 runtime 保留或隔离；
-- 已有 archive 不删除、不覆盖；
-- Token 不输出；本轮已在受控 TTY 显示的二维码不再次回显，也不写入错误、日志或文件；
-- 返回非零；
-- 修复原因后重新运行完整入口，生成另一套 fresh runtime 和新二维码。
-
-不得执行 UI logout、裸 `docker compose up/restart/down`、旧 session 恢复或数据库修改
-来绕过失败。
-
-## 成功输出
-
-成功只报告脱敏状态：
-
-- fresh runtime status；
-- archive path；
-- container/health/process/auth/chats/messages 结果类别；
-- Gateway ready、Token contract、poll/delivery health 状态。
-
-CFserver Host 按 `Asia/Shanghai` 展示，容器、日志、archive manifest 和原始审计时间
-使用 UTC。不要在同一字段中混用时区。
-
-详细故障处理见[故障排查](troubleshooting.md)，实机验收项见
-[验证总览](validation.md)。
-
-本实现尚未在 CFserver 完成真实扫码和 Gateway controller 验收；基础静态检查不等于
-生产验收。
+失败中已经显示过的二维码不得再次回显到日志或工单。只记录时间、Commit、状态类别和
+退出码。
