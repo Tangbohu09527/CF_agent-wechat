@@ -97,7 +97,10 @@ class RuntimeFixture:
         ).hexdigest()
         self.account = f"{SENSITIVE_ACCOUNT_PREFIX}{name}"
         self.chat = f"{SENSITIVE_CHAT_PREFIX}{name}#/id"
-        self.agent_env_sentinel = f"{SENSITIVE_AGENT_ENV_PREFIX}{name}"
+        self.agent_env_sentinel = (
+            "agent-env-"
+            + hashlib.sha256(name.encode("utf-8")).hexdigest()[:16]
+        )
         self._create_layout()
         self.env = self._build_environment()
         self.set_scenario()

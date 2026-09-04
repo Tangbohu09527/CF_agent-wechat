@@ -111,7 +111,7 @@ AGENT_ENV_FILE="${TEST_ROOT}/agent.env"
 AGENT_ENV_SENTINEL="agent-env-fixture-sensitive-permissions-$$"
 AGENT_STATE_FILE="${TEST_ROOT}/agent-state"
 
-install -d -o root -g root -m 755 "${TEST_REPO}/scripts"
+install -d -o root -g root -m 755 "${TEST_REPO}/scripts" "${TEST_REPO}/docker"
 install -o root -g root -m 755 \
   "${REPO_ROOT}/scripts/common.sh" \
   "${REPO_ROOT}/scripts/qr-runtime-common.sh" \
