@@ -152,6 +152,8 @@ printf '%s\n' \
   'AGENT_WECHAT_PORT=6174' \
   "PROXY=http://${AGENT_ENV_SENTINEL}.invalid" \
   'RUST_LOG=info' > "$AGENT_ENV_FILE"
+chown root:root "$AGENT_COMPOSE_FILE" "$AGENT_ENV_FILE"
+chmod 600 "$AGENT_COMPOSE_FILE" "$AGENT_ENV_FILE"
 printf '%s\n' 'running' > "$AGENT_STATE_FILE"
 
 useradd --create-home --home-dir "$TEST_HOME" --shell /bin/bash "$TEST_USER"

@@ -84,6 +84,20 @@ assert_no_lifecycle_commands() {
   }
 }
 
+assert_controller_contract_only() {
+  local log_file="$MOCK_STATE/controller.log"
+  local mutation_file="$MOCK_STATE/controller-mutations.log"
+
+  if [ -s "$mutation_file" ]; then
+    sed -n '1,200p' "$mutation_file" >&2
+    fail "Bootstrap invoked a mutating Gateway Controller operation"
+  fi
+  if [ -f "$log_file" ] &&
+    grep -Fvx 'gateway controller contract' "$log_file" >/dev/null; then
+    sed -n '1,200p' "$log_file" >&2
+    fail "Bootstrap invoked a Gateway Controller operation other than contract"
+  fi
+}
 assert_process_reaped() {
   local pid_file="$1" label="$2" pid
   [ -s "$pid_file" ] || fail "$label did not record its PID"

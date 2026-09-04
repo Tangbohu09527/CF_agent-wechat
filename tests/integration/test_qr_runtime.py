@@ -68,12 +68,14 @@ class RuntimeFixture:
             )
         self.root = Path(tempfile.mkdtemp(prefix=f"cf-qr-{name}-"))
         self.deployment_root = DEPLOYMENT_ROOT
+        self.repo = self.root / "repo"
+        self.scripts = self.repo / "scripts"
         self.storage = self.root / "storage"
         self.runtime = self.storage / "runtime"
         self.archive = self.storage / "session-archive"
         self.secrets = self.deployment_root / "secrets"
-        self.agent_compose = self.root / "agent-compose.yaml"
-        self.agent_env = self.root / "agent.env"
+        self.agent_compose = self.repo / "docker" / "compose.cfserver.yaml"
+        self.agent_env = self.repo / "docker" / ".env"
         self.fake_bin = self.root / "bin"
         self.docker_state = self.root / "docker-state"
         self.home = self.root / "home"
@@ -102,6 +104,9 @@ class RuntimeFixture:
         self._start_server()
 
     def _create_layout(self) -> None:
+        self.repo.mkdir()
+        shutil.copytree(SCRIPTS, self.scripts)
+        shutil.copytree(REPO_ROOT / "docker", self.repo / "docker")
         self.runtime.mkdir(parents=True)
         (self.runtime / "data").mkdir()
         (self.runtime / "wechat-home").mkdir()
@@ -120,7 +125,6 @@ class RuntimeFixture:
         token_file.write_text(self.token, encoding="ascii")
         os.chown(token_file, 10001, 10001)
         os.chmod(token_file, 0o600)
-        self.agent_compose.write_text("services: {}\n", encoding="utf-8")
         self.agent_env.write_text(
             "\n".join(
                 (
@@ -171,7 +175,7 @@ class RuntimeFixture:
         fake_python = venv_dir / "bin" / "python"
         shutil.copy2(HELPERS / "mock_login_python.sh", fake_python)
         os.chmod(fake_python, 0o755)
-        requirements = (SCRIPTS / "requirements.txt").read_bytes()
+        requirements = (self.scripts / "requirements.txt").read_bytes()
         checksum = subprocess.check_output(["cksum"], input=requirements, text=False)
         (venv_dir / ".cf-agent-wechat-requirements").write_bytes(checksum)
 
@@ -335,11 +339,11 @@ class RuntimeFixture:
         command = ["bash"]
         if trace:
             command.append("-x")
-        command.extend([str(SCRIPTS / script), *arguments])
+        command.extend([str(self.scripts / script), *arguments])
         command = ["script", "-qefc", shlex.join(command), "/dev/null"]
         return subprocess.run(
             command,
-            cwd=REPO_ROOT,
+            cwd=self.repo,
             env=self.env,
             text=True,
             stdout=subprocess.PIPE,
@@ -349,10 +353,10 @@ class RuntimeFixture:
         )
 
     def popen(self, script: str, *arguments: str) -> subprocess.Popen[str]:
-        command = ["bash", str(SCRIPTS / script), *arguments]
+        command = ["bash", str(self.scripts / script), *arguments]
         process = subprocess.Popen(
             ["script", "-qefc", shlex.join(command), "/dev/null"],
-            cwd=REPO_ROOT,
+            cwd=self.repo,
             env=self.env,
             text=True,
             stdout=subprocess.PIPE,
@@ -568,8 +572,8 @@ class ForcedQrRuntimeTests(unittest.TestCase):
     def test_real_start_rejects_non_tty_before_any_mutation(self) -> None:
         before = tree_digest(self.fixture.storage)
         result = subprocess.run(
-            ["bash", str(SCRIPTS / "start-qr-login.sh")],
-            cwd=REPO_ROOT,
+            ["bash", str(self.fixture.scripts / "start-qr-login.sh")],
+            cwd=self.repo,
             env=self.fixture.env,
             text=True,
             stdout=subprocess.PIPE,
