@@ -7,6 +7,9 @@
 > Runtime 轮换、Gateway Contract 或当前镜像。当前事实见
 > [生产状态](../production-status.md)，当前验收见
 > [2026-09-03 R2 记录](2026-09-03-forced-qr-r2-production.md)。
+>
+> Repository promotion was completed later on 2026-09-04; this record preserves the
+> state at its evidence date.
 
 ## 记录边界
 

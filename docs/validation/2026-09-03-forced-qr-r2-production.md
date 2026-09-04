@@ -4,6 +4,9 @@
 > 本页是一次性、脱敏的生产 Closeout 记录，不是未来部署 Runbook。可复用命令见
 > [CFserver 生产 Runbook](../deployment/cfserver-production.md)，当前状态见
 > [生产状态](../production-status.md)。
+>
+> Repository promotion was completed later on 2026-09-04; this record preserves the
+> state at its evidence date.
 
 ## Scope
 
