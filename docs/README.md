@@ -6,7 +6,7 @@
 
 | 文档 | 用途 | 权威性 |
 | --- | --- | --- |
-| [当前生产状态](production-status.md) | 生产在线状态、Git/PR 栈、镜像证据、重启事实与已知限制 | **当前生产事实唯一入口** |
+| [当前生产状态](production-status.md) | 生产在线状态、repository promotion、镜像证据、重启事实与已知限制 | **当前生产事实唯一入口** |
 | [CFserver 生产 Runbook](deployment/cfserver-production.md) | Bootstrap、fresh QR、stop、status、重启、升级与回滚 | **详细生产操作唯一入口** |
 | [R2 生产验收记录](validation/2026-09-03-forced-qr-r2-production.md) | 2026-09-03 forced-QR R2 实机 Closeout | **当前生产验收唯一详细记录** |
 
@@ -60,7 +60,7 @@
 
 | 文档 | 分类 | 用途 |
 | --- | --- | --- |
-| [2026-09-03 R2 生产验收](validation/2026-09-03-forced-qr-r2-production.md) | 当前一次性记录 | forced fresh QR、重启、Gateway Contract 与集成链路证据 |
+| [2026-09-03 R2 生产验收](validation/2026-09-03-forced-qr-r2-production.md) | 带日期生产证据 | forced fresh QR、重启、Gateway Contract 与集成链路证据 |
 | [2026-08-13 CFserver 记录](validation/2026-08-13-cfserver-production.md) | 历史快照 | 旧可信设备登录与基础 API 证据，不能证明 forced QR |
 | [2026-08-14 消息/媒体记录](validation/2026-08-14-message-media-production.md) | 历史快照 | 当时消息与图片 media 观察，不能替代当前 Runbook |
 
@@ -80,6 +80,9 @@
 历史结论只在其日期、Commit 和明确范围内有效。与当前事实冲突时，以
 [当前生产状态](production-status.md)为准；执行生产操作时，只使用
 [CFserver 生产 Runbook](deployment/cfserver-production.md)。
+
+Repository promotion 已于 2026-09-04 完成。该仓库事件不改写 2026-09-03 及更早
+验证记录，也不证明 Repository `main` 已重新构建或部署到 CFserver。
 
 ## 文档维护规则
 

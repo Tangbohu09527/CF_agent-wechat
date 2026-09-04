@@ -176,8 +176,8 @@ sudo -n docker compose \
 - [ ] Runtime、Archive、Token 的路径和访问责任已交接。
 - [ ] Archive 保留、容量、备份和销毁有外部负责人。
 - [ ] 日志按 `20m × 3` 监控，且敏感信息规则明确。
-- [ ] PR #4/#5 已并入 PR #1、但 PR #1 尚未提升到 `main` 的状态已交接。
-- [ ] Source SHA 与现场 Image ID 的精确绑定仍未验证。
+- [ ] PR #1/#4/#5 均已合并、Repository promotion 已完成、main CI 已成功的状态已交接。
+- [ ] Repository `main` 未重新部署，Source SHA 与现场 Image ID 的精确绑定仍未验证。
 
 ## Upgrade/rollback decision
 

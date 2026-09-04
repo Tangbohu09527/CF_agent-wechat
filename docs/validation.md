@@ -7,13 +7,16 @@
 
 | 标签 | 当前使用方式 |
 | --- | --- |
-| **已完成** | 实现、测试、Workflow 和文档存在于 PR #1 Head |
+| **已完成** | 实现、测试、Workflow 和文档已进入 Repository `main` `02583fe76220916019ca961bb37dfa015640384e` |
 | **已验证（自动化）** | 隔离测试覆盖，不连接 CFserver 或真实微信 |
 | **已验证（CFserver 行为）** | 带日期的脱敏现场记录观察到预期行为 |
 | **未证明** | 缺少 exact build/provenance 或 automatic boot gate 证据 |
-| **后续提升** | PR #1 合入 `main`；不表示生产重新部署 |
+| **Repository promotion** | **COMPLETED**；PR #1/#4/#5 已合并，main CI Run `33853255941` 成功 |
 
 历史基线只证明其日期、Commit 与运行方式，不能替代当前 R2 证据。
+
+2026-09-04 的 repository promotion 没有连接或修改 CFserver，也没有重新构建或发布
+生产镜像。forced-QR 的真实生产行为验收仍来自 2026-09-03 的既有证据。
 ## A. Completed R2 production acceptance
 
 以下项目已在 2026-09-03 Closeout 前完成真实 CFserver 验证：
@@ -106,4 +109,5 @@
 - 本仓库不验证 Gateway 内部去重、Admission、Checkpoint、Dispatch、Response、
   Delivery Receipt 或 Hermes 业务语义。
 - 现场 Image ID 与源码 SHA 的精确构建映射未验证。
-- PR #4/#5 已并入 PR #1；PR #1 仍未提升到 `main`。
+- Repository `main` `02583fe...` 未被证明已经重新部署；现场 Image ID 仍为
+  `sha256:7ee0309980b7d03b747b40c6c04cbaeafe2d8fc01fc9429810cbc7571ebbf720`。
