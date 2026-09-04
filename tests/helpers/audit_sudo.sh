@@ -7,6 +7,7 @@ set -euo pipefail
 sudo_arguments=("$@")
 
 docker_subcommand=""
+gateway_operation=""
 docker_arguments=()
 python_or_pip=0
 token_reader=0
@@ -17,6 +18,10 @@ for argument_index in "${!sudo_arguments[@]}"; do
   case "$argument" in
     -v) validation=1 ;;
     -n) noninteractive=1 ;;
+    /opt/cf-agent-gateway/deploy/wechat-runtime-control)
+      gateway_operation="${sudo_arguments[argument_index + 1]:-unknown}"
+      break
+      ;;
     docker|*/docker)
       docker_offset=$((argument_index + 1))
       docker_arguments=("${sudo_arguments[@]:docker_offset}")
@@ -41,6 +46,8 @@ elif [ "$python_or_pip" -eq 1 ]; then
   kind="python-pip"
 elif [ "$token_reader" -eq 1 ]; then
   kind="token-reader"
+elif [ -n "$gateway_operation" ]; then
+  kind="gateway-controller-${gateway_operation}"
 elif [ -n "$docker_subcommand" ]; then
   case "$docker_subcommand" in
     context|info|compose|exec|inspect) kind="docker-$docker_subcommand" ;;

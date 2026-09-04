@@ -8,14 +8,31 @@ IMAGE="registry.example/cf-agent-wechat@sha256:$(printf 'a%.0s' {1..64})"
 CURRENT_UID="$(id -u)"
 CURRENT_GID="$(id -g)"
 REQUIRE_TEST="$(printenv CF_REQUIRE_BOOTSTRAP_DEPLOYMENT_TEST 2>/dev/null || printf 0)"
+GATEWAY_RUNTIME_CONTROL="/opt/cf-agent-gateway/deploy/wechat-runtime-control"
+STORAGE_ROOT="/srv/storage/cf-agent-wechat"
+CONTROLLER_CREATED=0
+STORAGE_RESERVED=0
 
 cleanup() {
+  set +e
+  if [ "$STORAGE_RESERVED" -eq 1 ]; then
+    case "$STORAGE_ROOT" in
+      /srv/storage/cf-agent-wechat)
+        sudo -n -- rm -rf -- "$STORAGE_ROOT" 2>/dev/null
+        ;;
+    esac
+  fi
+  if [ "$CONTROLLER_CREATED" -eq 1 ]; then
+    sudo -n -- rm -f -- "$GATEWAY_RUNTIME_CONTROL" 2>/dev/null
+    sudo -n -- rmdir /opt/cf-agent-gateway/deploy 2>/dev/null
+    sudo -n -- rmdir /opt/cf-agent-gateway 2>/dev/null
+  fi
   case "$TEST_ROOT" in
     /tmp/cf-agent-wechat-bootstrap.*)
       if command -v sudo >/dev/null 2>&1; then
-        sudo -n -- rm -rf -- "$TEST_ROOT" 2>/dev/null || true
+        sudo -n -- rm -rf -- "$TEST_ROOT" 2>/dev/null
       else
-        rm -rf -- "$TEST_ROOT" 2>/dev/null || true
+        rm -rf -- "$TEST_ROOT" 2>/dev/null
       fi
       ;;
     *)
@@ -101,27 +118,41 @@ for command_name in bash install openssl python3 realpath stat timeout; do
     fail "missing test prerequisite: $command_name"
 done
 
+[ ! -e "$STORAGE_ROOT" ] && [ ! -L "$STORAGE_ROOT" ] ||
+  skip "Bootstrap deployment test requires an unused fixed storage path"
+[ ! -e "$GATEWAY_RUNTIME_CONTROL" ] && [ ! -L "$GATEWAY_RUNTIME_CONTROL" ] ||
+  skip "Bootstrap deployment test requires an unused fixed Controller path"
+sudo -n -- install -d -o root -g root -m 755 /opt/cf-agent-gateway/deploy
+sudo -n -- install -o root -g root -m 755 \
+  "$REPO_ROOT/tests/helpers/mock_gateway_runtime_control.sh" \
+  "$GATEWAY_RUNTIME_CONTROL"
+CONTROLLER_CREATED=1
+STORAGE_RESERVED=1
+
 prepare_fixture() {
   local name="$1"
+
+  if sudo -n -- test -e "$STORAGE_ROOT" ||
+    sudo -n -- test -L "$STORAGE_ROOT"; then
+    sudo -n -- rm -rf -- "$STORAGE_ROOT"
+  fi
+
   SCENARIO_ROOT="$TEST_ROOT/$name"
   APP_ROOT="$SCENARIO_ROOT/agent"
-  GATEWAY_PROJECT="$SCENARIO_ROOT/gateway/deploy"
-  STORAGE_ROOT="$SCENARIO_ROOT/storage"
   RUNTIME_ROOT="$STORAGE_ROOT/runtime"
   ARCHIVE_ROOT="$STORAGE_ROOT/session-archive"
-  GATEWAY_HEARTBEAT="$GATEWAY_PROJECT/check-wechat-worker-heartbeat"
   TOKEN_FILE="$STORAGE_ROOT/secrets/auth-token"
   AGENT_ENV="$APP_ROOT/docker/.env"
   AGENT_COMPOSE="$APP_ROOT/docker/compose.cfserver.yaml"
-  GATEWAY_ENV="$GATEWAY_PROJECT/.env"
-  GATEWAY_COMPOSE="$GATEWAY_PROJECT/compose.yaml"
   MOCK_BIN="$SCENARIO_ROOT/bin"
   MOCK_STATE="$MOCK_BIN/state"
   OUTPUT="$SCENARIO_ROOT/bootstrap.out"
   DOCKER_SOCKET="$SCENARIO_ROOT/docker.sock"
 
-  install -d -m 755 -- "$APP_ROOT/docker" "$GATEWAY_PROJECT" "$MOCK_BIN" \
+  install -d -m 755 -- "$APP_ROOT/docker" "$MOCK_BIN" \
     "$MOCK_STATE" "$SCENARIO_ROOT/tmp"
+  : > "$MOCK_STATE/controller.log"
+  : > "$MOCK_STATE/controller-mutations.log"
   install -m 644 -- "$REPO_ROOT/docker/compose.cfserver.yaml" "$AGENT_COMPOSE"
   install -m 755 -- "$REPO_ROOT/tests/helpers/mock_bootstrap_docker.sh" \
     "$MOCK_BIN/docker"
@@ -151,20 +182,8 @@ PY
       'RUST_LOG=info'
   } > "$AGENT_ENV"
   chmod 600 "$AGENT_ENV"
-  {
-    printf '%s\n' \
-      'services:' \
-      '  wechat-worker:' \
-      '    image: registry.example/gateway@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
-  } > "$GATEWAY_COMPOSE"
-  printf '%s\n' 'GATEWAY_ENV=production' > "$GATEWAY_ENV"
-  printf '%s\n' '#!/bin/sh' 'exit 0' > "$GATEWAY_HEARTBEAT"
-  chmod 644 "$GATEWAY_COMPOSE"
-  chmod 600 "$GATEWAY_ENV"
-  chmod 755 "$GATEWAY_HEARTBEAT"
   chmod 660 "$DOCKER_SOCKET"
 }
-
 run_bootstrap() {
   local output="$1" status=0
   shift
@@ -172,7 +191,9 @@ run_bootstrap() {
     -u DOCKER_HOST -u DOCKER_CONTEXT -u DOCKER_TLS_VERIFY -u DOCKER_CERT_PATH \
     -u AGENT_WECHAT_IMAGE -u AGENT_WECHAT_BIND_IP -u AGENT_WECHAT_PORT \
     -u AGENT_WECHAT_CONTAINER_NAME -u COMPOSE_PROJECT_NAME -u PROXY -u RUST_LOG \
-    -u CF_AGENT_WECHAT_TOKEN_FILE -u SUDO_UID -u SUDO_GID \
+    -u CF_AGENT_WECHAT_STORAGE_ROOT -u CF_AGENT_WECHAT_RUNTIME_ROOT \
+    -u CF_AGENT_WECHAT_ARCHIVE_ROOT -u CF_AGENT_WECHAT_TOKEN_FILE \
+    -u SUDO_UID -u SUDO_GID \
     CF_BOOTSTRAP_TESTING=1 \
     CF_BOOTSTRAP_DOCKER_BIN="$MOCK_BIN/docker" \
     CF_BOOTSTRAP_SYSTEMCTL_BIN="$MOCK_BIN/systemctl" \
@@ -182,22 +203,19 @@ run_bootstrap() {
     CF_AGENT_WECHAT_ROOT="$APP_ROOT" \
     CF_AGENT_WECHAT_COMPOSE_FILE="$AGENT_COMPOSE" \
     CF_AGENT_WECHAT_ENV_FILE="$AGENT_ENV" \
-    CF_AGENT_WECHAT_STORAGE_ROOT="$STORAGE_ROOT" \
-    CF_AGENT_WECHAT_RUNTIME_ROOT="$RUNTIME_ROOT" \
-    CF_AGENT_WECHAT_ARCHIVE_ROOT="$ARCHIVE_ROOT" \
     CF_AGENT_WECHAT_RUNTIME_UID="$CURRENT_UID" \
     CF_AGENT_WECHAT_RUNTIME_GID="$CURRENT_GID" \
     CF_AGENT_WECHAT_RUNTIME_MODE=700 \
-    CF_AGENT_GATEWAY_PROJECT_DIR="$GATEWAY_PROJECT" \
-    CF_AGENT_GATEWAY_COMPOSE_FILE="$GATEWAY_COMPOSE" \
-    CF_AGENT_GATEWAY_ENV_FILE="$GATEWAY_ENV" \
+    MOCK_GATEWAY_STATE_DIR="$MOCK_STATE" \
+    MOCK_GATEWAY_LOG="$MOCK_STATE/controller.log" \
+    MOCK_GATEWAY_MUTATION_LOG="$MOCK_STATE/controller-mutations.log" \
     TMPDIR="$SCENARIO_ROOT/tmp" \
     "$@" \
     /bin/bash "$BOOTSTRAP" > "$output" 2>&1 || status=$?
   assert_no_lifecycle_commands
+  assert_controller_contract_only
   return "$status"
 }
-
 expect_failure() {
   local expected="$1"
   shift
@@ -215,8 +233,8 @@ sudo -n -- test -f "$TOKEN_FILE" ||
 TOKEN_BEFORE="$(sudo -n -- cat "$TOKEN_FILE")"
 [ "$(printf '%s' "$TOKEN_BEFORE" | wc -c)" -eq 64 ] ||
   fail "generated Token length is invalid"
-[ "$(sudo -n -- stat -c '%u:%g:%a:%h' "$TOKEN_FILE")" = '0:0:600:1' ] ||
-  fail "generated Token is not root:root 600 with one hard link"
+[ "$(sudo -n -- stat -c '%u:%g:%a:%h' "$TOKEN_FILE")" = '10001:10001:600:1' ] ||
+  fail "generated Token is not 10001:10001 600 with one hard link"
 [ ! -e "$RUNTIME_ROOT" ] || fail "Bootstrap created the fresh runtime root"
 [ ! -e "$STORAGE_ROOT/data" ] || fail "Bootstrap created legacy data"
 [ ! -e "$STORAGE_ROOT/wechat-home" ] || fail "Bootstrap created legacy WeChat HOME"
@@ -278,12 +296,12 @@ grep -Fq $'via_sudo=0\tinfo' "$MOCK_STATE/docker.log" ||
   fail "ordinary Docker access was not attempted first"
 grep -Fq $'via_sudo=1\tinfo' "$MOCK_STATE/docker.log" ||
   fail "Docker access did not fall back to sudo -n"
-[ "$(sudo -n -- stat -c '%u:%g:%a' "$TOKEN_FILE")" = '0:0:600' ] ||
-  fail "ordinary-user flow did not retain a root-only Token"
+[ "$(sudo -n -- stat -c '%u:%g:%a' "$TOKEN_FILE")" = '10001:10001:600' ] ||
+  fail "ordinary-user flow did not retain the 10001:10001 Token contract"
 pass "ordinary user authorizes once and uses Docker socket sudo fallback"
 
 prepare_fixture root-protected-config
-sudo -n -- chown 0:0 "$AGENT_ENV" "$GATEWAY_ENV"
+sudo -n -- chown 0:0 "$AGENT_ENV"
 run_bootstrap "$OUTPUT" || {
   sed -n '1,200p' "$OUTPUT" >&2
   fail "root-protected Compose configuration did not use sudo -n"
@@ -374,11 +392,12 @@ touch "$MOCK_STATE/agent-running"
 expect_failure 'agent-wechat is running'
 pass "Bootstrap refuses a long-lived agent-wechat container"
 
-prepare_fixture worker-running
-touch "$MOCK_STATE/worker-running"
-expect_failure 'Gateway wechat-worker must be stopped'
-pass "Bootstrap gates Gateway wechat-worker before fresh QR verification"
-
+prepare_fixture controller-contract-malformed
+printf '%s\n' malformed > "$MOCK_STATE/contract_mode"
+expect_failure 'Gateway Runtime Contract does not match required version 1'
+[ ! -e "$STORAGE_ROOT" ] ||
+  fail "invalid Controller contract mutated deployment state"
+pass "malformed Gateway Runtime Contract fails closed before Bootstrap mutation"
 prepare_fixture existing-restart
 touch "$MOCK_STATE/agent-existing" "$MOCK_STATE/agent-bad-restart"
 expect_failure 'existing agent-wechat container must use restart policy no'
@@ -435,39 +454,30 @@ ln -- "$AGENT_COMPOSE" "$AGENT_COMPOSE.copy"
 expect_failure 'production Compose file must not have additional hard links'
 pass "production Compose hardlink is rejected"
 
-prepare_fixture symlink-ancestor
-mv -- "$SCENARIO_ROOT/gateway" "$SCENARIO_ROOT/gateway.real"
-ln -s -- gateway.real "$SCENARIO_ROOT/gateway"
-expect_failure 'Gateway project directory must not contain symbolic link ancestors'
-[ ! -e "$STORAGE_ROOT" ] || fail "symlink ancestor rejection mutated deployment state"
-pass "symbolic link ancestors cannot redirect managed paths"
-prepare_fixture heartbeat-missing
-rm -f -- "$GATEWAY_HEARTBEAT"
-expect_failure 'Gateway heartbeat checker must be an existing non-symlink regular file'
-[ ! -e "$STORAGE_ROOT" ] || fail "missing heartbeat checker mutated deployment state"
-pass "missing Gateway heartbeat checker fails closed"
+prepare_fixture env-relative-path
+expect_failure 'production environment must be an absolute path' \
+  CF_AGENT_WECHAT_ENV_FILE=relative-docker.env
+pass "relative docker/.env path is rejected"
 
-prepare_fixture heartbeat-symlink
-mv -- "$GATEWAY_HEARTBEAT" "${GATEWAY_HEARTBEAT}.real"
-ln -s -- "$(basename -- "${GATEWAY_HEARTBEAT}.real")" "$GATEWAY_HEARTBEAT"
-expect_failure 'Gateway heartbeat checker must be an existing non-symlink regular file'
-pass "Gateway heartbeat checker symlink is rejected"
+prepare_fixture env-duplicate-key
+printf '%s\n' 'AGENT_WECHAT_PORT=6174' >> "$AGENT_ENV"
+expect_failure 'production environment contains a duplicate key: AGENT_WECHAT_PORT'
+pass "duplicate docker/.env keys are rejected"
 
-prepare_fixture heartbeat-hardlink
-ln -- "$GATEWAY_HEARTBEAT" "${GATEWAY_HEARTBEAT}.copy"
-expect_failure 'Gateway heartbeat checker must not have additional hard links'
-pass "Gateway heartbeat checker hardlinks are rejected"
+prepare_fixture env-unknown-key
+printf '%s\n' 'UNAPPROVED_SETTING=value' >> "$AGENT_ENV"
+expect_failure 'production environment contains an unsupported key: UNAPPROVED_SETTING'
+pass "unknown docker/.env keys are rejected"
 
-prepare_fixture heartbeat-mode
-chmod 777 "$GATEWAY_HEARTBEAT"
-expect_failure 'Gateway heartbeat checker must not be group/other writable'
-pass "group/other-writable Gateway heartbeat checker is rejected"
+prepare_fixture env-image-tag
+sed -i 's|^AGENT_WECHAT_IMAGE=.*|AGENT_WECHAT_IMAGE=registry.example/cf-agent-wechat:latest|' "$AGENT_ENV"
+expect_failure 'AGENT_WECHAT_IMAGE must be pinned to an immutable sha256 digest'
+pass "mutable image tags are rejected"
 
-prepare_fixture heartbeat-not-executable
-chmod 644 "$GATEWAY_HEARTBEAT"
-expect_failure 'Gateway heartbeat checker must be executable by the management user'
-pass "non-executable Gateway heartbeat checker is rejected"
-
+prepare_fixture env-authenticated-proxy
+sed -i 's|^PROXY=.*|PROXY=http://user:password@proxy.example:8080|' "$AGENT_ENV"
+expect_failure 'PROXY must be unauthenticated'
+pass "authenticated proxy URLs are rejected"
 
 prepare_fixture token-hardlink
 touch "$MOCK_STATE/fail-agent-compose"
@@ -475,7 +485,7 @@ expect_failure 'production Compose validation failed'
 rm -f -- "$MOCK_STATE/fail-agent-compose"
 TOKEN_VALUE="$(sudo -n -- cat "$TOKEN_FILE")"
 sudo -n -- ln -- "$TOKEN_FILE" "$STORAGE_ROOT/secrets/auth-token.extra"
-expect_failure 'auth Token must be root:root 600 with one hard link'
+expect_failure 'auth Token has an unknown format'
 assert_not_contains "$OUTPUT" "$TOKEN_VALUE"
 assert_not_contains "$MOCK_STATE/docker.log" "$TOKEN_VALUE"
 pass "Token hardlinks fail closed without disclosure"
