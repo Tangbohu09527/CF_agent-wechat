@@ -1,56 +1,72 @@
 # CF_agent-wechat 文档索引
 
-本目录按“当前权威资料、生产验证记录、历史实验快照”分层。部署与登录生产基线日期为
-2026-08-13，最新消息与媒体生产证据日期为 2026-08-14；状态区分“已实现并
-实机验证”“已实现但尚未实机验证”“规划中”。证据不足以判断实现状态时，只写
-“尚未完成生产实机验证”，不强行归类。
+本页是唯一文档索引。当前事实、可复用 Runbook 与一次性验收记录必须分开使用。
 
-## 当前权威资料
+## Start here
 
-| 入口 | 用途 |
+| 文档 | 用途 | 权威性 |
+| --- | --- | --- |
+| [当前生产状态](production-status.md) | 生产在线状态、Git/PR 栈、镜像证据、重启事实与已知限制 | **当前生产事实唯一入口** |
+| [CFserver 生产 Runbook](deployment/cfserver-production.md) | Bootstrap、fresh QR、stop、status、重启、升级与回滚 | **详细生产操作唯一入口** |
+| [R2 生产验收记录](validation/2026-09-03-forced-qr-r2-production.md) | 2026-09-03 forced-QR R2 实机 Closeout | **当前生产验收唯一详细记录** |
+
+## Current production
+
+| 文档 | 用途 |
 | --- | --- |
-| [项目说明](00_项目说明.md) | 项目职责、边界、当前状态与安全口径 |
-| [架构设计](01_架构设计.md) | 容器内 Xvfb 链路、组件职责与 Gateway 调用关系 |
-| [CFserver 正式部署](deployment/cfserver-production.md) | 正式 Compose、目录、权限、启停、重建、重启检查和回滚 |
-| [微信登录管理](login-management.md) | `status.sh`、`login.sh`、返回码、权限模型和登录验证矩阵 |
-| [API 边界](api.md) | agent-server 当前生产端点、登录接口和历史能力边界 |
-| [生产运维](operations.md) | 日常检查、启停、备份恢复、升级与交接 |
-| [故障排查](troubleshooting.md) | 容器、健康、Token、登录、进程与项目边界排查 |
+| [项目说明](00_项目说明.md) | 项目职责、外部边界和当前限制摘要 |
+| [验证总览](validation.md) | 已完成 R2 验收、未来 Release 清单、历史记录与剩余限制 |
+| [生产运维](operations.md) | 日常状态、维护、重启边界、归档盘点和交接 |
 
-> **生产警告：不得在 CFserver 上执行不带 `-f` 的
-> `docker compose down`。** 正式命令必须显式指定
-> `docker/compose.cfserver.yaml`。
+## Architecture and boundaries
 
-## 验证记录
-
-| 入口 | 用途 |
+| 文档 | 用途 |
 | --- | --- |
-| [验证总览](validation.md) | 当前状态矩阵、准确表述和回归要求 |
-| [2026-08-13 CFserver 生产验证](validation/2026-08-13-cfserver-production.md) | 部署、登录和基础接口的脱敏实机记录 |
-| [2026-08-14 消息与媒体生产验证](validation/2026-08-14-message-media-production.md) | 文本发送、群消息字段、引用和图片 media 的脱敏实机记录 |
+| [架构设计](01_架构设计.md) | Host/Docker、Xvfb、WeChat、agent-server、Gateway 的层级与职责 |
+| [API 边界](api.md) | 当前脚本实际使用的 API、上游观察行为、认证与超时边界 |
 
-## 历史实验记录
+## Deployment
 
-以下文件已封存。它们可能包含 VNC/noVNC、x11vnc、XFCE、宿主桌面或旧 Compose
-步骤，均属于历史实验、已废弃、非当前生产方案：
-
-| 入口 | 历史用途 |
+| 文档 | 用途 |
 | --- | --- |
-| [02 部署记录](02_部署记录.md) | 早期实验部署与桌面调试记录 |
-| [03 V1 验证计划](03_V1验证计划.md) | 当时的 V1 验证计划 |
-| [04 二开规划](04_二开规划.md) | 当时的扩展规划快照 |
-| [05 V1 验证结果](05_V1验证结果.md) | 早期固定环境的能力验证结果 |
-| [Docker 实验室手册](../docker/README.md) | `docker/docker-compose.yml` 的实验室资料 |
+| [部署导航](deployment-guide.md) | 区分 Bootstrap、start、stop、status 与 recovery |
+| [新设备 Bootstrap](deployment/new-device-bootstrap.md) | 只准备部署输入，不创建 Session 或启动服务 |
 
-历史记录不得作为 CFserver 生产 runbook。当前事实发生冲突时，以
-[验证总览](validation.md)、对应日期的生产验证记录和
-[CFserver 正式部署](deployment/cfserver-production.md) 为准。
+## Login lifecycle
 
-## 维护规则
+| 文档 | 用途 |
+| --- | --- |
+| [登录生命周期](login-management.md) | 状态机、脚本职责、权限、锁、退出码与 fail-closed 原则 |
+| [QR 操作指南](qr-login-guide.md) | Operator 在 SSH TTY 中扫码和判断成功/失败 |
 
-1. 新验证结论必须记录日期、Commit、环境、动作、结果和未验证范围。
-2. 只有实机通过后，状态才能改为“已实现并实机验证”。
-3. 当前部署命令只维护在生产部署与运维文档，其他页面链接到权威入口。
-4. Gateway 只描述调用关系，不在本仓库展开其内部权限或 Hermes 实现。
-5. 文档不得包含真实账号、联系人、聊天标识、服务器 IP、二维码、Token、指纹、
-   API Key、密码或本地 Windows 绝对路径。
+## Operations and recovery
+
+| 文档 | 用途 |
+| --- | --- |
+| [恢复指南](recovery-guide.md) | 按“检查 -> 判断 -> 操作 -> 验证 -> 失败回退”处理故障 |
+| [故障排查](troubleshooting.md) | 按症状定位只读检查、安全动作和禁止操作 |
+
+## Validation evidence
+
+| 文档 | 分类 | 用途 |
+| --- | --- | --- |
+| [2026-09-03 R2 生产验收](validation/2026-09-03-forced-qr-r2-production.md) | 当前一次性记录 | forced fresh QR、重启、Gateway Contract 与集成链路证据 |
+| [2026-08-13 CFserver 记录](validation/2026-08-13-cfserver-production.md) | 历史快照 | 旧可信设备登录与基础 API 证据，不能证明 forced QR |
+| [2026-08-14 消息/媒体记录](validation/2026-08-14-message-media-production.md) | 历史快照 | 当时消息与图片 media 观察，不能替代当前 Runbook |
+
+## Historical documents
+
+以下材料保留原路径以维持链接，但都不是当前 CFserver Runbook：
+
+| 文档 | 历史范围 |
+| --- | --- |
+| [部署记录](02_部署记录.md) | 早期 V1、VNC/noVNC、自动恢复实验 |
+| [V1 验证计划](03_V1验证计划.md) | 早期验收计划快照 |
+| [二开规划](04_二开规划.md) | 早期扩展设想 |
+| [V1 验证结果](05_V1验证结果.md) | 固定实验环境能力记录 |
+| [R2 实现审计](deployment-audit.md) | PR #2 等实现选择的历史审计，不是操作入口 |
+| [Docker 实验室手册](../docker/README.md) | 实验室 Compose 与 VNC/noVNC 资料 |
+
+历史结论只在其日期、Commit 和明确范围内有效。与当前事实冲突时，以
+[当前生产状态](production-status.md)为准；执行生产操作时，只使用
+[CFserver 生产 Runbook](deployment/cfserver-production.md)。

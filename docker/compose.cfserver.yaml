@@ -4,7 +4,7 @@ services:
   agent-wechat:
     image: "${AGENT_WECHAT_IMAGE:?Set AGENT_WECHAT_IMAGE in .env}"
     container_name: "${AGENT_WECHAT_CONTAINER_NAME:-cf-agent-wechat}"
-    restart: "on-failure:3"
+    restart: "no"
 
     security_opt:
       - seccomp=unconfined
@@ -71,7 +71,9 @@ services:
     stop_grace_period: 30s
 
     networks:
-      - cf-internal
+      cf-internal:
+        aliases:
+          - cf-agent-wechat
 
 networks:
   cf-internal:

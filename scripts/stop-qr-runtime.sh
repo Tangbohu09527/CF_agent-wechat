@@ -13,8 +13,8 @@ usage() {
   cat <<'EOF'
 Usage: ./scripts/stop-qr-runtime.sh [--dry-run]
 
-Stop Gateway wechat-worker and agent-wechat without deleting the runtime,
-Token, container, or any session archive.
+Stop Gateway poll/delivery workers and agent-wechat without deleting the
+runtime, Token, container, or any session archive.
 EOF
 }
 
@@ -40,13 +40,12 @@ parse_args() {
 
 print_status() {
   local container_status="$1"
-  local worker_status="$2"
 
   printf '%s\n' '================================'
   printf '%s\n' 'QR Runtime Stop Status'
   printf '%s\n' '================================'
   printf 'Container:\n  %s\n' "$container_status"
-  printf 'Gateway WeChat Worker:\n  %s\n' "$worker_status"
+  printf 'Gateway Poll/Delivery Workers:\n  stopped\n'
   printf 'Runtime:\n  preserved\n'
   printf 'Token:\n  preserved\n'
   printf 'Session Archives:\n  preserved\n'
@@ -54,17 +53,21 @@ print_status() {
 }
 
 main() {
-  local container_status worker_status
+  local container_status
 
   parse_args "$@"
 
+  if ! resolve_python; then
+    error "$LAST_ERROR"
+    return 1
+  fi
   if ! runtime_validate_stop_configuration; then
     error "$LAST_ERROR"
     return 1
   fi
 
   if [ "$DRY_RUN" -eq 1 ]; then
-    printf '%s\n' 'Dry run: worker, container, runtime, Token, and archives are unchanged.'
+    printf '%s\n' 'Dry run: workers, container, runtime, Token, and archives are unchanged.'
     return 0
   fi
   if ! runtime_acquire_lock; then
@@ -72,7 +75,7 @@ main() {
     return 1
   fi
 
-  if ! stop_gateway_worker; then
+  if ! stop_gateway_workers; then
     error "$LAST_ERROR"
     return 1
   fi
@@ -88,15 +91,7 @@ main() {
     error "agent-wechat did not stop."
     return 1
   fi
-  if ! worker_status="$(gateway_worker_state)"; then
-    error "Gateway wechat-worker state could not be queried after stop."
-    return 1
-  fi
-  if [ "$worker_status" != "stopped" ]; then
-    error "Gateway wechat-worker did not stop."
-    return 1
-  fi
-  print_status "$container_status" "$worker_status"
+  print_status "$container_status"
 }
 
 main "$@"

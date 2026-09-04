@@ -39,37 +39,46 @@ class AgentRuntimeContractTests(unittest.TestCase):
         )
 
     def test_agent_compose_uses_env_file_for_direct_and_sudo_docker(self) -> None:
-        continuation = chr(92)
-        compose_arguments = (
-            f'      --env-file "$AGENT_ENV_FILE" {continuation}',
-            f'      --project-directory "$RUNTIME_REPO_ROOT" {continuation}',
-            '      -f "$AGENT_COMPOSE_FILE" "$@"',
+        body = function_body(self.content, "agent_compose")
+        self.assertIn('local -a clean_environment=(', body)
+        for variable in (
+            "AGENT_WECHAT_IMAGE",
+            "AGENT_WECHAT_BIND_IP",
+            "AGENT_WECHAT_PORT",
+            "AGENT_WECHAT_CONTAINER_NAME",
+            "COMPOSE_PROJECT_NAME",
+            "CF_AGENT_WECHAT_STORAGE_ROOT",
+            "CF_AGENT_WECHAT_RUNTIME_ROOT",
+            "CF_AGENT_WECHAT_ARCHIVE_ROOT",
+            "CF_AGENT_WECHAT_TOKEN_FILE",
+            "PROXY",
+            "RUST_LOG",
+        ):
+            self.assertIn(f"-u {variable}", body)
+        self.assertIn('sudo -n -- "${clean_environment[@]}"', body)
+        self.assertEqual(
+            body.count(
+                '"CF_AGENT_WECHAT_RUNTIME_ROOT=$RUNTIME_ROOT" docker compose'
+            ),
+            2,
         )
-        sudo_invocation = "\n".join(
-            (
-                '    sudo -- env '
-                '"CF_AGENT_WECHAT_RUNTIME_ROOT=$RUNTIME_ROOT" '
-                f"docker compose {continuation}",
-                *compose_arguments,
-            )
+        self.assertEqual(body.count('--env-file "$AGENT_ENV_FILE"'), 2)
+        self.assertEqual(
+            body.count('--project-directory "$RUNTIME_REPO_ROOT"'),
+            2,
         )
-        direct_invocation = "\n".join(
-            (
-                '    env "CF_AGENT_WECHAT_RUNTIME_ROOT=$RUNTIME_ROOT" '
-                f"docker compose {continuation}",
-                *compose_arguments,
-            )
+        self.assertEqual(
+            body.count('runtime_with_timeout "$COMPOSE_COMMAND_TIMEOUT"'),
+            2,
         )
-        self.assertIn(sudo_invocation, self.content)
-        self.assertIn(direct_invocation, self.content)
 
     def test_start_and_stop_validate_agent_env_before_compose(self) -> None:
         absolute_error = (
             "agent-wechat environment file path must be absolute:"
         )
         file_condition = (
-            'if [ -L "$AGENT_ENV_FILE" ] || '
-            '[ ! -f "$AGENT_ENV_FILE" ]; then'
+            'if runtime_privileged test -L "$AGENT_ENV_FILE" ||\n'
+            '    ! runtime_privileged test -f "$AGENT_ENV_FILE"; then'
         )
         file_error = (
             "agent-wechat environment file must be an existing non-symlink "
@@ -80,6 +89,48 @@ class AgentRuntimeContractTests(unittest.TestCase):
         self.assertEqual(self.content.count(file_condition), 2)
         self.assertEqual(self.content.count(file_error), 2)
 
+    def test_management_environment_load_follows_file_validation(self) -> None:
+        for function_name in (
+            "runtime_validate_configuration",
+            "runtime_validate_stop_configuration",
+        ):
+            body = function_body(self.content, function_name)
+            self.assertLess(
+                body.index('runtime_privileged test -L "$AGENT_ENV_FILE"'),
+                body.index("runtime_load_management_environment"),
+            )
+        self.assertEqual(
+            self.content.count("runtime_load_management_environment"), 3
+        )
+
+
+class ArchiveSafetyContractTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.content = START_SCRIPT.read_text(encoding="utf-8")
+        cls.archive_body = function_body(cls.content, "archive_current_runtime")
+
+    def test_token_scan_precedes_every_archive_destination_mutation(self) -> None:
+        runtime_scan = self.archive_body.index(
+            'runtime_assert_tree_has_no_auth_token "$RUNTIME_ROOT"'
+        )
+        legacy_scan = self.archive_body.index(
+            'runtime_assert_tree_has_no_auth_token "$LEGACY_DATA_ROOT"'
+        )
+        choose_destination = self.archive_body.index("choose_archive_path")
+        self.assertLess(runtime_scan, choose_destination)
+        self.assertLess(legacy_scan, choose_destination)
+        self.assertLess(
+            self.archive_body.index('ARCHIVE_RESULT="failed"'),
+            runtime_scan,
+        )
+        self.assertGreater(
+            self.archive_body.index('ARCHIVE_RESULT="succeeded"'),
+            self.archive_body.index('mv --no-clobber -T'),
+        )
+
+    def test_script_ends_at_the_single_production_entrypoint(self) -> None:
+        self.assertTrue(self.content.rstrip().endswith('main "$@"'))
 
 class FailedFlowCleanupContractTests(unittest.TestCase):
     @classmethod
@@ -142,6 +193,14 @@ class FailedFlowCleanupContractTests(unittest.TestCase):
         first_agent_stop = self.main_body.index("if ! stop_agent_container; then")
         self.assertLess(token_load, cleanup_guard)
         self.assertLess(cleanup_guard, first_agent_stop)
+
+    def test_forced_login_failure_preserves_safe_stage_error(self) -> None:
+        forced_login = self.main_body.index("if ! run_forced_login; then")
+        next_phase = self.main_body.index(
+            'FLOW_PHASE="verify_wechat_process"', forced_login
+        )
+        failure_block = self.main_body[forced_login:next_phase]
+        self.assertIn('error "$LAST_ERROR"', failure_block)
 
 
 class WeChatProcessIdentityContractTests(unittest.TestCase):

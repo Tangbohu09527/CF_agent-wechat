@@ -5,17 +5,23 @@ set -euo pipefail
 : "${CF_AUDIT_REAL_SUDO:?}"
 
 sudo_arguments=("$@")
-if [ "${sudo_arguments[0]:-}" = "--" ]; then
-  sudo_arguments=("${sudo_arguments[@]:1}")
-fi
 
 docker_subcommand=""
+gateway_operation=""
 docker_arguments=()
 python_or_pip=0
 token_reader=0
+validation=0
+noninteractive=0
 for argument_index in "${!sudo_arguments[@]}"; do
   argument="${sudo_arguments[$argument_index]}"
   case "$argument" in
+    -v) validation=1 ;;
+    -n) noninteractive=1 ;;
+    /opt/cf-agent-gateway/deploy/wechat-runtime-control)
+      gateway_operation="${sudo_arguments[argument_index + 1]:-unknown}"
+      break
+      ;;
     docker|*/docker)
       docker_offset=$((argument_index + 1))
       docker_arguments=("${sudo_arguments[@]:docker_offset}")
@@ -34,25 +40,49 @@ for argument in "${sudo_arguments[@]}"; do
   esac
 done
 
-if [ "$python_or_pip" -eq 1 ]; then
+if [ "$validation" -eq 1 ]; then
+  kind="validate"
+elif [ "$python_or_pip" -eq 1 ]; then
   kind="python-pip"
 elif [ "$token_reader" -eq 1 ]; then
   kind="token-reader"
+elif [ -n "$gateway_operation" ]; then
+  kind="gateway-controller-${gateway_operation}"
 elif [ -n "$docker_subcommand" ]; then
   case "$docker_subcommand" in
-    info|compose|exec|inspect) kind="docker-$docker_subcommand" ;;
+    context|info|compose|exec|inspect) kind="docker-$docker_subcommand" ;;
     *) kind="docker-other" ;;
   esac
 else
   kind="other"
 fi
-printf 'sudo\t%s\n' "$kind" >> "$CF_AUDIT_LOG"
+if [ "$noninteractive" -eq 1 ]; then
+  mode="noninteractive"
+else
+  mode="interactive"
+fi
+printf 'sudo\t%s\t%s\n' "$kind" "$mode" >> "$CF_AUDIT_LOG"
 
 if [ "$kind" = "python-pip" ]; then
   exit 97
 fi
+if [ "$kind" != "validate" ] && [ "$noninteractive" -ne 1 ]; then
+  printf '%s\n' 'operational sudo must use -n after sudo -v' >&2
+  exit 96
+fi
 if [ "${CF_AUDIT_DOCKER_RUNTIME_MOCK:-0}" = "1" ] &&
   [ -n "$docker_subcommand" ]; then
-  exec env CF_AUDIT_DOCKER_VIA_SUDO=1 "${sudo_arguments[@]}"
+  mock_arguments=("${sudo_arguments[@]}")
+  while [ "${#mock_arguments[@]}" -gt 0 ]; do
+    case "${mock_arguments[0]}" in
+      -n|-v) mock_arguments=("${mock_arguments[@]:1}") ;;
+      --)
+        mock_arguments=("${mock_arguments[@]:1}")
+        break
+        ;;
+      *) break ;;
+    esac
+  done
+  exec env CF_AUDIT_DOCKER_VIA_SUDO=1 "${mock_arguments[@]}"
 fi
 exec "$CF_AUDIT_REAL_SUDO" "$@"

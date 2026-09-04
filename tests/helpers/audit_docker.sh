@@ -14,8 +14,13 @@ require_process_contract_fragment() {
   esac
 }
 
-if [ "${1:-}" = "inspect" ]; then
-  printf 'docker\tinspect\n' >> "$CF_AUDIT_LOG"
+if [ -n "${1:-}" ]; then
+  if [ "${CF_AUDIT_DOCKER_VIA_SUDO:-0}" = "1" ]; then
+    audit_category="docker-sudo"
+  else
+    audit_category="docker"
+  fi
+  printf '%s\t%s\n' "$audit_category" "$1" >> "$CF_AUDIT_LOG"
   if [ "${CF_AUDIT_DOCKER_MODE:-}" = "nonpermission" ]; then
     printf 'Error: No such object\n' >&2
     exit 1
@@ -24,7 +29,7 @@ fi
 
 if [ "${CF_AUDIT_DOCKER_RUNTIME_MOCK:-}" = "1" ]; then
   case "${1:-}" in
-    info|compose|exec|inspect)
+    context|info|compose|exec|inspect)
       if [ "${CF_AUDIT_DOCKER_VIA_SUDO:-0}" != "1" ]; then
         printf '%s\n' \
           'permission denied while connecting to docker.sock' >&2
@@ -35,6 +40,19 @@ if [ "${CF_AUDIT_DOCKER_RUNTIME_MOCK:-}" = "1" ]; then
 
   case "${1:-}" in
     info)
+      if [[ " $* " == *LiveRestoreEnabled* ]]; then
+        printf '%s\n' "${CF_AUDIT_DOCKER_LIVE_RESTORE:-false}"
+      elif printf '%s\n' "$@" | grep -q -- '--format'; then
+        printf '%s\n' '["name=seccomp,profile=default","name=cgroupns"]'
+      fi
+      exit 0
+      ;;
+    context)
+      case "${2:-}" in
+        show) printf '%s\n' 'default' ;;
+        inspect) printf '%s\n' 'unix:///var/run/docker.sock' ;;
+        *) exit 64 ;;
+      esac
       exit 0
       ;;
     compose)
@@ -100,15 +118,6 @@ if [ "${CF_AUDIT_DOCKER_RUNTIME_MOCK:-}" = "1" ]; then
           esac
           exit 0
           ;;
-        wechat-worker)
-          [ "$compose_command" = "ps" ] || exit 64
-          if [ "$compose_env_file" != "${CF_AUDIT_GATEWAY_ENV_FILE:?}" ]; then
-            printf '%s\n' 'Gateway env-file argument mismatch' >&2
-            exit 67
-          fi
-          printf 'runtime-fixture-%s\n' "$service"
-          exit 0
-          ;;
         *)
           printf '%s\n' 'unexpected runtime Compose service' >&2
           exit 65
@@ -126,7 +135,9 @@ if [ "${CF_AUDIT_DOCKER_RUNTIME_MOCK:-}" = "1" ]; then
       exit 0
       ;;
     inspect)
-      if printf '%s\n' "$@" | grep -q '{{.State.Running}}'; then
+      if printf '%s\n' "$@" | grep -q 'Health.Status'; then
+        printf '%s\n' 'healthy'
+      elif printf '%s\n' "$@" | grep -q '{{.State.Running}}'; then
         printf '%s\n' 'true'
       else
         runtime_root="${CF_AGENT_WECHAT_RUNTIME_ROOT:-/srv/storage/cf-agent-wechat/runtime}"

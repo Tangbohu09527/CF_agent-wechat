@@ -1,87 +1,154 @@
-name: Login management permissions
+name: Forced fresh QR production hardening
 
 on:
   push:
-    paths:
-      - ".github/workflows/login-management-permissions.yml"
-      - "docker/compose.cfserver.yaml"
-      - "scripts/**"
-      - "tests/**"
   pull_request:
-    paths:
-      - ".github/workflows/login-management-permissions.yml"
-      - "docker/compose.cfserver.yaml"
-      - "scripts/**"
-      - "tests/**"
   workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
-  forced-qr-runtime:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v4
-      - name: Check Bash syntax
-        run: >-
-          bash -n
-          scripts/common.sh
-          scripts/qr-runtime-common.sh
-          scripts/login.sh
-          scripts/status.sh
-          scripts/start-qr-login.sh
-          scripts/stop-qr-runtime.sh
-          tests/helpers/audit_docker.sh
-          tests/helpers/audit_sudo.sh
-          tests/helpers/mock_docker.sh
-          tests/helpers/mock_sudo.sh
-          tests/helpers/mock_date.sh
-          tests/helpers/mock_login_python.sh
-          tests/integration/login_management_permissions.sh
-      - name: Run ShellCheck when available
-        shell: bash
-        run: |
-          if command -v shellcheck >/dev/null 2>&1; then
-            cd scripts
-            shellcheck --external-sources \
-              common.sh \
-              qr-runtime-common.sh \
-              login.sh \
-              status.sh \
-              start-qr-login.sh \
-              stop-qr-runtime.sh
-          else
-            echo "ShellCheck is not available on this runner."
-          fi
-      - name: Run dependency-free unit tests
-        run: python3 -m unittest discover -s tests/unit -p "test_*.py" -v
-      - name: Run isolated forced-QR lifecycle tests
-        run: python3 tests/integration/test_qr_runtime.py
-      - name: Parse production Compose configuration
-        shell: bash
-        run: |
-          agent_env_file="$(mktemp)"
-          trap 'rm -f "$agent_env_file"' EXIT
-          chmod 600 "$agent_env_file"
-          printf '%s\n' \
-            'AGENT_WECHAT_IMAGE=ghcr.io/example/agent-wechat@sha256:0000000000000000000000000000000000000000000000000000000000000000' \
-            'AGENT_WECHAT_BIND_IP=127.0.0.1' > "$agent_env_file"
-          docker compose \
-            --env-file "$agent_env_file" \
-            --project-directory "$GITHUB_WORKSPACE" \
-            -f "$GITHUB_WORKSPACE/docker/compose.cfserver.yaml" \
-            config --quiet
-
-  linux-permissions:
+  static-unit-lifecycle:
+    name: Static, unit, and forced QR lifecycle
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install required validation tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck python3-venv
+
+      - name: Check Bash syntax
+        shell: bash
+        run: |
+          mapfile -d '' shell_files < <(
+            find scripts tests docker -type f -name '*.sh' -print0
+          )
+          ((${#shell_files[@]} > 0))
+          bash -n "${shell_files[@]}"
+
+      - name: Run required ShellCheck
+        shell: bash
+        run: |
+          mapfile -d '' shell_files < <(
+            find scripts tests docker -type f -name '*.sh' -print0
+          )
+          shellcheck --severity=warning --external-sources -x \
+            "${shell_files[@]}"
+
+      - name: Compile Python sources
+        run: python3 -m compileall -q scripts tests
+
+      - name: Run dependency-free unit and QR tests
+        run: python3 -m unittest discover -s tests/unit -p "test_*.py" -v
+
+      - name: Run isolated forced fresh QR lifecycle tests
+        shell: bash
+        run: |
+          controller=/opt/cf-agent-gateway/deploy/wechat-runtime-control
+          storage=/srv/storage/cf-agent-wechat
+          cleanup_fixture() {
+            case "$storage" in
+              /srv/storage/cf-agent-wechat)
+                sudo rm -rf -- "$storage"
+                ;;
+            esac
+            sudo rm -f -- "$controller"
+            sudo rmdir /opt/cf-agent-gateway/deploy 2>/dev/null || true
+            sudo rmdir /opt/cf-agent-gateway 2>/dev/null || true
+          }
+          trap cleanup_fixture EXIT
+          if sudo test -e "$storage" || sudo test -L "$storage"; then
+            echo "fixed agent-wechat storage path is already occupied" >&2
+            exit 1
+          fi
+          if sudo test -e "$controller" || sudo test -L "$controller"; then
+            echo "fixed Gateway Runtime Controller path is already occupied" >&2
+            exit 1
+          fi
+          sudo install -d -o root -g root -m 755 \
+            /opt/cf-agent-gateway/deploy
+          sudo install -o root -g root -m 755 \
+            tests/helpers/mock_gateway_runtime_control.sh "$controller"
+          sudo python3 tests/integration/test_qr_runtime.py
+      - name: Run safe management environment tests
+        run: bash tests/integration/management_environment.sh
+
+      - name: Run API hard-timeout integration test
+        run: bash tests/integration/api_hard_timeout.sh
+
+      - name: Run repository hygiene unit tests
+        run: python3 -m unittest discover -s tests/static -p "test_*.py" -v
+
+      - name: Scan secrets, controls, UTF-8, Markdown, links, and CI policy
+        run: python3 tests/static/repository_hygiene.py
+
+      - name: Check committed whitespace
+        shell: bash
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          zero=0000000000000000000000000000000000000000
+          if [ -z "$BASE_SHA" ] || [ "$BASE_SHA" = "$zero" ] || \
+            ! git cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null; then
+            BASE_SHA="$(git rev-parse HEAD^)"
+          fi
+          git diff --check "$BASE_SHA" HEAD
+          git log --check --format='%H' "${BASE_SHA}..HEAD"
+
+  bootstrap:
+    name: Staged Bootstrap and Fake Docker
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Bootstrap prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-venv
+      - name: Run ordinary-user staged Bootstrap tests
+        env:
+          CF_REQUIRE_BOOTSTRAP_DEPLOYMENT_TEST: "1"
+        run: bash tests/deployment/bootstrap_cfserver.sh
+
+  linux-permissions:
+    name: Root and ordinary-user permissions
+    runs-on: ubuntu-24.04
+    timeout-minutes: 18
+    steps:
+      - uses: actions/checkout@v4
       - name: Install venv support
-        run: sudo apt-get update && sudo apt-get install -y python3-venv
-      - name: Run root and ordinary-user integration test
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-venv
+      - name: Run root-only Token and Docker socket fallback tests
         run: >-
           sudo env GITHUB_ACTIONS=true CF_AGENT_WECHAT_PERMISSION_TEST=1
           bash tests/integration/login_management_permissions.sh
+
+  compose-render:
+    name: Real production Compose render
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - name: Render and attest production Compose
+        env:
+          CF_REQUIRE_DOCKER_COMPOSE_CONFIG: "1"
+        run: bash tests/deployment/validate_compose_config.sh
+
+  docker-restart-no:
+    name: Real Docker restart=no lifecycle
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify exits and daemon initialization never restore Agent
+        run: >-
+          sudo env GITHUB_ACTIONS=true CF_AGENT_WECHAT_RESTART_NO_TEST=1
+          bash tests/integration/docker_restart_no.sh

@@ -187,15 +187,34 @@ class MockHttpHandler(http.server.BaseHTTPRequestHandler):
             self.respond(200, {"messages": []})
 
     def do_POST(self) -> None:
-        if self.path != "/api/status/login":
+        request = urlsplit(self.path)
+        if request.path != "/api/status/login":
             self.respond(404, {"error": "not found"})
             return
         if not self.authorized():
             self.respond(401, {"error": "unauthorized"})
             return
+        query = parse_qs(request.query)
+        if query.get("newAccount") != ["true"]:
+            self.respond(400, {"error": "fresh login requires newAccount=true"})
+            return
 
-        self.mock.record("POST /api/status/login")
-        self.respond(200, {"success": False, "state": {"status": "qr_pending"}})
+        self.mock.record("POST /api/status/login newAccount=true")
+        mode = str(self.mock.setting("login_request_mode", "pending"))
+        if mode == "http_error":
+            self.respond(503, {"error": "fixture failure"})
+        elif mode == "api_error":
+            self.respond(200, {"success": False, "error": "fixture failure"})
+        elif mode == "invalid":
+            self.respond_bytes(200, b"not-json", "application/json")
+        elif mode == "rejected":
+            self.respond(200, {"success": False, "state": {"status": "failed"}})
+        elif mode == "success":
+            self.respond(200, {"success": True})
+        else:
+            self.respond(
+                200, {"success": False, "state": {"status": "qr_pending"}}
+            )
 
 
 def websocket_frame(payload: str) -> bytes:
