@@ -405,6 +405,42 @@ def main() -> None:
     check(not (EXTERNAL_STATE / "mutations.log").read_bytes(), "dry-run mutated Docker")
     passed("ordinary-user start/stop dry-runs preserve Bootstrap-only deployment state")
 
+    entrypoints = (
+        ("start", "start-qr-login.sh", ["--dry-run"]),
+        ("stop", "stop-qr-runtime.sh", ["--dry-run"]),
+        ("status", "status.sh", []),
+        ("bootstrap", "bootstrap-cfserver.sh", []),
+    )
+    for denial in ("no-sudo", "sudo-denied", "invalid-contract"):
+        data_before = snapshot()
+        docker_before = (EXTERNAL_STATE / "audit.log").read_bytes()
+        gate_before = controller_snapshot()[1]
+        if denial == "no-sudo":
+            SUDOERS.unlink()
+        elif denial == "sudo-denied":
+            policy("NOPASSWD: !ALL")
+        else:
+            install_controller("#!/bin/sh\n" + "printf '%s\\n' '{invalid-json'\n")
+        for label, filename, args in entrypoints:
+            execute(denial + "-" + label, ["/bin/bash", str(APP / "scripts" / filename), *args], 1)
+            check(snapshot() == data_before, denial + "-" + label + " changed deployment state")
+            check((EXTERNAL_STATE / "audit.log").read_bytes() == docker_before,
+                  denial + "-" + label + " called Docker after failed authorization/contract")
+            check(controller_snapshot()[1] == gate_before,
+                  denial + "-" + label + " changed Controller gate")
+        policy()
+        install_controller(mock_controller)
+    passed("all start/stop/status/Bootstrap callers fail before Docker or lifecycle side effects")
+
+    # Environment claims may not widen the accepted owner of a protected file.
+    os.chown(ENV, 1102, 1102)
+    for label, filename, args in entrypoints:
+        execute("spoofed-owner-" + label, ["/bin/bash", str(APP / "scripts" / filename), *args], 1,
+                extra={"SUDO_UID": "1102", "SUDO_GID": "1102", "SUDO_USER": "deployadmin"})
+    os.chown(ENV, 0, 0)
+    check(snapshot() == data_before, "forged sudo identity changed deployment state")
+    passed("caller-provided SUDO_UID/SUDO_USER do not make another owner's dotenv acceptable")
+
     # A real controlled terminal and real venv; deliberate unhealthy Docker ends
     # startup after official create_fresh_runtime and before QR/network login.
     execute("fresh-start-health-failure", ["/bin/bash", str(APP / "scripts/start-qr-login.sh")],
@@ -434,6 +470,14 @@ def main() -> None:
     check((EXTERNAL_STATE / "mutations.log").read_bytes() == docker_before,
           "existing-runtime dry-run changed Docker")
     passed("formal fresh start uses service UID 1000; manager UID 1101 dry-run preserves runtime")
+
+    execute("ignored-service-identity-environment",
+            ["/bin/bash", str(APP / "scripts/start-qr-login.sh"), "--dry-run"],
+            extra={"CF_AGENT_WECHAT_RUNTIME_UID": "0", "CF_AGENT_WECHAT_RUNTIME_GID": "0",
+                   "CF_AGENT_WECHAT_RUNTIME_MODE": "777", "SUDO_UID": "0", "SUDO_USER": "root",
+                   "GATEWAY_RUNTIME_CONTROL": "/tmp/unapproved-controller"})
+    check(snapshot() == before, "process environment changed approved service identity or runtime")
+    passed("process UID/GID/mode, Controller-path, and sudo-owner overrides are ignored")
 
     for running, word in (("0", "false"), ("1", "true")):
         write(STATE / "gateway_running", running)

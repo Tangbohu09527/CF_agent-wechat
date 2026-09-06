@@ -129,6 +129,7 @@ install -o root -g root -m 755 \
   "${REPO_ROOT}/tests/helpers/audit_docker.sh" "${AUDIT_BIN}/docker"
 install -o root -g root -m 755 \
   "${REPO_ROOT}/tests/helpers/audit_sudo.sh" "${AUDIT_BIN}/sudo"
+install -d -o root -g root -m 750 /opt/cf-agent-gateway
 install -d -o root -g root -m 755 /opt/cf-agent-gateway/deploy
 install -o root -g root -m 755 \
   "${REPO_ROOT}/tests/helpers/mock_gateway_runtime_control.sh" \
@@ -565,8 +566,8 @@ run_gateway_library_as contract >/dev/null ||
   fail "ordinary user could not validate Runtime Contract v1"
 [ "$(controller_count 'gateway controller contract')" -eq 1 ] ||
   fail "contract operation was not recorded exactly once"
-assert_no_sudo_calls "ordinary-user Controller contract validation"
-printf 'PASS ordinary user validates fixed Runtime Contract v1 directly\n'
+assert_sudo_contract "ordinary-user Controller contract validation"
+printf 'PASS ordinary user validates fixed Runtime Contract v1 through authorized sudo\n'
 
 reset_audit
 run_gateway_library_as stop >/dev/null ||

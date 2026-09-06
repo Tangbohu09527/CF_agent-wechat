@@ -49,6 +49,11 @@ jobs:
       - name: Run dependency-free unit and QR tests
         run: python3 -m unittest discover -s tests/unit -p "test_*.py" -v
 
+      - name: Prepare protected Controller fixture parent
+        run: |
+          sudo stat -c 'original_ci_parent=%n metadata=%u:%g:%a' / /opt
+          sudo chown root:root /opt
+          sudo chmod 755 /opt
       - name: Run isolated forced fresh QR lifecycle tests
         shell: bash
         run: |
@@ -113,6 +118,11 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y python3-venv
+      - name: Prepare protected Controller fixture parent
+        run: |
+          sudo stat -c 'original_ci_parent=%n metadata=%u:%g:%a' / /opt
+          sudo chown root:root /opt
+          sudo chmod 755 /opt
       - name: Run ordinary-user staged Bootstrap tests
         env:
           CF_REQUIRE_BOOTSTRAP_DEPLOYMENT_TEST: "1"
@@ -128,6 +138,11 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y python3-venv
+      - name: Prepare protected Controller fixture parent
+        run: |
+          sudo stat -c 'original_ci_parent=%n metadata=%u:%g:%a' / /opt
+          sudo chown root:root /opt
+          sudo chmod 755 /opt
       - name: Run root-only Token and Docker socket fallback tests
         run: >-
           sudo env GITHUB_ACTIONS=true CF_AGENT_WECHAT_PERMISSION_TEST=1
