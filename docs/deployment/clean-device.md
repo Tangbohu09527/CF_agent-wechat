@@ -217,6 +217,11 @@ PY
 
 ## 验收记录和旧设备替换
 
+仓库验收入口为 [`tests/deployment/clean_host_prepare.sh`](../../tests/deployment/clean_host_prepare.sh)，
+由 [Debian 13 CI](../../.github/workflows/clean-host-debian13.yml) 在一次性 Debian 容器运行。
+它实际执行包/账户安装、GitHub 固定提交 checkout、自有 Docker daemon、镜像身份和
+configure/venv；没有用容器结果替代宿主 systemd、Bootstrap 全栈或 reboot。
+
 每次报告必须独立填写 A/B/C，附测试日志/CI 链接、输入 SHA 和依赖记录：
 
 - A：仓库修复和自动化权限/生命周期回归；记录修复前失败、修复后通过。

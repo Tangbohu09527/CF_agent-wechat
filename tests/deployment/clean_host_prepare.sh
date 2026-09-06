@@ -133,7 +133,7 @@ dockerd --host=unix:///var/run/docker.sock --storage-driver=vfs \
   --bridge=none --ip-forward=false --ip-masq=false > /tmp/cf-clean-host-dockerd.log 2>&1 &
 DAEMON_PID=$!
 daemon_ready=0
-for attempt in $(seq 1 60); do
+for _attempt in $(seq 1 60); do
   if /usr/bin/docker --context default info >/dev/null 2>&1; then
     daemon_ready=1
     break

@@ -15,12 +15,12 @@ concurrency:
 jobs:
   clean-host:
     name: Debian 13 packages, original checkout and configure
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:
       ACCEPTANCE_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
       CONTAINER_NAME: cf-wechat-clean-host-${{ github.run_id }}-${{ github.run_attempt }}
-      EVIDENCE_DIR: ${{ runner.temp }}/cf-wechat-clean-host-evidence
+      EVIDENCE_DIR: /tmp/cf-wechat-clean-host-evidence-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - name: Check out the exact candidate for the installer seed
         uses: actions/checkout@v4
