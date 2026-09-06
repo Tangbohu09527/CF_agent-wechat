@@ -44,10 +44,9 @@ class GatewayRuntimeContractTests(unittest.TestCase):
     def test_contract_validation_is_bounded_and_exact_v1(self) -> None:
         body = function_body(self.content, "gateway_validate_runtime_contract")
         for fragment in (
-            '[ -L "$GATEWAY_RUNTIME_CONTROL" ]',
-            '[ ! -f "$GATEWAY_RUNTIME_CONTROL" ]',
-            '[ ! -x "$GATEWAY_RUNTIME_CONTROL" ]',
-            'runtime_with_timeout "$COMPOSE_COMMAND_TIMEOUT"',
+            "runtime_authorize_sudo || return 1",
+            "gateway_controller_check_file runtime_with_timeout",
+            'runtime_with_timeout "$COMPOSE_COMMAND_TIMEOUT" --privileged',
             '"$GATEWAY_RUNTIME_CONTROL" contract',
             '"contract_version": 1',
             '"poll_worker_service": "worker"',
@@ -62,12 +61,27 @@ class GatewayRuntimeContractTests(unittest.TestCase):
         ):
             self.assertIn(fragment, body)
 
+    def test_privilege_precedes_protected_controller_inspection(self) -> None:
+        body = function_body(self.content, "gateway_validate_runtime_contract")
+        self.assertLess(body.index("runtime_authorize_sudo"), body.index("gateway_controller_check_file"))
+        shared = (REPO_ROOT / "scripts/gateway-controller-common.sh").read_text(encoding="utf-8")
+        for fragment in (
+            'controller=/opt/cf-agent-gateway/deploy/wechat-runtime-control',
+            '[ ! -L "$directory" ]', '[ ! -L "$controller" ]',
+            '[ -f "$controller" ]', '[ -x "$controller" ]',
+            '[ "$owner:$group" = "0:0" ]', '07022', 'stat -c "%h"',
+        ):
+            self.assertIn(fragment, shared)
+        bootstrap = (REPO_ROOT / "scripts/bootstrap-cfserver.sh").read_text(encoding="utf-8")
+        self.assertIn("gateway_controller_check_file run_with_hard_timeout", bootstrap)
+        self.assertNotIn('MANAGEMENT_UID="${SUDO_UID:-', bootstrap)
+
     def test_control_operations_use_fixed_controller_and_timeout(self) -> None:
         body = function_body(self.content, "gateway_runtime_control")
         self.assertIn("stop|start|status", body)
         self.assertIn('runtime_with_timeout "$GATEWAY_CONTROL_TIMEOUT"', body)
-        self.assertEqual(body.count('"$GATEWAY_RUNTIME_CONTROL" "$@"'), 2)
-        self.assertIn('sudo -n -- "$GATEWAY_RUNTIME_CONTROL" "$@"', body)
+        self.assertEqual(body.count('"$GATEWAY_RUNTIME_CONTROL" "$@"'), 1)
+        self.assertIn('runtime_with_timeout "$GATEWAY_CONTROL_TIMEOUT" --privileged', body)
         self.assertIn("requires prior sudo authorization", body)
         self.assertIn("Unsupported Gateway Runtime Contract operation", body)
 

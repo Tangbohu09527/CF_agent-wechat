@@ -187,3 +187,40 @@ jobs:
         with:
           name: controller-baseline-debian13
           path: test-results/controller-baseline.log
+
+  controller-regression-debian13:
+    name: Debian 13 real users and Controller regression
+    runs-on: ubuntu-24.04
+    timeout-minutes: 18
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Verify authentic baseline and candidate with real Linux permissions
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p test-results/controller-details
+          docker pull --platform linux/amd64 debian:13-slim
+          docker image inspect debian:13-slim \
+            --format 'debian_image_id={{.Id}} debian_repo_digests={{json .RepoDigests}}' \
+            | tee test-results/controller-regression.log
+          docker run --rm --platform linux/amd64 \
+            -e CF_CONTROLLER_PERMISSION_DISPOSABLE=1 \
+            -e CF_CONTROLLER_PERMISSION_LOG_DIR=/logs \
+            -v "$PWD:/src:ro" -v "$PWD/test-results/controller-details:/logs" \
+            debian:13-slim /bin/bash -c '
+              set -euo pipefail
+              apt-get update
+              DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+                ca-certificates curl git sudo python3 python3-venv openssl systemd
+              bash /src/tests/integration/controller_real_permissions.sh --full
+            ' 2>&1 | tee -a test-results/controller-regression.log
+      - name: Preserve real-permissions evidence and simulated-behavior logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: controller-regression-debian13
+          path: |
+            test-results/controller-regression.log
+            test-results/controller-details

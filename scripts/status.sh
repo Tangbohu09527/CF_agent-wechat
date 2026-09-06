@@ -152,7 +152,9 @@ main() {
     [ -n "$initial_wechat_identity" ]; then
     process_status="running"
   fi
-  runtime_mode="$(detect_runtime_mode)"
+  if [ "$docker_ok" -eq 1 ]; then
+    runtime_mode="$(detect_runtime_mode)"
+  fi
 
   if [ "$configuration_ok" -eq 1 ]; then
     if ! load_auth_token; then

@@ -19,7 +19,7 @@ pass() { printf 'PASS: %s\n' "$*"; }
 . /etc/os-release
 [ "$ID" = debian ] && [ "$VERSION_ID" = 13 ] || fail 'requires Debian 13'
 [ "$(dpkg --print-architecture)" = amd64 ] || fail 'requires amd64'
-[ "$MODE" = --baseline-only ] || fail 'unsupported test mode'
+case "$MODE" in --baseline-only|--full) ;; *) fail 'unsupported test mode' ;; esac
 for path in "$TEST_ROOT" /opt/cf-agent-gateway /srv/storage/cf-agent-wechat; do
   [ ! -e "$path" ] && [ ! -L "$path" ] || fail "test path is occupied: $path"
 done
@@ -92,3 +92,13 @@ run_manager /usr/bin/sudo -n -- "$CONTROLLER" contract |
 [ ! -e /srv/storage/cf-agent-wechat ] || fail 'baseline proof created deployment state'
 pass 'same real user can inspect file and read authentic Gateway static contract using real sudo'
 pass 'baseline evidence complete; no installation, real QR, Hermes, or Gateway readiness claim'
+
+if [ "$MODE" = --full ]; then
+  preserve_logs() {
+    if [ -n "${CF_CONTROLLER_PERMISSION_LOG_DIR:-}" ] && [ -d "$TEST_ROOT/results" ]; then
+      cp -a "$TEST_ROOT/results/." "$CF_CONTROLLER_PERMISSION_LOG_DIR/"
+    fi
+  }
+  trap preserve_logs EXIT
+  python3 "$REPO_ROOT/tests/integration/controller_real_permissions.py"
+fi

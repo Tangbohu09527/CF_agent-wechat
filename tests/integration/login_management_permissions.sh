@@ -115,6 +115,7 @@ install -d -o root -g root -m 755 "${TEST_REPO}/scripts" "${TEST_REPO}/docker"
 install -o root -g root -m 755 \
   "${REPO_ROOT}/scripts/common.sh" \
   "${REPO_ROOT}/scripts/qr-runtime-common.sh" \
+  "${REPO_ROOT}/scripts/gateway-controller-common.sh" \
   "${REPO_ROOT}/scripts/status.sh" \
   "${REPO_ROOT}/scripts/login.sh" \
   "${REPO_ROOT}/scripts/start-qr-login.sh" \

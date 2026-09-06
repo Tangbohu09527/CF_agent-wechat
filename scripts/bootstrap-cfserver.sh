@@ -9,6 +9,8 @@ export PATH
 
 SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 DEFAULT_AGENT_ROOT="$(CDPATH='' cd -- "${SCRIPT_DIR}/.." && pwd -P)"
+# shellcheck source=gateway-controller-common.sh
+source "${SCRIPT_DIR}/gateway-controller-common.sh"
 
 AGENT_ROOT="${CF_AGENT_WECHAT_ROOT:-$DEFAULT_AGENT_ROOT}"
 AGENT_COMPOSE_FILE="${CF_AGENT_WECHAT_COMPOSE_FILE:-${AGENT_ROOT}/docker/compose.cfserver.yaml}"
@@ -23,9 +25,11 @@ LEGACY_HOME_ROOT="${STORAGE_ROOT}/wechat-home"
 
 GATEWAY_RUNTIME_CONTROL="/opt/cf-agent-gateway/deploy/wechat-runtime-control"
 
-RUNTIME_UID="${CF_AGENT_WECHAT_RUNTIME_UID:-1000}"
-RUNTIME_GID="${CF_AGENT_WECHAT_RUNTIME_GID:-1000}"
-RUNTIME_MODE="${CF_AGENT_WECHAT_RUNTIME_MODE:-700}"
+# Service identity is persistent deployment configuration, not the sudo caller.
+unset CF_AGENT_WECHAT_RUNTIME_UID CF_AGENT_WECHAT_RUNTIME_GID CF_AGENT_WECHAT_RUNTIME_MODE
+RUNTIME_UID=1000
+RUNTIME_GID=1000
+RUNTIME_MODE=700
 DOCKER_TIMEOUT="${CF_BOOTSTRAP_DOCKER_TIMEOUT:-30}"
 COMPOSE_TIMEOUT="${CF_BOOTSTRAP_COMPOSE_TIMEOUT:-120}"
 TIMEOUT_GRACE=2
@@ -44,7 +48,8 @@ OPENSSL_BIN="/usr/bin/openssl"
 TIMEOUT_BIN="/usr/bin/timeout"
 
 EFFECTIVE_UID="$(id -u)"
-MANAGEMENT_UID="${SUDO_UID:-$EFFECTIVE_UID}"
+# The actual caller is the management identity; never trust SUDO_UID/SUDO_USER.
+MANAGEMENT_UID="$EFFECTIVE_UID"
 SUDO_AUTHORIZED=0
 DOCKER_USE_SUDO=0
 NORMALIZED_PATH=""
@@ -136,13 +141,18 @@ path_is_within() {
 
 run_with_hard_timeout() {
   local seconds="$1" soft
+  local -a privilege=()
   shift
+  if [ "${1:-}" = --privileged ]; then
+    privilege=(privileged)
+    shift
+  fi
   if [ "$seconds" -le "$TIMEOUT_GRACE" ]; then
-    "$TIMEOUT_BIN" --signal=KILL "${seconds}s" "$@"
+    "${privilege[@]}" "$TIMEOUT_BIN" --signal=KILL "${seconds}s" "$@"
     return
   fi
   soft=$((seconds - TIMEOUT_GRACE))
-  "$TIMEOUT_BIN" --signal=TERM --kill-after="${TIMEOUT_GRACE}s" "${soft}s" "$@"
+  "${privilege[@]}" "$TIMEOUT_BIN" --signal=TERM --kill-after="${TIMEOUT_GRACE}s" "${soft}s" "$@"
 }
 
 authorize_privilege() {
@@ -400,12 +410,11 @@ proxy_is_safe() {
 validate_gateway_runtime_contract() {
   local contract_json
 
-  if [ -L "$GATEWAY_RUNTIME_CONTROL" ] ||
-    [ ! -f "$GATEWAY_RUNTIME_CONTROL" ] ||
-    [ ! -x "$GATEWAY_RUNTIME_CONTROL" ]; then
-    die "Gateway Runtime Contract controller is unavailable at the fixed path"
+  if ! gateway_controller_check_file run_with_hard_timeout \
+    "$COMPOSE_TIMEOUT" --privileged 2>/dev/null; then
+    die "Gateway Runtime Contract controller is unavailable or unsafe at the fixed path"
   fi
-  contract_json="$(run_with_hard_timeout "$COMPOSE_TIMEOUT" \
+  contract_json="$(run_with_hard_timeout "$COMPOSE_TIMEOUT" --privileged \
     "$GATEWAY_RUNTIME_CONTROL" contract 2>/dev/null)" ||
     die "Gateway Runtime Contract v1 could not be read"
   [ "${#contract_json}" -le 65536 ] ||
@@ -542,6 +551,16 @@ parse_agent_environment() {
       CF_AGENT_WECHAT_STORAGE_ROOT) ENV_STORAGE_ROOT="$value" ;;
       CF_AGENT_WECHAT_RUNTIME_ROOT) ENV_RUNTIME_ROOT="$value" ;;
       CF_AGENT_WECHAT_ARCHIVE_ROOT) ENV_ARCHIVE_ROOT="$value" ;;
+      CF_AGENT_WECHAT_RUNTIME_UID|CF_AGENT_WECHAT_RUNTIME_GID)
+        [[ "$value" =~ ^(0|[1-9][0-9]{0,9})$ ]] && [ "$value" -le 2147483647 ] ||
+          die "$key must be a valid numeric service identity"
+        if [ "$key" = CF_AGENT_WECHAT_RUNTIME_UID ]; then RUNTIME_UID="$value"; else RUNTIME_GID="$value"; fi
+        ;;
+      CF_AGENT_WECHAT_RUNTIME_MODE)
+        validate_mode "$key" "$value"
+        (( (8#$value & 8#022) == 0 )) || die "runtime mode must not grant group/other write"
+        RUNTIME_MODE="$value"
+        ;;
       PROXY)
         proxy_is_safe "$value" ||
           die "PROXY must be unauthenticated and contain only an approved scheme, host, and port"
@@ -972,8 +991,8 @@ main() {
   configure_external_tools
   reject_environment_overrides
   validate_and_normalize_paths
-  validate_gateway_runtime_contract
   authorize_privilege
+  validate_gateway_runtime_contract
   validate_external_tool_integrity
   validate_docker_socket
   validate_input_path_chains

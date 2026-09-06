@@ -129,7 +129,7 @@ case "${1:-}" in
   inspect)
     record "docker inspect"
     if printf '%s\n' "$@" | grep -q 'HostConfig.RestartPolicy.Name'; then
-      printf '/agent-wechat-fixture|ghcr.io/example/agent-wechat@sha256:%064d|' 0
+      printf '/%s|ghcr.io/example/agent-wechat@sha256:%064d|' "${MOCK_AGENT_CONTAINER_NAME:-agent-wechat-fixture}" 0
       printf 'sha256:%064d|no\n' 1
       exit 0
     fi
@@ -210,7 +210,7 @@ case "$command_name" in
       [ -n "$published_port" ] || exit 68
       printf '{"name":"cf-agent-wechat","services":{"agent-wechat":{'
       printf '"image":"ghcr.io/example/agent-wechat@sha256:%064d",' 0
-      printf '"container_name":"agent-wechat-fixture",'
+      printf '"container_name":"%s",' "${MOCK_AGENT_CONTAINER_NAME:-agent-wechat-fixture}"
       printf '"restart":"no",'
       printf '"ports":[{"target":6174,"published":"%s","host_ip":"127.0.0.1","protocol":"tcp"}],' \
         "$published_port"
