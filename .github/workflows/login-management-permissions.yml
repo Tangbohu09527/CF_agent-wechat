@@ -178,7 +178,7 @@ jobs:
               set -euo pipefail
               apt-get update
               DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-                ca-certificates git sudo python3
+                ca-certificates curl git sudo python3
               bash /src/tests/integration/controller_real_permissions.sh --baseline-only
             ' 2>&1 | tee -a test-results/controller-baseline.log
       - name: Preserve original-defect evidence

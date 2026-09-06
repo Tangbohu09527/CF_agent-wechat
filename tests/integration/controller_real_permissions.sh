@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Disposable Debian 13 amd64 only. Identity, permissions, and sudo are real.
-# The Controller fixture substitutes external behavior, not file metadata.
+# Static contract uses the authentic fixed Gateway Controller source.
 set -euo pipefail
 
 BASELINE_SHA=69f07702b6ee16d8e9700b3a53d5ebbb8ee875f8
@@ -23,7 +23,7 @@ pass() { printf 'PASS: %s\n' "$*"; }
 for path in "$TEST_ROOT" /opt/cf-agent-gateway /srv/storage/cf-agent-wechat; do
   [ ! -e "$path" ] && [ ! -L "$path" ] || fail "test path is occupied: $path"
 done
-for tool in git python3 sudo runuser useradd visudo; do
+for tool in curl git python3 sudo runuser useradd visudo; do
   command -v "$tool" >/dev/null || fail "missing prerequisite: $tool"
 done
 
@@ -36,11 +36,14 @@ git -c "safe.directory=$REPO_ROOT" -C "$REPO_ROOT" archive "$BASELINE_SHA" scrip
   tar -x -C "$TEST_ROOT/baseline"
 install -d -o root -g root -m 750 /opt/cf-agent-gateway
 install -d -o root -g root -m 755 /opt/cf-agent-gateway/deploy
-install -o root -g root -m 755 \
-  "$REPO_ROOT/tests/helpers/mock_gateway_runtime_control.sh" "$CONTROLLER"
-STATE=/opt/cf-agent-gateway/deploy/.wechat-runtime-control-test-state
-install -d -o root -g root -m 700 "$STATE"
-touch "$STATE/controller.log" "$STATE/mutations.log"
+GATEWAY_SHA=4f13039b86c60bc94340edb5468f0102d62d2dff
+CONTROLLER_SHA256=c28d9a97157b7551d91b6ee8e29396fd6b7807670c85b470a0b522f7d4b0c7f6
+curl --fail --silent --show-error --location --connect-timeout 20 --max-time 90 \
+  "https://raw.githubusercontent.com/Tangbohu09527/CF_agent-gateway/$GATEWAY_SHA/deploy/wechat-runtime-control" \
+  --output "$TEST_ROOT/authentic-controller"
+printf '%s  %s\n' "$CONTROLLER_SHA256" "$TEST_ROOT/authentic-controller" | sha256sum -c -
+install -o root -g root -m 755 "$TEST_ROOT/authentic-controller" "$CONTROLLER"
+printf 'gateway_git_commit=%s controller_sha256=%s\n' "$GATEWAY_SHA" "$CONTROLLER_SHA256"
 
 run_manager() {
   runuser -u "$MANAGER" -- env -i HOME="/home/$MANAGER" \
@@ -76,7 +79,7 @@ if run_manager /bin/bash -c '
 fi
 grep -Fq 'Gateway Runtime Contract controller is unavailable at the fixed path.' "$OUTPUT" ||
   fail 'baseline did not reproduce the reported unavailable failure'
-[ ! -s "$STATE/controller.log" ] || fail 'baseline unexpectedly invoked Controller'
+[ ! -e /srv/storage/cf-agent-wechat ] || fail 'baseline created deployment state'
 cat "$OUTPUT"
 pass 'fixed original commit reproduces unavailable before any Controller invocation'
 
@@ -85,7 +88,7 @@ run_manager /usr/bin/sudo -n -- test -f "$CONTROLLER"
 run_manager /usr/bin/sudo -n -- test -x "$CONTROLLER"
 run_manager /usr/bin/sudo -n -- "$CONTROLLER" contract |
   python3 -c 'import json,sys; p=json.load(sys.stdin); assert type(p["contract_version"]) is int and p["contract_version"] == 1'
-[ ! -s "$STATE/mutations.log" ] || fail 'baseline proof changed lifecycle state'
+[ ! -e /opt/cf-agent-gateway/.env ] || fail 'static contract created Gateway configuration'
 [ ! -e /srv/storage/cf-agent-wechat ] || fail 'baseline proof created deployment state'
-pass 'same real user can inspect file and read static contract using authorized real sudo'
+pass 'same real user can inspect file and read authentic Gateway static contract using real sudo'
 pass 'baseline evidence complete; no installation, real QR, Hermes, or Gateway readiness claim'
