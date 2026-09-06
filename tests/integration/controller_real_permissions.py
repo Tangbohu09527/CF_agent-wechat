@@ -8,6 +8,7 @@ is installed. Bootstrap and fresh-start create their own deployment assets.
 from __future__ import annotations
 
 import errno
+import fcntl
 import hashlib
 import json
 import os
@@ -20,6 +21,7 @@ import stat
 import subprocess
 import sys
 import time
+import termios
 from pathlib import Path
 
 SOURCE = Path(__file__).resolve().parents[2]
@@ -107,8 +109,12 @@ def execute(label: str, args: list[str], expected: int | None = 0,
             cancel_password: bool = False) -> str:
     if terminal:
         master, slave = pty.openpty()
+        def controlling_terminal() -> None:
+            os.setsid()
+            fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+
         proc = subprocess.Popen(command(args, extra), stdin=slave, stdout=slave,
-                                stderr=slave, start_new_session=True)
+                                stderr=slave, preexec_fn=controlling_terminal)
         os.close(slave)
         chunks: list[bytes] = []
         deadline = time.monotonic() + 180
@@ -126,7 +132,7 @@ def execute(label: str, args: list[str], expected: int | None = 0,
                 chunks.append(chunk)
                 if cancel_password and b"password" in b"".join(chunks).lower():
                     # sudo reads an actual controlling-terminal password prompt.
-                    os.write(master, b"\n\n\n")
+                    os.write(master, b"\x03")
                     cancel_password = False
             if proc.poll() is not None:
                 break
@@ -325,12 +331,39 @@ def main() -> None:
         validate("contract-" + name, 1)
     install_controller("#!/bin/sh\nprintf 'private-error\\n' >&2\nexit 70\n")
     check("private-error" not in validate("contract-nonzero", 1), "Controller stderr escaped")
-    install_controller("#!/bin/sh\nexec /bin/sleep 300\n")
+    parent_pid = ROOT / "timeout-parent.pid"
+    child_pid = ROOT / "timeout-child.pid"
+    hard_timeout_script = (
+        "#!/bin/sh\ntrap '' TERM\n"
+        f"echo $$ > {shlex.quote(str(parent_pid))}\n"
+        "/bin/sleep 300 &\n"
+        f"echo $! > {shlex.quote(str(child_pid))}\nwait\n"
+    )
+
+    def assert_timeout_processes_terminated(label: str) -> None:
+        for pid_file in (parent_pid, child_pid):
+            check(pid_file.exists(), label + " did not actually launch root Controller process")
+            process_stat = Path("/proc") / pid_file.read_text().strip() / "stat"
+            if process_stat.exists():
+                # Container PID 1 can retain a killed orphan as a zombie; it must
+                # have stopped executing, even when PID 1 has not reaped it yet.
+                process_state = process_stat.read_text().rsplit(")", 1)[1].split()[0]
+                check(process_state == "Z", label + " left a root process executing")
+            pid_file.unlink()
+
+    install_controller(hard_timeout_script)
     started = time.monotonic()
-    validate("contract-timeout", 1)
+    validate("contract-hard-kill-timeout", 1)
     check(time.monotonic() - started < 7, "contract timeout exceeded bound")
+    assert_timeout_processes_terminated("contract timeout")
+    started = time.monotonic()
+    shell("lifecycle-hard-kill-timeout",
+          "runtime_authorize_sudo || exit 90; GATEWAY_CONTROL_TIMEOUT=1; "
+          "gateway_runtime_control stop", 1)
+    check(time.monotonic() - started < 6, "lifecycle timeout exceeded bound")
+    assert_timeout_processes_terminated("lifecycle timeout")
     install_controller()
-    passed("contract exact JSON fields/types/values, nonzero exit, output bound, and real timeout")
+    passed("contract JSON/types/values/nonzero/output bound; real hard-kill timeout terminates root parent and child")
 
     # Formal Bootstrap owns Token, management directory, and archive creation.
     BIN.mkdir()
@@ -410,6 +443,8 @@ def main() -> None:
         ("stop", "stop-qr-runtime.sh", ["--dry-run"]),
         ("status", "status.sh", []),
         ("bootstrap", "bootstrap-cfserver.sh", []),
+        ("fresh-start-live", "start-qr-login.sh", []),
+        ("stop-live", "stop-qr-runtime.sh", []),
     )
     for denial in ("no-sudo", "sudo-denied", "invalid-contract"):
         data_before = snapshot()
@@ -422,7 +457,8 @@ def main() -> None:
         else:
             install_controller("#!/bin/sh\n" + "printf '%s\\n' '{invalid-json'\n")
         for label, filename, args in entrypoints:
-            execute(denial + "-" + label, ["/bin/bash", str(APP / "scripts" / filename), *args], 1)
+            execute(denial + "-" + label, ["/bin/bash", str(APP / "scripts" / filename), *args], 1,
+                    terminal=label == "fresh-start-live", cancel_password=True)
             check(snapshot() == data_before, denial + "-" + label + " changed deployment state")
             check((EXTERNAL_STATE / "audit.log").read_bytes() == docker_before,
                   denial + "-" + label + " called Docker after failed authorization/contract")
@@ -436,7 +472,8 @@ def main() -> None:
     os.chown(ENV, 1102, 1102)
     for label, filename, args in entrypoints:
         execute("spoofed-owner-" + label, ["/bin/bash", str(APP / "scripts" / filename), *args], 1,
-                extra={"SUDO_UID": "1102", "SUDO_GID": "1102", "SUDO_USER": "deployadmin"})
+                extra={"SUDO_UID": "1102", "SUDO_GID": "1102", "SUDO_USER": "deployadmin"},
+                terminal=label == "fresh-start-live")
     os.chown(ENV, 0, 0)
     check(snapshot() == data_before, "forged sudo identity changed deployment state")
     passed("caller-provided SUDO_UID/SUDO_USER do not make another owner's dotenv acceptable")

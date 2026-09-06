@@ -670,7 +670,7 @@ MISSING_CONTROLLER_ERROR="$TEST_ROOT/controller-missing.error"
 if run_gateway_library_root contract > /dev/null 2> "$MISSING_CONTROLLER_ERROR"; then
   fail "missing fixed Controller unexpectedly passed validation"
 fi
-grep -Fq 'unavailable at the fixed path' "$MISSING_CONTROLLER_ERROR" ||
+grep -Fq 'unavailable or unsafe at the fixed path' "$MISSING_CONTROLLER_ERROR" ||
   fail "missing fixed Controller did not fail closed"
 restore_controller
 
@@ -685,7 +685,7 @@ SYMLINK_CONTROLLER_ERROR="$TEST_ROOT/controller-symlink.error"
 if run_gateway_library_root contract > /dev/null 2> "$SYMLINK_CONTROLLER_ERROR"; then
   fail "symlink fixed Controller unexpectedly passed validation"
 fi
-grep -Fq 'unavailable at the fixed path' "$SYMLINK_CONTROLLER_ERROR" ||
+grep -Fq 'unavailable or unsafe at the fixed path' "$SYMLINK_CONTROLLER_ERROR" ||
   fail "symlink fixed Controller did not fail closed"
 restore_controller
 assert_secret_permissions
