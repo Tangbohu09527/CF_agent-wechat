@@ -30,7 +30,9 @@ jobs:
             find scripts tests docker -type f -name '*.sh' -print0
           )
           ((${#shell_files[@]} > 0))
-          bash -n "${shell_files[@]}"
+          for shell_file in "${shell_files[@]}"; do
+            bash -n "$shell_file"
+          done
 
       - name: Run required ShellCheck
         shell: bash
@@ -152,3 +154,36 @@ jobs:
         run: >-
           sudo env GITHUB_ACTIONS=true CF_AGENT_WECHAT_RESTART_NO_TEST=1
           bash tests/integration/docker_restart_no.sh
+
+  controller-baseline-debian13:
+    name: Debian 13 real permissions - original defect reproduction
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Reproduce fixed original commit in clean Debian 13 amd64
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p test-results
+          docker pull --platform linux/amd64 debian:13-slim
+          docker image inspect debian:13-slim \
+            --format 'debian_image_id={{.Id}} debian_repo_digests={{json .RepoDigests}}' \
+            | tee test-results/controller-baseline.log
+          docker run --rm --platform linux/amd64 \
+            -e CF_CONTROLLER_PERMISSION_DISPOSABLE=1 \
+            -v "$PWD:/src:ro" debian:13-slim /bin/bash -c '
+              set -euo pipefail
+              apt-get update
+              DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+                ca-certificates git sudo python3
+              bash /src/tests/integration/controller_real_permissions.sh --baseline-only
+            ' 2>&1 | tee -a test-results/controller-baseline.log
+      - name: Preserve original-defect evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: controller-baseline-debian13
+          path: test-results/controller-baseline.log
