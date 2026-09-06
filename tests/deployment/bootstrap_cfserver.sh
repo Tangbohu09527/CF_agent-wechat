@@ -24,6 +24,7 @@ cleanup() {
   fi
   if [ "$CONTROLLER_CREATED" -eq 1 ]; then
     sudo -n -- rm -f -- "$GATEWAY_RUNTIME_CONTROL" 2>/dev/null
+    sudo -n -- rm -f -- /opt/cf-agent-gateway/deploy/.wechat-runtime-control-test-state 2>/dev/null
     sudo -n -- rmdir /opt/cf-agent-gateway/deploy 2>/dev/null
     sudo -n -- rmdir /opt/cf-agent-gateway 2>/dev/null
   fi
@@ -136,6 +137,7 @@ done
   skip "Bootstrap deployment test requires an unused fixed storage path"
 [ ! -e "$GATEWAY_RUNTIME_CONTROL" ] && [ ! -L "$GATEWAY_RUNTIME_CONTROL" ] ||
   skip "Bootstrap deployment test requires an unused fixed Controller path"
+sudo -n -- install -d -o root -g root -m 750 /opt/cf-agent-gateway
 sudo -n -- install -d -o root -g root -m 755 /opt/cf-agent-gateway/deploy
 sudo -n -- install -o root -g root -m 755 \
   "$REPO_ROOT/tests/helpers/mock_gateway_runtime_control.sh" \
@@ -167,6 +169,12 @@ prepare_fixture() {
     "$MOCK_STATE" "$SCENARIO_ROOT/tmp"
   : > "$MOCK_STATE/controller.log"
   : > "$MOCK_STATE/controller-mutations.log"
+  # sudo deliberately drops caller environment. Only the external-behavior
+  # fixture state follows each scenario; Controller itself remains root-owned
+  # and non-symlink at the protected fixed production path.
+  sudo -n -- ln -sfn -- "$MOCK_STATE" \
+    /opt/cf-agent-gateway/deploy/.wechat-runtime-control-test-state
+  ln -s -- controller-mutations.log "$MOCK_STATE/mutations.log"
   install -m 644 -- "$REPO_ROOT/docker/compose.cfserver.yaml" "$AGENT_COMPOSE"
   install -m 755 -- "$REPO_ROOT/tests/helpers/mock_bootstrap_docker.sh" \
     "$MOCK_BIN/docker"
@@ -192,6 +200,9 @@ PY
       "CF_AGENT_WECHAT_STORAGE_ROOT=$STORAGE_ROOT" \
       "CF_AGENT_WECHAT_RUNTIME_ROOT=$RUNTIME_ROOT" \
       "CF_AGENT_WECHAT_ARCHIVE_ROOT=$ARCHIVE_ROOT" \
+      "CF_AGENT_WECHAT_RUNTIME_UID=$CURRENT_UID" \
+      "CF_AGENT_WECHAT_RUNTIME_GID=$CURRENT_GID" \
+      'CF_AGENT_WECHAT_RUNTIME_MODE=700' \
       'PROXY=' \
       'RUST_LOG=info'
   } > "$AGENT_ENV"

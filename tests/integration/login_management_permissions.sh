@@ -115,6 +115,7 @@ install -d -o root -g root -m 755 "${TEST_REPO}/scripts" "${TEST_REPO}/docker"
 install -o root -g root -m 755 \
   "${REPO_ROOT}/scripts/common.sh" \
   "${REPO_ROOT}/scripts/qr-runtime-common.sh" \
+  "${REPO_ROOT}/scripts/gateway-controller-common.sh" \
   "${REPO_ROOT}/scripts/status.sh" \
   "${REPO_ROOT}/scripts/login.sh" \
   "${REPO_ROOT}/scripts/start-qr-login.sh" \
@@ -128,6 +129,7 @@ install -o root -g root -m 755 \
   "${REPO_ROOT}/tests/helpers/audit_docker.sh" "${AUDIT_BIN}/docker"
 install -o root -g root -m 755 \
   "${REPO_ROOT}/tests/helpers/audit_sudo.sh" "${AUDIT_BIN}/sudo"
+install -d -o root -g root -m 750 /opt/cf-agent-gateway
 install -d -o root -g root -m 755 /opt/cf-agent-gateway/deploy
 install -o root -g root -m 755 \
   "${REPO_ROOT}/tests/helpers/mock_gateway_runtime_control.sh" \
@@ -564,8 +566,8 @@ run_gateway_library_as contract >/dev/null ||
   fail "ordinary user could not validate Runtime Contract v1"
 [ "$(controller_count 'gateway controller contract')" -eq 1 ] ||
   fail "contract operation was not recorded exactly once"
-assert_no_sudo_calls "ordinary-user Controller contract validation"
-printf 'PASS ordinary user validates fixed Runtime Contract v1 directly\n'
+assert_sudo_contract "ordinary-user Controller contract validation"
+printf 'PASS ordinary user validates fixed Runtime Contract v1 through authorized sudo\n'
 
 reset_audit
 run_gateway_library_as stop >/dev/null ||
@@ -668,7 +670,7 @@ MISSING_CONTROLLER_ERROR="$TEST_ROOT/controller-missing.error"
 if run_gateway_library_root contract > /dev/null 2> "$MISSING_CONTROLLER_ERROR"; then
   fail "missing fixed Controller unexpectedly passed validation"
 fi
-grep -Fq 'unavailable at the fixed path' "$MISSING_CONTROLLER_ERROR" ||
+grep -Fq 'unavailable or unsafe at the fixed path' "$MISSING_CONTROLLER_ERROR" ||
   fail "missing fixed Controller did not fail closed"
 restore_controller
 
@@ -683,7 +685,7 @@ SYMLINK_CONTROLLER_ERROR="$TEST_ROOT/controller-symlink.error"
 if run_gateway_library_root contract > /dev/null 2> "$SYMLINK_CONTROLLER_ERROR"; then
   fail "symlink fixed Controller unexpectedly passed validation"
 fi
-grep -Fq 'unavailable at the fixed path' "$SYMLINK_CONTROLLER_ERROR" ||
+grep -Fq 'unavailable or unsafe at the fixed path' "$SYMLINK_CONTROLLER_ERROR" ||
   fail "symlink fixed Controller did not fail closed"
 restore_controller
 assert_secret_permissions

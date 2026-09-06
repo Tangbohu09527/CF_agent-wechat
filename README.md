@@ -39,7 +39,7 @@ Skills、ERP、RAG、OCR 和文件理解不属于本仓库。
 ## 生产入口
 
 ```text
-Bootstrap   sudo ./scripts/bootstrap-cfserver.sh   # 只准备，不上线
+Bootstrap   ./scripts/bootstrap-cfserver.sh        # 普通管理用户；只准备，不上线
 Fresh QR    ./scripts/start-qr-login.sh            # 唯一生产启动
 Stop        ./scripts/stop-qr-runtime.sh           # 停 Worker 和 Agent，保留数据
 Status      ./scripts/status.sh                    # 只读完整状态判定
@@ -88,6 +88,7 @@ chats/messages 可读或 Gateway 已放行。生产在线必须以 `./scripts/st
 
 - [文档索引](docs/README.md)
 - [当前生产状态](docs/production-status.md)
+- [干净 Debian 13 安装与验收](docs/deployment/clean-device.md)
 - [CFserver 生产 Runbook](docs/deployment/cfserver-production.md)
 - [forced-QR R2 生产验收记录](docs/validation/2026-09-03-forced-qr-r2-production.md)
 - [API 边界](docs/api.md)

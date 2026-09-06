@@ -1,14 +1,17 @@
 # 新设备 Bootstrap
 
 本文说明首次 CFserver 部署或部署输入变化后的基础准备。Bootstrap 不是登录流程、启动
-流程或 Session 恢复流程。
+流程或 Session 恢复流程。首次主机依赖、代码与配置安装见
+[干净 Debian 13 安装与验收](clean-device.md)。
 
 ## Result definition
 
 ~~~bash
 cd /opt/cf-agent-wechat
-sudo ./scripts/bootstrap-cfserver.sh
+./scripts/bootstrap-cfserver.sh
 ~~~
+
+入口由普通管理用户运行，在终端完成脚本请求的 sudo 授权；不要把整个流程改为 root。
 
 成功只表示：
 

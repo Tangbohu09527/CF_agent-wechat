@@ -1,0 +1,74 @@
+name: Clean host Debian 13 preparation
+
+on:
+  pull_request:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: clean-host-debian13-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  clean-host:
+    name: Debian 13 packages, original checkout and configure
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      ACCEPTANCE_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+      CONTAINER_NAME: cf-wechat-clean-host-${{ github.run_id }}-${{ github.run_attempt }}
+      EVIDENCE_DIR: /tmp/cf-wechat-clean-host-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - name: Check out the exact candidate for the installer seed
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+
+      - name: Check the new shell entrypoints separately
+        shell: bash
+        run: |
+          bash -n scripts/prepare-clean-host.sh
+          bash -n tests/deployment/clean_host_prepare.sh
+          shellcheck --severity=warning --external-sources -x scripts/prepare-clean-host.sh tests/deployment/clean_host_prepare.sh
+
+      - name: Record the pristine Debian 13 amd64 image
+        shell: bash
+        run: |
+          mkdir -p "$EVIDENCE_DIR"
+          docker pull --platform linux/amd64 debian:13-slim
+          docker image inspect debian:13-slim \
+            --format '{{json .RepoDigests}} {{.Id}} {{.Os}}/{{.Architecture}}' \
+            > "$EVIDENCE_DIR/debian-image.txt"
+
+      - name: Run the formal installer in an isolated clean Debian container
+        shell: bash
+        run: |
+          # This container has its own daemon/storage. No host Docker socket,
+          # user home, Token, Session, business data or GitHub credential is mounted.
+          docker run --name "$CONTAINER_NAME" --privileged --platform linux/amd64 \
+            --mount "type=bind,source=$GITHUB_WORKSPACE,target=/source,readonly" \
+            --mount "type=bind,source=$EVIDENCE_DIR,target=/evidence" \
+            --env "CF_CLEAN_HOST_COMMIT=$ACCEPTANCE_COMMIT" \
+            --env CF_CLEAN_HOST_DISPOSABLE=1 \
+            debian:13-slim bash /source/tests/deployment/clean_host_prepare.sh
+
+      - name: Upload preparation evidence with explicit acceptance limits
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: clean-host-debian13-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.EVIDENCE_DIR }}
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Remove only this job's disposable container
+        if: always()
+        shell: bash
+        run: |
+          if docker container inspect "$CONTAINER_NAME" >/dev/null 2>&1; then
+            docker rm --force "$CONTAINER_NAME" >/dev/null
+          fi

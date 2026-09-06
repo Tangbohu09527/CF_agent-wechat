@@ -4,6 +4,8 @@ set +x
 
 RUNTIME_SCRIPTS_DIR="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 RUNTIME_REPO_ROOT="$(CDPATH='' cd -- "${RUNTIME_SCRIPTS_DIR}/.." && pwd -P)"
+# shellcheck source=gateway-controller-common.sh
+source "${RUNTIME_SCRIPTS_DIR}/gateway-controller-common.sh"
 
 AGENT_COMPOSE_FILE="${CF_AGENT_WECHAT_COMPOSE_FILE:-${RUNTIME_REPO_ROOT}/docker/compose.cfserver.yaml}"
 AGENT_ENV_FILE="${CF_AGENT_WECHAT_ENV_FILE:-${RUNTIME_REPO_ROOT}/docker/.env}"
@@ -24,6 +26,7 @@ unset AGENT_WECHAT_IMAGE AGENT_WECHAT_BIND_IP AGENT_WECHAT_PORT
 unset AGENT_WECHAT_CONTAINER_NAME COMPOSE_PROJECT_NAME
 unset CF_AGENT_WECHAT_STORAGE_ROOT CF_AGENT_WECHAT_RUNTIME_ROOT
 unset CF_AGENT_WECHAT_ARCHIVE_ROOT CF_AGENT_WECHAT_TOKEN_FILE
+unset CF_AGENT_WECHAT_RUNTIME_UID CF_AGENT_WECHAT_RUNTIME_GID CF_AGENT_WECHAT_RUNTIME_MODE
 unset PROXY RUST_LOG
 # These endpoint globals are consumed by scripts that source this file.
 # shellcheck disable=SC2034
@@ -34,10 +37,10 @@ CONTAINER_NAME="cf-agent-wechat"
 
 # These globals are validated indirectly and consumed by start-qr-login.sh.
 # shellcheck disable=SC2034
-RUNTIME_DEFAULT_UID="${CF_AGENT_WECHAT_RUNTIME_UID:-1000}"
+RUNTIME_DEFAULT_UID=1000
 # shellcheck disable=SC2034
-RUNTIME_DEFAULT_GID="${CF_AGENT_WECHAT_RUNTIME_GID:-1000}"
-RUNTIME_DEFAULT_MODE="${CF_AGENT_WECHAT_RUNTIME_MODE:-700}"
+RUNTIME_DEFAULT_GID=1000
+RUNTIME_DEFAULT_MODE=700
 SERVER_READY_TIMEOUT="${SERVER_READY_TIMEOUT:-120}"
 WECHAT_READY_TIMEOUT="${WECHAT_READY_TIMEOUT:-120}"
 WECHAT_STABLE_SECONDS="${WECHAT_STABLE_SECONDS:-10}"
@@ -127,7 +130,7 @@ runtime_load_management_environment() {
       return 1
     fi
     case "$key" in
-      COMPOSE_PROJECT_NAME|CF_AGENT_WECHAT_STORAGE_ROOT|CF_AGENT_WECHAT_RUNTIME_ROOT|CF_AGENT_WECHAT_ARCHIVE_ROOT|AGENT_WECHAT_BIND_IP|AGENT_WECHAT_PORT|AGENT_WECHAT_CONTAINER_NAME|AGENT_WECHAT_IMAGE|PROXY|RUST_LOG) ;;
+      COMPOSE_PROJECT_NAME|CF_AGENT_WECHAT_STORAGE_ROOT|CF_AGENT_WECHAT_RUNTIME_ROOT|CF_AGENT_WECHAT_ARCHIVE_ROOT|CF_AGENT_WECHAT_RUNTIME_UID|CF_AGENT_WECHAT_RUNTIME_GID|CF_AGENT_WECHAT_RUNTIME_MODE|AGENT_WECHAT_BIND_IP|AGENT_WECHAT_PORT|AGENT_WECHAT_CONTAINER_NAME|AGENT_WECHAT_IMAGE|PROXY|RUST_LOG) ;;
       *)
         RUNTIME_MANAGEMENT_ENV_ERROR="docker/.env contains unsupported key: ${key}."
         return 1
@@ -138,6 +141,18 @@ runtime_load_management_environment() {
         if ! [[ "$value" =~ ^/[-A-Za-z0-9._/@%+,=:~]+$ ]] ||
           [[ "$value" == *'/../'* ]] || [[ "$value" == */.. ]]; then
           RUNTIME_MANAGEMENT_ENV_ERROR="docker/.env ${key} is not a safe absolute path."
+          return 1
+        fi
+        ;;
+      CF_AGENT_WECHAT_RUNTIME_UID|CF_AGENT_WECHAT_RUNTIME_GID)
+        if ! [[ "$value" =~ ^(0|[1-9][0-9]{0,9})$ ]] || [ "$value" -gt 2147483647 ]; then
+          RUNTIME_MANAGEMENT_ENV_ERROR="docker/.env ${key} must be a valid numeric service identity."
+          return 1
+        fi
+        ;;
+      CF_AGENT_WECHAT_RUNTIME_MODE)
+        if ! [[ "$value" =~ ^[0-7]{3}$ ]] || (( (8#$value & 8#022) != 0 )); then
+          RUNTIME_MANAGEMENT_ENV_ERROR="docker/.env runtime mode must not grant group/other write."
           return 1
         fi
         ;;
@@ -191,6 +206,9 @@ runtime_load_management_environment() {
       CF_AGENT_WECHAT_STORAGE_ROOT) STORAGE_ROOT="$value" ;;
       CF_AGENT_WECHAT_RUNTIME_ROOT) RUNTIME_ROOT="$value" ;;
       CF_AGENT_WECHAT_ARCHIVE_ROOT) ARCHIVE_ROOT="$value" ;;
+      CF_AGENT_WECHAT_RUNTIME_UID) RUNTIME_DEFAULT_UID="$value" ;;
+      CF_AGENT_WECHAT_RUNTIME_GID) RUNTIME_DEFAULT_GID="$value" ;;
+      CF_AGENT_WECHAT_RUNTIME_MODE) RUNTIME_DEFAULT_MODE="$value" ;;
       AGENT_WECHAT_CONTAINER_NAME) CONTAINER_NAME="$value" ;;
       AGENT_WECHAT_PORT) AGENT_WECHAT_PUBLISHED_PORT="$value" ;;
       AGENT_WECHAT_IMAGE) AGENT_WECHAT_APPROVED_IMAGE="$value" ;;
@@ -253,9 +271,14 @@ runtime_authorize_sudo() {
 
 runtime_with_timeout() {
   local duration="$1"
+  local -a privilege=()
   shift
+  if [ "${1:-}" = --privileged ]; then
+    privilege=(runtime_privileged)
+    shift
+  fi
 
-  "$TIMEOUT_BIN" --signal=TERM --kill-after=2s "${duration}s" "$@"
+  "${privilege[@]}" "$TIMEOUT_BIN" --signal=TERM --kill-after=2s "${duration}s" "$@"
 }
 
 runtime_canonical_path() {
@@ -433,6 +456,29 @@ runtime_validate_management_directory() {
   fi
 }
 
+runtime_validate_service_directory() {
+  local path="$1" metadata owner group mode
+
+  if runtime_privileged test -L "$path" ||
+    ! runtime_privileged test -d "$path" ||
+    ! metadata="$(runtime_privileged stat -c '%u:%g:%a' -- "$path")"; then
+    LAST_ERROR="Runtime service path must be an existing non-symlink directory."
+    return 1
+  fi
+  owner="${metadata%%:*}"
+  group="${metadata#*:}"
+  group="${group%%:*}"
+  mode="${metadata##*:}"
+  if [ "$owner:$group" != "$RUNTIME_DEFAULT_UID:$RUNTIME_DEFAULT_GID" ]; then
+    LAST_ERROR="Runtime directory must match the service UID/GID configured in docker/.env."
+    return 1
+  fi
+  if (( (8#$mode & 8#7022) != 0 )); then
+    LAST_ERROR="Runtime directory must not have special mode bits or group/other write."
+    return 1
+  fi
+}
+
 gateway_validate_runtime_contract() {
   local contract_json
 
@@ -440,18 +486,18 @@ gateway_validate_runtime_contract() {
     LAST_ERROR="Gateway Runtime Contract timeout must be a positive integer."
     return 1
   fi
-  if [ -L "$GATEWAY_RUNTIME_CONTROL" ] ||
-    [ ! -f "$GATEWAY_RUNTIME_CONTROL" ] ||
-    [ ! -x "$GATEWAY_RUNTIME_CONTROL" ]; then
-    LAST_ERROR="Gateway Runtime Contract controller is unavailable at the fixed path."
-    return 1
-  fi
   if [ ! -x "$TIMEOUT_BIN" ] ||
     ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
     LAST_ERROR="Gateway Runtime Contract validation prerequisites are unavailable."
     return 1
   fi
-  if ! contract_json="$(runtime_with_timeout "$COMPOSE_COMMAND_TIMEOUT" \
+  runtime_authorize_sudo || return 1
+  if ! gateway_controller_check_file runtime_with_timeout \
+    "$COMPOSE_COMMAND_TIMEOUT" --privileged 2>/dev/null; then
+    LAST_ERROR="Gateway Runtime Contract controller is unavailable or unsafe at the fixed path."
+    return 1
+  fi
+  if ! contract_json="$(runtime_with_timeout "$COMPOSE_COMMAND_TIMEOUT" --privileged \
     "$GATEWAY_RUNTIME_CONTROL" contract 2>/dev/null)"; then
     LAST_ERROR="Gateway Runtime Contract v1 could not be read."
     return 1
@@ -502,17 +548,12 @@ gateway_runtime_control() {
       return 1
       ;;
   esac
-  if [ "$(id -u)" -eq 0 ]; then
-    runtime_with_timeout "$GATEWAY_CONTROL_TIMEOUT" \
-      "$GATEWAY_RUNTIME_CONTROL" "$@"
-  else
-    if [ "$RUNTIME_SUDO_AUTHORIZED" -ne 1 ]; then
-      LAST_ERROR="Gateway Runtime Contract control requires prior sudo authorization."
-      return 1
-    fi
-    runtime_with_timeout "$GATEWAY_CONTROL_TIMEOUT" \
-      sudo -n -- "$GATEWAY_RUNTIME_CONTROL" "$@"
+  if [ "$(id -u)" -ne 0 ] && [ "$RUNTIME_SUDO_AUTHORIZED" -ne 1 ]; then
+    LAST_ERROR="Gateway Runtime Contract control requires prior sudo authorization."
+    return 1
   fi
+  runtime_with_timeout "$GATEWAY_CONTROL_TIMEOUT" --privileged \
+    "$GATEWAY_RUNTIME_CONTROL" "$@"
 }
 
 gateway_status_json_is_ready() {
@@ -815,6 +856,10 @@ runtime_privileged() {
   if [ "$(id -u)" -eq 0 ]; then
     "$@"
   else
+    if [ "$RUNTIME_SUDO_AUTHORIZED" -ne 1 ]; then
+      LAST_ERROR="Privileged runtime operation requires prior sudo authorization."
+      return 1
+    fi
     sudo -n -- "$@"
   fi
 }
@@ -1112,13 +1157,15 @@ runtime_validate_configuration() {
   runtime_validate_directory_or_missing "$LEGACY_DATA_ROOT" "Legacy data path" || return 1
   runtime_validate_directory_or_missing \
     "$LEGACY_WECHAT_HOME_ROOT" "Legacy WeChat HOME path" || return 1
+  if runtime_privileged test -d "$ARCHIVE_ROOT"; then
+    runtime_validate_management_directory "$ARCHIVE_ROOT" "Archive directory" 1 || return 1
+  fi
   for required_path in \
-    "$RUNTIME_ROOT" "$ARCHIVE_ROOT" "${RUNTIME_ROOT}/data" \
+    "$RUNTIME_ROOT" "${RUNTIME_ROOT}/data" \
     "${RUNTIME_ROOT}/wechat-home" "$LEGACY_DATA_ROOT" \
     "$LEGACY_WECHAT_HOME_ROOT"; do
     if runtime_privileged test -d "$required_path"; then
-      runtime_validate_management_directory \
-        "$required_path" "Runtime management directory" 1 || return 1
+      runtime_validate_service_directory "$required_path" || return 1
     fi
   done
 
