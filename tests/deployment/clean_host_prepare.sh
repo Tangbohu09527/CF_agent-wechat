@@ -106,7 +106,7 @@ pass "real sudo denial failed before checkout or lifecycle side effects"
 
 # This is explicit test-host authorization. No sudo command or user identity is
 # mocked; password-based interactive sudo belongs to manual host acceptance.
-printf '%s ALL=(root) NOPASSWD: ALL\n' "$MANAGER" > /etc/sudoers.d/cf-clean-host-test
+printf 'Defaults:%s verifypw=any\n%s ALL=(root) NOPASSWD: ALL\n' "$MANAGER" "$MANAGER" > /etc/sudoers.d/cf-clean-host-test
 chmod 440 /etc/sudoers.d/cf-clean-host-test
 visudo -cf /etc/sudoers.d/cf-clean-host-test >/dev/null
 
