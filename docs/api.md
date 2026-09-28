@@ -159,6 +159,10 @@ X-Session-Id: default
 
 ## Observed upstream media behavior
 
+2026-09-28 已对固定历史镜像完成源码/制品核验：它的文件 GET 仅查缓存，不触发原生
+下载，图片可优先返回缩略图。固定升级候选、质量/完整性语义及未完成的现场验收见
+[媒体取件核验](validation/2026-09-28-media-retrieval-candidate.md)。候选能力不代表生产已升级。
+
 ### GET /api/messages/{chat_id}/media/{local_id}
 
 历史生产样本曾读取真实图片 media，观察到 `supported=true`、image/jpeg 类型、文件名

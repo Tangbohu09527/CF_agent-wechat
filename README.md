@@ -77,6 +77,10 @@ chats/messages 可读或 Gateway 已放行。生产在线必须以 `./scripts/st
 | **Repository promotion** | **COMPLETED**；仓库合并不表示生产重新部署 |
 ## 当前限制
 
+- 微信文件原件取件已定位为历史上游镜像仅查缓存；图片不能据 JPEG 响应认定原图。
+  [固定升级候选与验收边界](docs/validation/2026-09-28-media-retrieval-candidate.md)
+  已单独记录，未部署生产。
+
 - CFserver 重启后必须人工 fresh QR；automatic Gateway boot stop gate 尚未证明。
 - 离线或重启窗口内的消息可能无法由本地微信客户端补拉。
 - Archive 是受限敏感资产，保留期、容量、备份与安全销毁由外部运维策略负责。

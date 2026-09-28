@@ -1,0 +1,64 @@
+{
+  "schema_version": 1,
+  "scope": "isolated linux/amd64 candidate only; not deployed or field accepted",
+  "historical": {
+    "image": "ghcr.io/thisnick/agent-wechat@sha256:31a4e351c191bcbfc75e5c10be51e207d22a3eedd97f3ff56ad579fcce717b24",
+    "amd64_manifest": "sha256:b5e92047e28ce67e34576e574d8ccf00f8619f485597109f7342a137300285c0",
+    "config_digest": "sha256:7ee0309980b7d03b747b40c6c04cbaeafe2d8fc01fc9429810cbc7571ebbf720",
+    "provenance_digest": "sha256:849c5ee3f61345db8757244e0537837a52eed7107458b7c259739c9e6820b70b",
+    "source_revision": "3b7de890eb1fd3a16cf9cf26dbe1c20e0f88a616",
+    "source_repository": "https://github.com/thisnick/agent-wechat",
+    "builder": {
+      "id": "https://github.com/thisnick/agent-wechat/actions/runs/23874698754/attempts/1"
+    },
+    "image_files_sha256": {
+      "opt/agent-server/agent-server": "cf237332958378d74341aa1b8c95f1d7a3f515c54173fe41090928f34d4afae5",
+      "opt/tools/media-convert.py": "160bd9ab7e46cce8937a2e0f323ebbc9426a077258816970b594c53095999e84"
+    },
+    "layers": [
+      "sha256:733fb5ee158ea74b6de53cb09735332bf8f6fc14bc1b071af5294d46e57cfa42",
+      "sha256:bdda08b92c53a86bba3f683bd4c6e9280191593d9e10270653c7748fabd30154"
+    ],
+    "native_download_helpers_present": false
+  },
+  "candidate": {
+    "image": "ghcr.io/thisnick/agent-wechat@sha256:97d5a99f933592c15897a7579b4e2b2cbbb5f4dda856228f8271f91dd7cafb43",
+    "amd64_manifest": "sha256:51b6d9ccfae344dd2fb60d9c37d3a089f884658f3d818fcd37a51eef48a63658",
+    "config_digest": "sha256:3b14e58c908ec11e9163ef0bbb51522bea15c1568c8e1012a29890b9adadc48e",
+    "provenance_digest": "sha256:4f5557d146d8e8b05c71aa1335f6267aca9420a6db7cef9eac1c99f24c142358",
+    "source_revision": "96c2e90c497d999bf5189a134a9b3b293731f42e",
+    "source_repository": "https://github.com/thisnick/agent-wechat",
+    "builder": {
+      "id": "https://github.com/thisnick/agent-wechat/actions/runs/36276886277/attempts/1"
+    },
+    "image_files_sha256": {
+      "opt/agent-server/agent-server": "4f07107800d8c6a592f8a0c50bb0cf683e7d454d10b383e87078ed59009715db",
+      "opt/tools/media-convert.py": "f4e8f9fbc59ffdd7ae64bd373094936b24e5c56542f006f7446f7854e53dab9a",
+      "opt/tools/media-download.py": "844192f2cbf41e21c0396f8134b2379a1c619cb8ef5cc1e23c1dd046f7e8fecd",
+      "opt/tools/media-download.js": "e7bab94d344928c7d951eba63db9edd9df756930418f3e0cbd9c603e67bb517a",
+      "opt/tools/media-convert": "8abfadd4e6b82c335294f346a5cc9924ec6bc9da604f3d921c14e46259ee80b5",
+      "opt/tools/extract-keys.py": "828738a43c1901de01953e2444959f714dc7db551f515936ba88a922082d652a",
+      "opt/wechat/wechat": "2ca28ea56b1a400543d0128ebaf0b93f88172dd66dc0426d3d74fdb971eab959"
+    },
+    "layers": [
+      "sha256:6b6b01281386f837a6914f1529676fe1644f15d9aec60c8e96dcdf8ccffb2ca2",
+      "sha256:c3113d5441294e196f3f6f8c7ca5523211d0e4f195c1c9af02a5a3df49921ef1",
+      "sha256:ce38f0acfdf82d8202334c9dcb78a8423e7454f405fd0aa9071a88a7aeeea4ae",
+      "sha256:d6a5bb072c88b90fcee364e0417dafc91f033a811acd69d498b9a8b58a8b5a9b"
+    ],
+    "release": "0.15.1",
+    "wechat_elf_path": "opt/wechat/wechat",
+    "wechat_build_id": "ce28c3471d532eeb1f136482eeb4d0bdfd59c06e",
+    "source_files_sha256": {
+      "packages/agent-server-rust/src/router/messages.rs": "7ab7c8460d7cb17e15b6c4d7a32d5ae8e3f430e778d4d7a26b164c35ce9297e0",
+      "packages/agent-server-rust/src/tools/wechat_media.rs": "e52fa6aaafe5f66ebafb1929bdbf76a473c82d3c224c052e4442c88570699441",
+      "packages/agent-server-rust/src/tools/media_download.rs": "eb3e2b913397e2e58f443fd1ebcf9b4a385735de8884cd26fc69c5b3c2e81389",
+      "packages/agent-server-rust/src/ia/types.rs": "1cf407ba4bc7684d75c618a98a98f3689aac1d1c9ab7617df0a976c287c18eec",
+      "packages/agent-server-rust/Cargo.lock": "9f553183024da0fbbdaea7eb7adc49831f9d058921f17b064d4145fa9501736c",
+      "docker/tools/media-download.py": "844192f2cbf41e21c0396f8134b2379a1c619cb8ef5cc1e23c1dd046f7e8fecd",
+      "docker/tools/media-download.js": "e7bab94d344928c7d951eba63db9edd9df756930418f3e0cbd9c603e67bb517a",
+      "docker/tools/media-convert.py": "f4e8f9fbc59ffdd7ae64bd373094936b24e5c56542f006f7446f7854e53dab9a",
+      "docker/tools/extract-keys.py": "828738a43c1901de01953e2444959f714dc7db551f515936ba88a922082d652a"
+    }
+  }
+}
