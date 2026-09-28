@@ -42,7 +42,7 @@ jobs:
           python3 scripts/verify-media-candidate.py --source agent-wechat/candidate --image-root image-root | tee test-results/media/identity.txt
           # A separate disposable container runs tool/codec checks only. No
           # WeChat entrypoint, host session, production mount or network access.
-          docker run --rm --network none --read-only --entrypoint /bin/sh "$candidate" -c 'command -v python3; command -v readelf; command -v ffmpeg; python3 -c "import frida"' > test-results/media/runtime-dependencies.txt
+          docker run --rm --network none --read-only --entrypoint /bin/sh "$candidate" -c 'set -eu; command -v python3; command -v readelf; command -v ffmpeg; python3 -c "import frida"' > test-results/media/runtime-dependencies.txt
       - name: Exercise pinned native helper guards without native invocation
         shell: bash
         run: |

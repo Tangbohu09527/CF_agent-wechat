@@ -106,8 +106,9 @@ Build ID 有严格限制，只替换旧容器 binary/helper 无法证明兼容�
 资料存取用严格 `quality=full`；缺 `_h.dat` 时不能用标准图或预览图满足原图请求。
 
 必须同时记录请求质量、响应质量和实际字节证据：候选显式 full/standard/thumbnail
-的响应 `quality` 可能为 null；显式 full 未取得时也可能 `type=image,data=null`。
-只有可读取的 data/url 才算取得。`quality=full` 仅代表原图缓存层级；WXGF 会转成
+的响应 `quality` 通常缺失（None 被序列化时省略，也应兼容 null）；显式 full 未取得时
+也可能 `type=image` 而 data/url 缺失或为 null。只有可读取的 data/url 才算取得。
+`quality=full` 仅代表原图缓存层级；WXGF 会转成
 JPEG/GIF，仍需对比源样本 SHA-256 才能称逐字节原件；转码结果必须标注。
 未发送 Original 的普通图，其标准图依赖微信已缓存内容；media GET 不选择聊天。
 
