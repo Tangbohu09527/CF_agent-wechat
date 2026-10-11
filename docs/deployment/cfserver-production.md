@@ -1,9 +1,13 @@
 # CFserver 生产 Runbook
 
 > [!IMPORTANT]
-> 本文是详细生产操作的唯一权威入口。当前状态、SHA 和现场镜像证据见
-> [生产状态](../production-status.md)；一次性验收见
+> 本文是详细生产操作的唯一权威入口。日期化状态、SHA 和镜像证据见
+> [生产状态](../production-status.md)；历史一次性验收见
 > [2026-09-03 R2 生产验收](../validation/2026-09-03-forced-qr-r2-production.md)。
+
+2026-10-11 本轮仅更新文档。用户报告 Gateway d9 新 plan 通过后执行 CFserver reboot；
+重启后的微信容器、登录、API 和 Poll/Delivery Gate 未复验，不能沿用 2026-09-03
+`production online` 作为今天实时在线结论。以下命令是未来获准操作的 Runbook，本轮未执行。
 
 ## Preconditions
 
@@ -54,8 +58,10 @@ sudo -n docker compose \
 
 ~~~bash
 cd /opt/cf-agent-wechat
-sudo ./scripts/bootstrap-cfserver.sh
+./scripts/bootstrap-cfserver.sh
 ~~~
+
+由普通管理用户运行，在脚本请求时完成 sudo 授权；不要用 root 身份运行整个入口。
 
 Bootstrap 只负责：
 
@@ -162,11 +168,15 @@ Gateway ready、Token Contract valid、Poll/Delivery healthy。
 | `3` | 容器、Docker health、Agent Server、WeChat process、Runtime mode 或其他认证状态不可用 |
 
 Docker health 或 Auth `logged_in` 单项都不是完整成功。
+上述 11 项状态是通道运行门槛，不证明附件下载、完整字节取得、图片原图层级或内容理解。
+媒体必须按 [API 取件契约](../api.md) 和
+[候选验收记录](../validation/2026-09-28-media-retrieval-candidate.md) 单独留证。
 
 ## CFserver reboot recovery
 
-真实 reboot 已证明 Agent 因 `restart: "no"` 保持停止，但 Gateway Worker 可能自动
-恢复。**不要假设 Gate 已关闭。**
+2026-09-01 的真实 reboot（汇入 2026-09-03 Closeout）中，Agent 因 `restart: "no"`
+保持停止，Gateway Worker 曾自动恢复。2026-10-11 用户报告的这次 reboot 尚未复验，不能从历史结果
+推定当前容器或 Gate 状态。**不要假设 Gate 已关闭。**
 
 重启后必须先执行：
 
@@ -187,8 +197,10 @@ cd /opt/cf-agent-wechat
 ./scripts/status.sh
 ~~~
 
-`start-qr-login.sh` 自身仍会再次 stop/confirm；Host reboot 前置 stop 是强制运维步骤，
-用于弥补尚未实现或证明的 automatic boot stop gate。重启窗口收到的消息可能无法由
+`start-qr-login.sh` 自身仍会再次 stop/confirm；Host reboot 后、fresh QR 前的 stop 是强制运维步骤，
+用于弥补尚未证明的 automatic boot stop gate；后续 Gateway core unit 的 stop 前置动作
+也不能消除 Docker 启动到 stop 之间的调度窗口，见 [固定版本核对](gateway-clean-install-gaps.md)。
+重启窗口收到的消息可能无法由
 本地微信客户端补拉。
 
 ## Gateway-only deployment boundary
@@ -200,7 +212,7 @@ cd /opt/cf-agent-wechat
 3. 由 Gateway 运维按其 Runbook 恢复 Controller/Worker/Hermes 链路。
 4. Gateway 恢复后再次运行 `./scripts/status.sh`。
 
-生产验收中已观察到 Gateway-only 受控切换保持 Agent Session。该证据不能外推为 Agent
+2026-09-03 生产验收中已观察到 Gateway-only 受控切换保持 Agent Session。该证据不能外推为 Agent
 容器重启可复用 Session。
 
 ## AI host restart boundary
@@ -229,6 +241,11 @@ Archive 不是 Session 恢复源。不得跳过 Token scan、绕过 Controller �
 `logged_in` 手工启动 Worker。
 
 ## Upgrade
+
+升级必须另行批准。未合并的媒体候选仅由
+[`upstream/media-retrieval.lock.json`](../../upstream/media-retrieval.lock.json) 固定；
+该锁没有被生产 Compose 或安装器读取。候选来源与隔离检查不证明真实登录微信下载
+成功，不表示现场已用该版本；Gateway d9 plan 通过也不替代 WeChat 入站 PDF/原图验收。
 
 1. 在旧输入下 Normal stop。
 2. 记录旧批准 Commit 与镜像 digest，但不打印 `.env`。

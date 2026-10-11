@@ -4,6 +4,11 @@
 流程或 Session 恢复流程。首次主机依赖、代码与配置安装见
 [干净 Debian 13 安装与验收](clean-device.md)。
 
+这是部署契约，不是实时现场状态。2026-09-03 在线验收为历史证据；用户报告
+2026-10-11 在 Gateway d9 新 plan 通过后执行 CFserver reboot，重启后的微信容器、
+登录、API 和 Poll/Delivery Gate 未复验。后续 Gateway 正式安装资产的版本核对见
+[配套审计](gateway-clean-install-gaps.md)；媒体候选不由 Bootstrap 自动启用。
+
 ## Result definition
 
 ~~~bash
@@ -102,7 +107,7 @@ Bootstrap fail closed，不猜测、不合并。
 
 ## Token migration boundary
 
-完整 Token 契约见 [当前生产状态](../production-status.md#storage-and-token)。Bootstrap
+完整 Token 契约见 [生产状态与证据](../production-status.md#storage-and-token)。Bootstrap
 只允许三种结果：
 
 1. 当前格式已合规：原样复用。
@@ -141,6 +146,10 @@ Bootstrap 只读取固定 Controller：
 动态核对 Poll/Delivery/Dispatch 服务名、file Token 模式及 Token container path。
 Bootstrap 不启动或停止 Gateway Worker；Worker 生命周期由 fresh QR/stop 脚本通过
 Controller `stop/start/status` 管理。
+
+`restart: "no"` 只约束 Agent 容器，不证明 Gateway Worker 在 Host reboot 后一定保持
+停止。Automatic boot stop gate 未证明；重启后仍须显式 Controller stop/confirm，
+再进入完整 fresh QR，不得用 Archive 恢复活动会话。
 
 ## New-device acceptance checklist
 

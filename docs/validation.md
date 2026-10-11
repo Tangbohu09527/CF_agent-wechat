@@ -3,14 +3,21 @@
 本页把已完成的 R2 生产验收、未来 Release 模板、历史记录和剩余限制明确分开。当前
 事实以 [生产状态](production-status.md) 为准。
 
+2026-10-11：用户报告 Gateway d9 新 plan 通过后已 reboot CFserver，微信容器、登录、
+API 和 Poll/Delivery Gate 未复验。下列 R2 勾选项只保留 2026-09-03 历史结果。
+PR #7 已合并 main，新增的[Controller/干净 Debian A/B/C 证据](validation/2026-09-06-controller-precheck-clean-deploy.md)
+与[未合并媒体候选](validation/2026-09-28-media-retrieval-candidate.md)必须分别引用。
+精确 SHA/run 的远端核对见状态页；不得将 Gateway plan、隔离测试或 HTTP 200 写成
+WeChat 入站 PDF 完整字节或原图验收。
+
 ## Status definitions
 
 | 标签 | 当前使用方式 |
 | --- | --- |
-| **已完成** | 实现、测试、Workflow 和文档已进入 Repository branch authority `main`；live tip 动态查询 |
+| **已完成** | 仅对明确已合并 main 的实现使用；媒体候选不属于此标签，live tip 须查远端 |
 | **已验证（自动化）** | 隔离测试覆盖，不连接 CFserver 或真实微信 |
 | **已验证（CFserver 行为）** | 带日期的脱敏现场记录观察到预期行为 |
-| **未证明** | 缺少 exact build/provenance 或 automatic boot gate 证据 |
+| **未证明** | 缺少今天现场身份、管理脚本部署对应关系或 automatic boot gate 实机证据；历史公开上游 provenance 已有 |
 | **Repository promotion** | **COMPLETED**；PR #1 baseline `02583fe76220916019ca961bb37dfa015640384e`，baseline CI Run `33853255941` 成功 |
 
 历史基线只证明其日期、Commit 与运行方式，不能替代当前 R2 证据。
@@ -101,13 +108,13 @@
 9. automatic boot stop gate 的实现或验证状态。
 ## D. Remaining limitations
 
-- Automatic Gateway boot stop gate 尚未实现或证明；真实 reboot 中 Worker 曾自动恢复。
+- Automatic Gateway boot stop gate 尚未完成现场证明；新版已有 stop 相关资产，历史真实 reboot 中 Worker 曾自动恢复，仍须独立复验。
 - CFserver reboot 后需要人工 fresh QR，离线窗口消息可能不补拉。
 - Archive 不恢复为 active Session，保留和销毁由外部策略管理。
 - 上游 API/schema 与镜像运行要求可能变化，升级后必须重验。
 - `seccomp=unconfined` 与 `SYS_PTRACE` 仍需持续风险评估。
 - 本仓库不验证 Gateway 内部去重、Admission、Checkpoint、Dispatch、Response、
   Delivery Receipt 或 Hermes 业务语义。
-- 现场 Image ID 与选定 Release Commit、构建输入的精确映射未验证。
-- PR #1 promotion merge baseline `02583fe...` 未被证明已经重新部署；现场 Image ID 仍为
-  `sha256:7ee0309980b7d03b747b40c6c04cbaeafe2d8fc01fc9429810cbc7571ebbf720`。
+- 历史公开上游制品 provenance 已在媒体锁文件补齐；今天现场镜像、管理脚本版本和部署对应关系未复验。
+- PR #1 promotion merge baseline `02583fe...` 未被证明已经重新部署；2026-09-03 历史 Image ID 为
+  `sha256:7ee0309980b7d03b747b40c6c04cbaeafe2d8fc01fc9429810cbc7571ebbf720`，不声明今天仍相同。

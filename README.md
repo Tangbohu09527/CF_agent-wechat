@@ -15,22 +15,22 @@ Contract version 1 协调 Poll/Delivery Worker。Gateway 内部消息模型、AI
 Skills、ERP、RAG、OCR 和文件理解不属于本仓库。
 
 > [!IMPORTANT]
-> forced-QR R2 已于 2026-09-03 完成真实 CFserver 验收，当前生产在线。Repository
-> branch authority 为 `main`。Repository promotion 已于 2026-09-04 完成：PR #5、
-> PR #4、PR #1 均已合并；PR #1 promotion merge baseline 为
-> `02583fe76220916019ca961bb37dfa015640384e`，其 baseline CI Run
-> `33853255941` 成功。Live `main` tip 有意不硬编码，必须通过 GitHub 或
-> `git rev-parse origin/main` 动态查询。
-> 仓库合并没有连接或修改 CFserver，也没有重新构建或发布生产镜像；不得把
-> `02583fe...` 写成已经重新部署。
-> 当前事实只以 [生产状态](docs/production-status.md) 为准。
+> 状态核对日期：2026-10-11。`production online` 是 **2026-09-03 历史验收结果**，
+> 不代表今天实时在线。用户报告在 Gateway d9 新 plan 通过后执行了 CFserver reboot；
+> 重启后的微信容器、登录、API 和 Poll/Delivery Gate **均未复验**。
+> 本次远端 `main` 为 `81d21f451adc61df71077ca3035adeddeca4621f`，包含已合并 PR #7；
+> 媒体候选分支 `codex/fix-wechat-original-media` 固定为
+> `9b997ac92d653380a01ac93e0ac65e4a0e3a4c0a`，未合并，未证明现场已升级。
+> 本页所在文档分支基于该候选，只更新文档。能力、来源和待验收项以
+> [生产状态](docs/production-status.md)为准；仓库/CI 成功不证明部署或真实取件。
 
 ## 核心决策
 
 - 每次 CFserver 重启、`agent-wechat` 容器重建、人工重新启动或 Runtime 轮换，都必须
   创建全新 Runtime，并在交互式 SSH TTY 扫描新的二维码。
 - 旧 Runtime 只移动到 `session-archive/<UTC timestamp>`，不得恢复为 active Session。
-- 生产 Compose 使用 `restart: "no"`；主机重启后 `cf-agent-wechat` 保持停止。
+- 生产 Compose 使用 `restart: "no"`；2026-09-01 重启曾观察到 Agent 保持停止，
+  2026-10-11 重启后的实际容器状态仍待复验。
 - 真实重启验收中 Gateway Poll/Delivery Worker 曾自动恢复。因此重启后不能假设 Gate
   已关闭，fresh QR 前必须通过正式 Controller 显式 `stop` 并确认。
 - Gateway-only 部署若不重启或删除 `cf-agent-wechat`，已观察到微信 Session 保持；
@@ -63,18 +63,20 @@ Compat      ./scripts/login.sh                     # 仅转入 start-qr-login.sh
 - Gateway Controller：`/opt/cf-agent-gateway/deploy/wechat-runtime-control`
 
 Docker health 只证明 Agent API `/health` 可达，不证明 WeChat 已登录、真实进程稳定、
-chats/messages 可读或 Gateway 已放行。生产在线必须以 `./scripts/status.sh` 的全部
-11 个状态项和退出码为准。
+chats/messages 可读或 Gateway 已放行。在线状态须由当次 `./scripts/status.sh` 的全部
+11 个状态项和退出码证明；它不包含 PDF/原图取件或下游内容理解验收。
 
 ## 状态口径
 
-| 状态 | 当前使用方式 |
+| 能力/事件 | 来源与边界 |
 | --- | --- |
-| **已完成** | forced-QR R2 已进入 Repository branch authority `main`；live tip 动态查询 |
-| **已验证（自动化）** | PR #1 promotion baseline CI Run `33853255941` 成功，五项 Job 全部通过 |
-| **已验证（CFserver 行为）** | 2026-09-03 的脱敏记录证明 forced fresh QR 生产行为 |
-| **未证明** | 选定 Release Commit、构建输入与现场 Image ID 的精确映射、automatic boot stop gate |
-| **Repository promotion** | **COMPLETED**；仓库合并不表示生产重新部署 |
+| main 已有 | forced-QR 生命周期；PR #7 Controller 授权预检查、Runtime 服务身份配置与干净设备准备流程 |
+| 历史生产成功 | 2026-09-03 fresh QR、API 与私聊/群聊文本闭环；不替代本次 reboot 后复验 |
+| 未合并媒体候选 | 锁文件 `0.15.1` 固定源码/制品与隔离校验；不称最新版本或生产现用版本 |
+| 历史媒体失败 | PDF 两次 HTTP 200/pending 无 data/url；图片 JPEG 与源文件大小/摘要不同，原图未证明 |
+| 待验收 | reboot 后在线/Gate、真实微信 native 取件、PDF 完整字节、图片层级/转码/源文件一致性 |
+| Gateway d9 新 plan | 用户报告通过；不能替代 WeChat 入站 PDF/原图验收，本仓不实现分类/理解或 Gateway 队列 |
+
 ## 当前限制
 
 - 微信文件原件取件已定位为历史上游镜像仅查缓存；图片不能据 JPEG 响应认定原图。
@@ -86,7 +88,8 @@ chats/messages 可读或 Gateway 已放行。生产在线必须以 `./scripts/st
 - Archive 是受限敏感资产，保留期、容量、备份与安全销毁由外部运维策略负责。
 - 上游 `agent-wechat` API/schema 可能变化；镜像升级必须重新验证。
 - `seccomp=unconfined` 与 `SYS_PTRACE` 是当前上游要求，需持续审查。
-- 现场 Docker Image ID 与选定 Release Commit、构建输入的精确映射尚无完整证据。
+- 锁文件记录了历史公开制品与上游源码 provenance；2026-10-11 实际运行镜像未核对，
+  本仓管理脚本 Release Commit 与现场部署的对应关系仍无完整证据。
 
 ## 文档
 

@@ -9,6 +9,11 @@
 
 详细命令以 [CFserver 生产 Runbook](deployment/cfserver-production.md) 为准。
 
+2026-10-11 状态：用户报告在 Gateway d9 新 plan 通过后已 reboot CFserver，微信容器、
+登录、API 和 Poll/Delivery Gate 均未复验。2026-09-03 的在线记录不能作为今天的恢复
+结果；本次纯文档任务没有执行下列现场检查。`restart: "no"` 保留，但不能据此宣称
+本次 Agent 已停止，更不能承诺 automatic boot stop gate 已生效。
+
 ## Baseline checks
 
 ~~~bash
@@ -37,7 +42,7 @@ cd /opt/cf-agent-wechat
 | Mixed layout | 新 Runtime 与 legacy data/HOME 同时存在 | fail closed；确认受控来源并走独立人工处置 | 重新校验无 mixed layout 后 Bootstrap/fresh QR | 不合并、不删除任一目录掩盖状态 |
 | Token metadata invalid | 只用 `stat` 查 type/owner/mode/link | 保留文件，离线修复到当前契约后重跑 Bootstrap | Bootstrap/状态安全加载 Token | 不读取、重生成替换或复制 Token |
 | Docker daemon reboot | Agent 应保持停止 | 确认 Gate，再完整 fresh QR | status 全过 | 若 Agent 自动恢复，先修复 restart/live-restore 偏差 |
-| CFserver reboot | Agent 停止，但 Worker 可能 running | 强制 Controller `stop --timeout-seconds 30`，再 fresh QR | status 全过 | 不依赖 automatic boot stop gate |
+| CFserver reboot | 查询 Agent 实际状态；按 restart=no 应停止，Worker 可能 running | 强制 Controller `stop --timeout-seconds 30` 并确认 Gate 关闭，再 fresh QR | status 全过并独立验证实际收发 | 不依赖 automatic boot stop gate |
 | Interrupted QR flow | start 返回 `130` 或连接中断 | 等待 cleanup/锁释放，确认 Gate，再重新运行完整流程 | 新 QR 实际显示并完整就绪 | 不复用旧 QR，不删除锁文件 |
 | Container stop/remove failed | 查看 cleanup 的 stop/remove 脱敏结果 | 保留容器和持久数据，人工确认容器已停止/移除后再重试 | 容器状态明确且新流程全过 | 确认前不重启 Docker/Host |
 | Archive exists, active Runtime missing | 判断是否中断在 archive 与 create 之间 | 不恢复 Archive；确认 Gate 后重新运行 fresh QR 创建新 Runtime | 新 Runtime fresh、旧 Archive 保留 | 不把 Archive 移回 active path |
@@ -83,7 +88,12 @@ Token 替换已有数据库关联 Token。
 
 ## Verification and fallback
 
-恢复成功必须由 `./scripts/status.sh` 退出 `0` 证明。失败时：
+入口恢复须由当次 `./scripts/status.sh` 11 项通过、退出 `0` 证明，真实收发另验。
+该状态不测试 PDF 或原图；HTTP 200、文件名、元数据或 `pending` 也不能证明取得完整
+附件。历史 GET 可能只查缓存，重派 pending 或不断 GET 不能作为下载修复。固定候选的
+已登录 native 取件、缓存字节完整性、图片 full/standard/thumbnail 和转码/发送前文件
+一致性应依 [API 边界](api.md)及[候选记录](validation/2026-09-28-media-retrieval-candidate.md)
+单独验收，保留原失败，不用 Gateway plan 或下游文字回复替代。失败时：
 
 1. 保留原退出码和失败 phase。
 2. 保留 Runtime、Archive、manifest 与必要轮转日志。
