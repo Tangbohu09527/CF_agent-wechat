@@ -179,8 +179,10 @@ sudo -n docker compose \
 - [ ] Repository branch authority 为 `main`、PR #1 promotion baseline 为
   `02583fe76220916019ca961bb37dfa015640384e`、baseline CI Run `33853255941`
   成功的状态已交接。
-- [ ] Live `main` tip 动态查询；没有选定 Release Commit 被证明已重新部署，Source
-  与现场 Image ID 的精确绑定仍未验证。
+- [ ] 通过远端核对 live `main`；历史公开上游制品 provenance 已在媒体锁文件补齐，
+  但今天运行实例与本仓管理脚本部署版本未复验，不能从仓库合并推定现场升级。
+- [ ] 2026-10-11 用户报告 Gateway d9 新 plan 通过后 reboot CFserver；微信容器、登录、
+  API 与 Poll/Delivery Gate 均未复验，2026-09-03 在线记录只作历史证据。
 
 ## Upgrade/rollback decision
 

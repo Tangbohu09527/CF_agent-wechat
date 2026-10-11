@@ -1,9 +1,17 @@
 # 微信附件取件：固定上游升级候选
 
-本轮结论：历史镜像的媒体 GET **只读缓存，不触发文件下载**；图片先取缩略图。
+2026-09-28 核验结论：历史镜像的媒体 GET **只读缓存，不触发文件下载**；图片先取缩略图。
 修复位置在上游 `agent-wechat`，不在本项目生命周期脚本。采用已有修复的固定完整
-制品作为升级候选，在隔离环境验证。本轮没有部署、合并、修改生产配置或运行容器，
+制品作为升级候选，在隔离环境验证。该候选任务没有部署、合并、修改生产配置或运行生产容器，
 没有连接 CFserver、读取聊天/凭据、扫码、重派历史任务或改变历史失败记录。
+
+> **2026-10-11 文档状态补记**：本页对应 `codex/fix-wechat-original-media` 的固定
+> 候选基线 `9b997ac92d653380a01ac93e0ac65e4a0e3a4c0a`，不是现场升级记录。
+> `main@81d21f451adc61df71077ca3035adeddeca4621f` 已有功能与未合并媒体候选须分开。
+> 用户确认在 Gateway d9 新 plan 通过后执行了 CFserver reboot；微信容器、登录、API
+> 及 Poll/Delivery Gate 尚未复验。2026-09-03 的 production online 是历史验收，
+> Gateway plan 或隔离 CI 通过都不能替代 WeChat 入站 PDF/原图验收。
+> 状态、精确 CI 来源及待验收矩阵见[生产状态](../production-status.md)。
 
 ## 工作树和证据范围
 
@@ -22,7 +30,8 @@
 
 完整摘要、镜像/源码校验值见
 [media-retrieval.lock.json](../../upstream/media-retrieval.lock.json)。锁文件仅用于隔离
-验收，没有被生产 Compose 或安装脚本读取。
+验收，没有被生产 Compose 或安装脚本读取。候选版本按该锁文件 `release=0.15.1`
+描述，不称为当前最新版本或生产现用版本。
 
 | 项目 | 历史现场引用 | 升级候选（仅 linux/amd64 已审计） |
 | --- | --- | --- |
@@ -85,6 +94,17 @@ layer 的 SHA-256。源码 revision 来自 BuildKit provenance 的
 上游本身仍有诊断限制：元数据缺失、原生进程不匹配或 helper 拒绝可能仍表现为
 pending/无 data，不能仅凭 HTTP 响应区分失败原因。未伪造 ready，也未增大超时。
 
+| 证据层级 | 所需观察 | 不成立的替代证据 |
+| --- | --- | --- |
+| 附件元数据 | 消息类型/ID、title、声明长度/摘要；按私密数据处理 | 文件名、卡片或文字回复不等于取得文件 |
+| 下载触发 | 固定候选的合格元数据与 native 提交/拒绝结果 | 历史 GET、HTTP 200、`pending` 均不证明正在下载 |
+| 缓存命中 | 实际缓存路径可读；候选普通文件与消息声明长度/MD5 匹配 | 已有缓存不证明本次触发过 native 下载 |
+| 完整字节取得 | Base64 解码或实际取回 url 的字节，核对大小/摘要 | 返回字段存在或请求成功，不等于完整内容可读 |
+| 发送前原件一致 | 与发送前样本逐字节比较或核对大小/SHA-256，记录转码 | 消息声明 MD5、图片 full 层级、扩展名不单独证明发送前原件一致 |
+
+这几层必须分别记结果。候选 GET 在条件满足时可能提交下载并写入缓存；历史 GET
+仅重复查询缓存，因此不能把二者一概视为只读查询，也不能把 pending 当成进度状态。
+
 ## 最小修复选择
 
 选定完整固定候选，而不把原生 offsets 回填旧微信客户端：原生 helper 对完整
@@ -97,7 +117,10 @@ Build ID 有严格限制，只替换旧容器 binary/helper 无法证明兼容�
 
 完整版本升级还包含语音等无关变化及 `V3__voice_jobs.sql` migration，因此这是
 **待现场验收的固定升级方案**，不是可无条件滚动升级的热补丁。没有运行生产 migration。
-后续任何上线须另行授权，并遵循本项目 fresh QR 生命周期；本轮保留已有登录。
+后续任何上线须另行授权，并遵循本项目 fresh QR 生命周期。2026-09-28 未操作已有
+登录；该历史事实不代表 2026-10-11 reboot 后登录仍有效。保持 `restart: "no"`，
+Archive 不得恢复活动 Session；automatic boot stop gate 未被证明，重启后必须显式
+stop/confirm，不能承诺 Gate 自动关闭。
 
 ## 图片及格式状态
 
@@ -107,23 +130,35 @@ Build ID 有严格限制，只替换旧容器 binary/helper 无法证明兼容�
 
 必须同时记录请求质量、响应质量和实际字节证据：候选显式 full/standard/thumbnail
 的响应 `quality` 通常缺失（None 被序列化时省略，也应兼容 null）；显式 full 未取得时
-也可能 `type=image` 而 data/url 缺失或为 null。只有可读取的 data/url 才算取得。
+也可能 `type=image` 而 data/url 缺失或为 null。必须实际解码 data 或取回 url 字节；
+只有字段、HTTP 200、文件名或 `supported=true` 不算取件成功。
 `quality=full` 仅代表原图缓存层级；WXGF 会转成
 JPEG/GIF，仍需对比源样本 SHA-256 才能称逐字节原件；转码结果必须标注。
 未发送 Original 的普通图，其标准图依赖微信已缓存内容；media GET 不选择聊天。
 
+| 候选图片层级 | 固定选择规则 | 不可外推的结论 |
+| --- | --- | --- |
+| `best` | 按 full → standard → thumbnail 选择可用最高层 | 允许预览降级，不保证 full 已取得 |
+| `full` | 只选 `_h.dat` | 原图缓存层不保证与发送前文件逐字节一致；可能发生 WXGF 转码 |
+| `standard` | 只选普通 `.dat` | 标准图不能作为 full 验收 |
+| `thumbnail` | 只选 `_t.dat` | 缩略图不能作为 standard 或 full 验收 |
+
 | 格式 | 原始字节取得状态 | 内容解析状态 |
 | --- | --- | --- |
-| PDF | 现场失败证据已知；候选通用取件路径，待现场验证 | 未验证；文件名/文字回复不算解析 |
+| PDF | 2026-09-28 记录的现场失败保留；候选通用取件路径，待现场验证 | 未验证；文件名/文字回复不算解析 |
 | Word `.docx` | 候选通用取件路径；待现场验证 | 本服务不解析；现有下游能力另验 |
 | Excel `.xlsx` | 同上 | 同上 |
 | PPT `.pptx` | 同上 | 同上 |
 | 旧 Office `.doc/.xls/.ppt` | 同一通用字节路径，不按扩展名静默拒绝；待现场验证 | 本服务不提供旧 Office 解析器；下游未验证 |
 | 其他普通文件 subtype 6 | 同一字节路径；待现场验证 | 未支持/未验证须明确报告 |
 | 其他 appmsg subtype、表情等 | 不保证通用原件路径支持；需明确 unsupported/不可用 | 未验证，不静默丢弃 |
-| 图片聊天展示 | 已有可用 JPEG；层级未知；候选 best 分级待现场验证 | 可解码展示不等于视觉/OCR 已解析 |
+| 图片聊天展示 | 2026-08-14 历史样本取得 5712 字节 JPEG；层级未知；候选 best 分级待现场验证 | 可解码展示不等于视觉/OCR 已解析 |
 | 图片原图 | 现场未证明；strict full 及 SHA-256/转码核对后才能确认 | 未验证 |
 | 图片标准图/预览图 | 候选区分层级；不能冒充原图 | 未验证 |
+
+本仓只负责通道与上游适配；上述通用字节路径不实现 PDF/Office 内容理解、分类或
+Gateway 队列。Gateway d9 新 plan 通过只能作为其自身版本的证据，不能填平此矩阵的
+微信入站取件和下游解析空白，也不能把早期 Gateway 缺口写成所有版本的永久现状。
 
 ## 隔离验证
 
@@ -131,14 +166,23 @@ JPEG/GIF，仍需对比源样本 SHA-256 才能称逐字节原件；转码结果
 下载并创建停止的容器抽取 binary/helpers/client，校验摘要和 Build ID；不运行镜像
 入口，不挂生产数据。另一个无网络、只读、无登录数据的临时容器仅检查运行依赖。
 
-- 本地：固定源码身份校验通过；Python 媒体 helper 11 项、Node 调度 4 项通过。
+- 2026-09-28 本地记录：固定源码身份校验通过；Python 媒体 helper 11 项、Node 调度
+  4 项通过。2026-10-11 文档任务未重新运行这些功能测试。
 - CI：`cargo test --locked` 执行上游测试，并加入
   [6 项缓存契约测试](../../tests/upstream/media_cache_contract.rs)，直接调用上游
   `get_file_attachment`。两根目录、8 类扩展名、中文/空格、月份、缺文件/截断/错摘要、
   路径边界、重复读取及图片质量后缀均覆盖。
 - fixture 是合成二进制；正确数据落盘后 Base64 逐字节相等，只证明真实缓存读取函数，
   **不证明原生下载已在微信完成，也不证明 PDF/Office 内容解析**。
-- CI 结果以此分支最新提交对应的 GitHub Actions 为准；工作流未通过不能视为候选通过。
+- 2026-10-11 核对的候选 CI：head SHA
+  `9b997ac92d653380a01ac93e0ac65e4a0e3a4c0a` 的 push
+  [run 36403240631 / attempt 1](https://github.com/Tangbohu09527/CF_agent-wechat/actions/runs/36403240631/attempts/1)
+  为 `completed/success`；[job 108865816205](https://github.com/Tangbohu09527/CF_agent-wechat/actions/runs/36403240631/job/108865816205)
+  的固定身份、helper 和合成缓存检查成功。制品为
+  `media-candidate-9b997ac92d653380a01ac93e0ac65e4a0e3a4c0a`（artifact ID `10961287330`）；
+  本次只核对远端元数据，未下载或重新执行制品。
+- 其他检查的状态独立记录在[生产状态](../production-status.md)；该 run 成功不代表
+  分支所有检查“全绿”，不证明已登录微信 native 取件、发送前原件一致或现场升级。
 
 ## 一次交给操作者的最小现场检查
 

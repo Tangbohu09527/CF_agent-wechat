@@ -1,14 +1,40 @@
-# Gateway 首次部署资产审计
+# Gateway 首次部署资产：历史审计与版本对照
 
-本记录是本次 WeChat 权限修复的跨仓库只读审计，检查时间为 2026-09-06。没有连接
+原记录是 WeChat 权限修复的跨仓库只读审计，检查时间为 2026-09-06。没有连接
 CFserver、AI 主机或读取现场配置；没有修改 Gateway 或总文档仓库。它不是干净 Debian
 全栈安装通过的证明，也不替代真实扫码和真实 Hermes 回复验收。
 
-## 固定来源与已执行检查
+## 2026-10-11 版本核对与当前证据边界
+
+本次通过 GitHub API 只读核对 Gateway 远端 main，固定为
+[`7963bc0db5a01e38099e021959feabf648db7ede`](https://github.com/Tangbohu09527/CF_agent-gateway/commit/7963bc0db5a01e38099e021959feabf648db7ede)，
+递归 tree 返回 `truncated: false`，并读取下表对应文件。没有执行 Gateway 安装、
+构建或测试，没有连接服务器。下文 `4f13039b…` 的缺口均为旧版本事实，不能沿用为
+这个已核对版本仍永久缺失的结论。
+
+| 项目 | 2026-09-06 `4f13039b…` 历史发现 | 2026-10-11 固定 `7963bc0d…` 源码证据 | 仍需独立证明 |
+| --- | --- | --- | --- |
+| 空白设备正式入口 | 缺完整安装/Controller 准备入口 | 已有 [install-clean-device.sh](https://github.com/Tangbohu09527/CF_agent-gateway/blob/7963bc0db5a01e38099e021959feabf648db7ede/deploy/install-clean-device.sh)、[prepare-clean-host.py](https://github.com/Tangbohu09527/CF_agent-gateway/blob/7963bc0db5a01e38099e021959feabf648db7ede/deploy/prepare-clean-host.py) 及 [安装指南](https://github.com/Tangbohu09527/CF_agent-gateway/blob/7963bc0db5a01e38099e021959feabf648db7ede/docs/deployment/clean-device.md) | 指定设备实际完成哪些阶段；不能由文件存在推定现场已安装 |
+| 跨组件网络和地址 | production Compose 缺共享网络，示例地址不可用 | [正式 Compose](https://github.com/Tangbohu09527/CF_agent-gateway/blob/7963bc0db5a01e38099e021959feabf648db7ede/docker-compose.prod.yml) 声明 default external `cf-internal`；安装器渲染 enabled WeChat `http://cf-agent-wechat:6174` 和批准 Hermes URL | 实际容器网络、端点和认证；`config/production.yaml` 仍是 disabled 示例，须区分模板与正式渲染结果 |
+| 镜像来源和依赖记录 | 示例 registry 不可部署；固定 Git SHA 不保证可复现构建 | 正式 `build` 阶段记录基础镜像 digest、Gateway SHA、依赖解析结果及实际 Image ID，配置使用该 Image ID | 指定设备的实际记录；不承诺逐字节可复现，也不推断已有公开发布镜像 |
+| PostgreSQL/首次迁移 | 外部依赖与空库流程未形成完整安装资产 | 已有 [独立 PostgreSQL Compose](https://github.com/Tangbohu09527/CF_agent-gateway/blob/7963bc0db5a01e38099e021959feabf648db7ede/deploy/postgres/compose.yml)、managed/external 输入与 database/migrate/start 阶段 | 实际 DB/迁移/readiness，真实 Hermes 与 WeChat 验收分别记录 |
+| 开机组合 Gate | 历史 reboot 不能保证 Worker 保持停止 | [core unit](https://github.com/Tangbohu09527/CF_agent-gateway/blob/7963bc0db5a01e38099e021959feabf648db7ede/deploy/systemd/cf-agent-gateway-core.service) 在 Docker ready 后 `ExecStartPre` 调用 Controller stop | Docker 启动到 stop 之间仍有调度窗口；automatic boot stop gate 未证明，boot 后仍须显式确认/关闭 Gate |
+
+上述首次安装资产的引入提交为
+[`997e1c42e91a6bfac4c0a8e013ef283f00d30bbd`](https://github.com/Tangbohu09527/CF_agent-gateway/commit/997e1c42e91a6bfac4c0a8e013ef283f00d30bbd)
+（2026-09-06）；本轮只读核对的是上述固定 main 内容，不宣称其所有 CI 或现场验收通过。
+
+用户报告 2026-10-11 Gateway d9 新 plan 通过后执行了 CFserver reboot。该报告与
+GitHub 源码核对属于不同证据，不能据此认定现场部署了 `7963bc0d…`，也不能代替
+重启后的微信容器、登录、API、Poll/Delivery Gate，以及入站 PDF/原图验收。
+这些现场项目本轮均未复验；本仓库负责微信通道与上游适配，不实现 Gateway 队列、
+文件理解或分类。
+
+## 2026-09-06 固定来源与已执行检查（历史）
 
 GitHub API 查询 `branches/main`、完整递归 Git tree、固定提交的文件和 Releases：
 
-| 仓库 | 本次固定 main | Git tree | 可见性 |
+| 仓库 | 当时固定 main | Git tree | 可见性 |
 | --- | --- | --- | --- |
 | Gateway | [`4f13039b86c60bc94340edb5468f0102d62d2dff`](https://github.com/Tangbohu09527/CF_agent-gateway/commit/4f13039b86c60bc94340edb5468f0102d62d2dff) | `d0c83ea8842d97ada066abbfb975f4c05c8a7d9b` | public |
 | 总文档 | [`8f51cd095c6967f806701b703281b08e5144296f`](https://github.com/Tangbohu09527/CF_ecommerce-automation-docs/commit/8f51cd095c6967f806701b703281b08e5144296f) | `1ff9fab6ba5867eee7520a48daae75e11abf7659` | public |
@@ -48,15 +74,18 @@ Linux 权限和安装验收必须记录各自的实际结果。
 6. 交互式 fresh QR、认证和 API 检查，确认外部 Hermes 可达，再按现有流程打开组合 Gate。
 7. 验收文本闭环、正常停止/再次启动、Host reboot 后 fresh-QR 恢复。
 
-这是一份依赖顺序说明，具体执行入口见本仓库安装说明；下述 Gateway 缺口仍须由
-Gateway 配套修复解决。不能把准备步骤的静态 contract 成功写成 Worker 已经 ready。
+这是一份依赖顺序说明，具体执行入口见本仓库安装说明。下述 Gateway 历史缺口与后续
+资产进展须按前述版本对照阅读；不能把准备步骤的静态 contract 成功写成 Worker 已经 ready。
 
 总文档[现有顺序 4.4/4.5](https://github.com/Tangbohu09527/CF_ecommerce-automation-docs/blob/8f51cd095c6967f806701b703281b08e5144296f/deployment/deployment-guide.md#L49-L63)
 先要求 Controller ready/Token contract，后执行 WeChat Bootstrap。它基于已准备的
 生产依赖，不能作为空白设备首次安装顺序。首次安装必须将“安装文件/静态 contract”
 与“Token 校验/运行时 ready”拆开，不得造一个 ready Controller 绕过顺序问题。
 
-## Gateway 配套缺口与复现证据
+## Gateway `4f13039b…` 历史缺口与复现证据
+
+以下四项保留 2026-09-06 审计原始发现和当时提出的修复范围，所有链接固定到旧版本；
+其现在是否适用须看实际选定版本，不能仅凭这些历史段落推断当前 main 或现场状态。
 
 ### 1. 生产 Compose 尚未提供跨组件网络配置
 
@@ -78,7 +107,7 @@ Gateway 配套修复应在自身正式部署资产中声明/校验 external 网�
 ### 2. 缺少针对空白主机的生产准备入口
 
 完整 tree 中 `deploy/` 仅有 Controller 和两个 systemd unit。
-当前[生产 runbook](https://github.com/Tangbohu09527/CF_agent-gateway/blob/4f13039b86c60bc94340edb5468f0102d62d2dff/docs/deployment/production.md#L39-L105)
+当时的[生产 runbook](https://github.com/Tangbohu09527/CF_agent-gateway/blob/4f13039b86c60bc94340edb5468f0102d62d2dff/docs/deployment/production.md#L39-L105)
 假定批准的管理身份、证据目录、代码、受保护 `.env` 和渲染配置已经存在；
 [pre-deployment gate](https://github.com/Tangbohu09527/CF_agent-gateway/blob/4f13039b86c60bc94340edb5468f0102d62d2dff/docs/deployment/production.md#L111-L131)
 还要求先前 Release、数据库 revision 与备份。唯一含首次安装步骤的 Debian 文档已
@@ -130,9 +159,11 @@ Gateway 的[容器 E2E](https://github.com/Tangbohu09527/CF_agent-gateway/blob/4
 直接准备测试 Token、配置和构建环境。它可证明容器契约，不能替代正式安装入口的
 空白主机验收或真实微信/Hermes 验收。
 
-## 可重复的只读来源检查
+## 可重复的历史来源检查
 
-下面命令只读取公开 GitHub，向新的临时目录保存审计快照；不修改任何部署或仓库。
+下面保留 2026-09-06 的复现入口：读取公开 GitHub、向临时目录保存旧版本快照，
+并执行旧 Controller 的静态 contract；不修改任何部署或仓库。本轮文档更新未执行它，
+其 `networks=absent` 断言仅适用于代码中固定的 `4f13039b…`。
 需要 Python 3，网络可匿名访问 `api.github.com` 和 `raw.githubusercontent.com`。
 
 ```bash
@@ -191,9 +222,10 @@ print("gateway_example_image=placeholder")
 PY
 ```
 
-## Gateway 配套修复的独立验收范围
+## Gateway 配套变更的独立验收范围
 
-配套 Gateway 变更应在自己的分支/PR 中完成，本 WeChat PR 不修改其仓库。验收至少包括：
+配套 Gateway 变更在自己的分支/PR 中完成，本 WeChat 文档 PR 不修改其仓库。
+下列是独立验收范围，不表示 2026-10-11 本轮已执行或通过：
 
 - 干净 Debian 13 amd64，从固定源码执行正式准备/构建入口，安装 root:root 0750
   Gateway 根目录及 root:root 0755 deploy/Controller；非 root、非 docker 管理用户可
@@ -208,6 +240,7 @@ PY
   微信/Hermes，但真实微信扫码、真实 Hermes 文本回复、停止/再次启动及 Host reboot
   恢复必须逐项记录。未执行的真实项目写“待人工验收”。
 
-本次审计已定位跨库缺口，没有把这些缺口当成 WeChat 管理脚本权限修复通过的前提或
-结果。任何 A（代码/回归）、B（干净 Linux 安装）、C（真实扫码/Hermes）报告都应分别
-说明执行范围，不能将当前静态审计或历史生产记录代替 B/C。
+2026-09-06 审计定位的跨库缺口与 2026-10-11 核对的后续资产分别保留，没有把它们
+当成 WeChat 管理脚本权限修复通过的前提或结果。任何 A（代码/回归）、B（干净 Linux
+安装）、C（真实扫码/Hermes）报告都应分别说明执行范围，不能将静态源码核对或历史
+生产记录代替 B/C，更不能代替真实微信入站 PDF/原图字节验收。

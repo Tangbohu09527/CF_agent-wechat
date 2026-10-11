@@ -1,6 +1,17 @@
 # Controller 权限修复与干净设备部署验收记录
 
 日期：2026-09-06。修复 PR：[WeChat #7](https://github.com/Tangbohu09527/CF_agent-wechat/pull/7)。
+
+> 2026-10-11 仓库状态补记：PR #7 已于 2026-09-06 合并，merge/main 为
+> `81d21f451adc61df71077ca3035adeddeca4621f`，最终 head 为
+> `67cbbb04ce15703428ce165ac38effac19f4b701`。下文“本任务没有合并/PR 保持未合并”
+> 保留原提交时快照，不代表当前 PR 状态。旧 Gateway 缺口限于审计版本 `4f13039b…`，
+> 后续版本见 [配套审计](../deployment/gateway-clean-install-gaps.md)；A/B/C 历史范围不变。
+> 本记录当时只检查了上游 config labels；2026-09-28 后补公开制品 provenance 见
+> [媒体候选记录](2026-09-28-media-retrieval-candidate.md)及[锁文件](../../upstream/media-retrieval.lock.json)，
+> 不能把当时未取得来源证据写成今天仍无上游来源，也不能据此推定现场已部署。
+> 用户报告 2026-10-11 reboot 后的微信状态未复验，最新证据边界见[生产状态](../production-status.md)。
+
 本任务没有连接 CFserver、AI 主机，没有读取现场 Token、Session、数据库或业务文件。
 没有修改其他 worktree、Gateway/总文档仓库，没有创建生产 Tag、发布镜像或合并 PR。
 

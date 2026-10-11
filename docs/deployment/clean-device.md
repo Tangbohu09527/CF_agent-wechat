@@ -1,8 +1,15 @@
 # 干净 Debian 13 amd64 安装与验收
 
 本入口把主机依赖、固定代码和 WeChat 配置准备变成可重复执行的仓库资产。
-它不是全栈上线按钮。当前 Gateway 固定版本仍有首次部署缺口，详见
-[Gateway 配套修复范围](gateway-clean-install-gaps.md)；未解决该门禁前不能声明新设备文本闭环通过。
+它不是全栈上线按钮。2026-09-06 对 Gateway `4f13039b…` 的首次部署缺口是历史审计；
+2026-10-11 核对的 Gateway `7963bc0d…` 已有正式安装、构建、网络和配置渲染资产，
+详见 [Gateway 版本对照](gateway-clean-install-gaps.md)。资产存在不能代替实际安装、
+真实微信扫码或文本/媒体验收。
+
+本仓库 [PR #7](https://github.com/Tangbohu09527/CF_agent-wechat/pull/7) 已合并至
+`main@81d21f451adc61df71077ca3035adeddeca4621f`，保留其
+[A/B/C 分层记录](../validation/2026-09-06-controller-precheck-clean-deploy.md)。
+本文命令供另行批准的新设备操作；2026-10-11 本轮只核对文档，没有执行安装。
 
 首个验收基线是干净 Debian 13（trixie）amd64。其他平台尚未验证。
 `system-packages` 可以在真实 Debian 13 容器验证包安装，但容器结果不证明
@@ -12,12 +19,12 @@ systemd、宿主内核、Docker daemon 或 Host reboot 已验收。
 
 | 输入 | 要求与来源 |
 | --- | --- |
-| 管理脚本提交 | 本次修复 PR 的最终完整 Git SHA；合并后可选择对应已审查提交，不使用浮动 main 代替记录 |
+| 管理脚本提交 | 选择已审查的完整 Git SHA；PR #7 merge 为 `81d21f451adc61df71077ca3035adeddeca4621f`，不使用浮动 main 代替记录 |
 | 新主机 | Debian 13 amd64，systemd，初始 root/管理员访问；足够的镜像和 Runtime/Archive 空间 |
 | 管理账户 | 任意合法非 root 用户名；不属于 root/docker 组；交互 sudo 授权、密码和 SSH 公钥由设备管理员配置 |
 | 上游镜像 | 可从 registry 获取的完整 `@sha256:` 引用；需要 registry 认证时单独配置 Docker 凭据，不放进 WeChat `.env` |
-| 容器服务 UID/GID | 根据批准镜像验证后显式提供，与管理用户 UID/GID 独立；当前候选是 1000:1000 |
-| Gateway | 固定源码提交、正式可执行安装/构建资产、配置版本；当前审计 SHA 为 `4f13039b86c60bc94340edb5468f0102d62d2dff` |
+| 容器服务 UID/GID | 根据批准镜像验证后显式提供，与管理用户 UID/GID 独立；下列历史镜像验收值为 1000:1000 |
+| Gateway | 固定源码提交、正式安装/构建资产和配置版本；2026-10-11 只读核对 `7963bc0db5a01e38099e021959feabf648db7ede`，不表示现场已部署该版 |
 | 外部服务 | Gateway 负责的 PostgreSQL 连接/凭据、数据库迁移、Hermes 地址/认证、消息路由配置 |
 | 网络 | Debian APT、Docker APT、GitHub、GHCR/PyPI、微信及外部 Hermes 的可达性；WeChat/Gateway 共享 `cf-internal` |
 | 人工验收 | 受控 TTY、真实微信人工扫码、测试聊天、真实 Hermes 回复权限及可控重启窗口 |
@@ -86,8 +93,11 @@ cd /opt/cf-agent-wechat
 
 ## 3. 准备镜像、配置和 Python venv
 
-下列引用是本次通过公开 registry 元数据查到的 `0.11.15` linux/amd64 manifest。
-元数据可获取不等于镜像已拉取、已运行或已通过扫码验收：
+下列引用是 2026-09-06 干净设备记录使用的 `0.11.15` linux/amd64 manifest，保留用于
+复现该历史基线。该次 B 层已实际拉取并探测服务身份，但不证明真实扫码。
+它不同于 [锁文件](../../upstream/media-retrieval.lock.json) 中仅供隔离验收的
+`0.15.1` 媒体候选；本文没有把候选改成生产配置，也不称任一版本为当前最新版本。
+实际新安装或升级须先选定批准制品并记录来源：
 
 ```bash
 WECHAT_IMAGE=ghcr.io/thisnick/agent-wechat@sha256:b5e92047e28ce67e34576e574d8ccf00f8619f485597109f7342a137300285c0
@@ -143,14 +153,16 @@ Gateway 来源明确记录为由 Gateway 单独安装，需在最终验收记录
 5. 管理用户运行 `./scripts/start-qr-login.sh --dry-run`，检查正式输入和受控 Controller。
    dry-run 不启停容器、不创建 Session、不归档 Runtime。
 
-当前审计发现步骤 1 缺少正式完整安装入口，步骤 4 的 Gateway production Compose
-缺 `cf-internal`，生产模板没有可用 WeChat/Hermes 地址，外部 DB/首次迁移链也未形成
-可重复的生产部署资产。具体文件、固定 SHA、原始 Controller 证明和所需配套 PR 范围
-见 [Gateway 审计](gateway-clean-install-gaps.md)。
+2026-09-06 审计的 Gateway `4f13039b…` 缺少步骤 1 的正式完整安装入口，步骤 4 的
+网络、生产配置和首次迁移链也不完整。2026-10-11 核对的 `7963bc0d…` 已提供
+`deploy/install-clean-device.sh`、`prepare-clean-host.py`、external `cf-internal`、
+配置渲染和独立 PostgreSQL 资产；历史缺口、更新来源和剩余边界见
+[Gateway 审计](gateway-clean-install-gaps.md)。
 
-因此这些步骤中可证明的静态 contract 和 WeChat Bootstrap 可以独立验收，步骤 4/5
-仍须等待 Gateway 配套资产与真实 Docker/PostgreSQL 联调。不能用手工网络连接、临时
-Compose overlay、假的 ready 或在 WeChat 复制 Gateway/PostgreSQL 实现填补该门禁。
+步骤 4/5 应按批准 Gateway 版本自己的正式入口执行，分别记录真实
+Docker/PostgreSQL 联调结果。不能用手工网络连接、临时 Compose overlay、假的 ready
+或在 WeChat 复制 Gateway/PostgreSQL 实现代替。源码具备这些资产不证明 CFserver
+已安装，也不替代 C 层真实微信/Hermes 或入站 PDF/原图验收。
 
 ## 5. 人工扫码、文本闭环和恢复
 
@@ -176,7 +188,7 @@ cd /opt/cf-agent-wechat
 
 ## 镜像来源证据与复现
 
-2026-09-06 本次直接读取 GHCR，未访问旧 Docker daemon：
+2026-09-06 历史记录直接读取 GHCR，未访问旧 Docker daemon：
 
 | 元数据 | 查询结果 |
 | --- | --- |
@@ -185,9 +197,13 @@ cd /opt/cf-agent-wechat
 | linux/amd64 manifest | `sha256:b5e92047e28ce67e34576e574d8ccf00f8619f485597109f7342a137300285c0` |
 | config digest（预期 Image ID） | `sha256:7ee0309980b7d03b747b40c6c04cbaeafe2d8fc01fc9429810cbc7571ebbf720` |
 | image config created | `2026-04-01T22:55:40.702857446Z` |
-| 上游源码 SHA | 镜像 labels 未提供，未证明；不能填写 WeChat 管理仓库 SHA |
+| 当时的上游源码映射 | 镜像 labels 未提供；当时未证明，不能填写 WeChat 管理仓库 SHA |
 
 config digest 不替代新机实际 `docker image inspect` 的 Image ID。
+后续 2026-09-28 已从固定 provenance 核对历史上游源码为
+`3b7de890eb1fd3a16cf9cf26dbe1c20e0f88a616`，见
+[候选来源记录](../validation/2026-09-28-media-retrieval-candidate.md)和锁文件；
+这不改变上述 2026-09-06 的执行范围，也不证明 2026-10-11 的运行实例身份。
 在有 Python 3 的设备可匿名复现元数据查询；临时 registry bearer 值只留在进程内，
 不输出、不保存，不使用现场 Token：
 
@@ -231,7 +247,12 @@ configure/venv；没有用容器结果替代宿主 systemd、Bootstrap 全栈或
 - C：真实微信扫码、真实 Hermes 文本回复、stop/start 和 reboot 后 fresh QR。
   本任务未执行的真实项目写“待人工验收”，不用历史现场记录代替。
 
-已有 CFserver 应急补丁应在此 PR 审查/CI 完成、Gateway 配套缺口处理且新设备验收后，
+已有 CFserver 应急补丁应在选定版本审查/CI 完成、对应 Gateway 配套验收且新设备验收后，
 由单独授权的维护任务升级到记录的正式提交。升级前核对现场 diff、保留有效 Secret/
 Session/业务数据，再按正式 stop/部署/fresh-QR 顺序替换；不能直接覆盖现场未知修改。
 本任务不执行 CFserver 更新、不获取现场数据，也不发布生产 Tag/镜像。
+
+2026-10-11 用户报告 Gateway d9 新 plan 通过后执行 CFserver reboot；重启后的微信
+容器、登录、API 和 Poll/Delivery Gate 未复验。Gateway plan 结果不替代本页 C 层或
+入站 PDF/原图验收；`restart: "no"` 不证明重启后 Gate 必然关闭，automatic boot stop
+gate 仍未证明。

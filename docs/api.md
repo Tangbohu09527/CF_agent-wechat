@@ -4,12 +4,21 @@
 
 本仓库不实现上游 `agent-server`。本文区分：
 
-1. **R2 lifecycle contract**：当前脚本和测试实际调用、解析并用于生产放行的接口。
+1. **R2 lifecycle contract**：仓库脚本和测试调用、解析并用于生产放行的接口。
 2. **Observed upstream behavior**：生产集成中观察到的发送/media 行为，不是本仓库拥有
    的稳定公共 schema。
+3. **Pinned media candidate**：锁文件固定的未合并升级候选；源码与隔离测试描述不代表
+   现场已部署、已登录微信取件成功或下游已理解文件。
 
 Gateway 内部 Message、Admission、Checkpoint、Dispatch、Response、Delivery Receipt、
-重试和去重不属于本文。
+重试和去重不属于本文。本仓负责微信通道、生命周期及上游适配，不实现文件理解、分类
+或 Gateway 队列。
+
+**状态日期边界（2026-10-11）**：R2 production online 来自
+[2026-09-03 历史验收](validation/2026-09-03-forced-qr-r2-production.md)，不是今天的
+在线探测。用户确认在 Gateway d9 新 plan 通过后执行了 CFserver reboot；重启后的
+微信容器、登录、API 和 Poll/Delivery Gate 均未复验。Gateway plan 通过不能替代
+WeChat 入站 PDF/原图验收。完整状态与来源见[生产状态](production-status.md)。
 
 ## Address and network
 
@@ -140,7 +149,9 @@ X-Session-Id: default
 
 ### POST /api/messages/send
 
-该端点已在生产集成链路和历史直接验收中观察到文本发送：
+该端点在 [2026-08-14 直接验收](validation/2026-08-14-message-media-production.md)
+及 [2026-09-03 R2 集成验收](validation/2026-09-03-forced-qr-r2-production.md)中
+观察到文本发送；这些历史结果不证明 2026-10-11 reboot 后仍可发送：
 
 ~~~json
 {
@@ -159,14 +170,21 @@ X-Session-Id: default
 
 ## Observed upstream media behavior
 
-2026-09-28 已对固定历史镜像完成源码/制品核验：它的文件 GET 仅查缓存，不触发原生
-下载，图片可优先返回缩略图。固定升级候选、质量/完整性语义及未完成的现场验收见
-[媒体取件核验](validation/2026-09-28-media-retrieval-candidate.md)。候选能力不代表生产已升级。
+2026-09-28 的[媒体取件核验](validation/2026-09-28-media-retrieval-candidate.md)区分
+固定历史镜像与升级候选：历史文件 GET 仅查缓存，不触发原生下载，图片可优先返回
+缩略图。候选身份只以 [media-retrieval.lock.json](../upstream/media-retrieval.lock.json)
+为准：release `0.15.1`、源码 `96c2e90c497d999bf5189a134a9b3b293731f42e`，仅
+`linux/amd64` 已审计。它不是“当前最新”或生产现用版本的声明，锁文件也没有被生产
+Compose/安装脚本读取。
 
 ### GET /api/messages/{chat_id}/media/{local_id}
 
-历史生产样本曾读取真实图片 media，观察到 `supported=true`、image/jpeg 类型、文件名
-和二进制数据。当前边界：
+2026-08-14 历史生产样本取得过 5712 字节 JPEG，并检查文件签名；该样本层级及是否与
+发送前文件逐字节一致未证明。2026-09-28 记录的 PDF 两次相隔约 10 分钟仍是 HTTP 200、
+`pending`、无 data/url；图片 JPEG 的大小/摘要与源样本不同。这些失败记录仍然有效，
+不因候选代码或 Gateway plan 通过而改为成功。
+
+调用和证据边界：
 
 - 使用 Bearer Agent API 认证。
 - 两个 path 标识都来自上游消息结果，并应按单个 path segment 安全编码。
@@ -175,6 +193,38 @@ X-Session-Id: default
 - 该端点不是 R2 status 或 fresh QR 放行条件。
 
 这是 **observed upstream behavior, not a repository-owned stable public contract**。
+
+### 附件取件的四层证据
+
+| 层级 | 能证明什么 | 不能据此声称什么 |
+| --- | --- | --- |
+| 消息/附件元数据 | 消息含类型、文件名、ID，可能含声明长度/MD5 | 元数据不是文件；有文件名或 HTTP 200 不代表已有字节 |
+| 下载触发 | 固定候选在缓存无可用字节且原生元数据合格时尝试提交 native 下载；提交/拒绝需独立证据 | 历史 GET 只查缓存；`pending` 不等于 queued/downloading，提交成功也不等于下载完成 |
+| 缓存命中 | 找到可读文件；候选普通文件还校验消息声明长度/MD5 | 缓存存在不证明本次 GET 触发过下载，也不自动证明是发送前原文件 |
+| 完整字节取得 | 实际解码 data 或取回 url 的字节，并核对大小/摘要；候选普通文件完整性与消息声明相符 | `data`/`url` 字段存在、扩展名、HTTP 200 或文字回复均不替代字节校验或内容理解 |
+
+历史 `pending` 还可能表示文件缺失或读取失败；候选元数据不足、原生进程/helper 拒绝、
+尚无完整匹配缓存等也可能表现为 pending/无 data，不能把它当作下载进度。重复历史
+GET 不会启动下载；候选 GET 可能改变微信缓存，不能把两版接口视为同一种只读操作。
+
+PDF、Word、Excel、PPT 及旧 Office 在固定候选中共用普通文件 subtype 6 取件路径。
+该路径不实现格式解析、OCR、文件理解或分类；取得字节与下游内容处理须分别验收。
+合成缓存 fixture、源码和制品校验不证明真实登录微信的 native 取件通过。
+
+### 候选图片质量与“原件”
+
+| 请求/概念 | 固定候选含义 | 验收边界 |
+| --- | --- | --- |
+| 默认或 `quality=best` | 从 full、standard、thumbnail 中选当前可用最高层，并报告质量 | 可降到标准图/缩略图；展示可用不等于原图可用 |
+| `quality=full` | 严格选择 `_h.dat` 原图缓存层 | 缺 full 不用 standard/thumbnail 冒充；响应 `type=image` 仍可能无字节 |
+| `quality=standard` | 选择普通 `.dat` 标准图层 | 不是 full；未发送 Original 的普通图依赖微信实际缓存 |
+| `quality=thumbnail` | 选择 `_t.dat` 缩略图层 | 只证明预览图层，不满足原图存取 |
+| 发送前文件逐字节一致 | 实际取得字节与发送前样本大小、SHA-256 一致 | `quality=full` 只是缓存层级；WXGF 转 JPEG/GIF 后不能称为逐字节原件 |
+
+记录请求质量、响应质量、实际字节和是否转码。固定候选显式 full/standard/thumbnail
+响应的 `quality` 可能缺失或为 null，不能据此改写请求层级；同样不能仅凭 quality
+标签、文件名或 HTTP 200 判定成功。必须实际解码/取回字节；转码结果单独标注，摘要
+不同本身也不能区分发送转换、标准图或缩略图。以上仍待真实微信入站原图验收。
 
 ## Error and timeout policy
 
@@ -195,6 +245,11 @@ Runtime mounts 与 Gateway Contract。退出码：
 - `2`：明确 `logged_out`。
 - `3`：容器、health、Agent、进程、Runtime mode 或其他 auth 状态不可用。
 
+退出码只说明该次执行的结果，历史 `0` 不代表 reboot 后当前在线。`restart: "no"`、
+每次启动 fresh QR、Archive 不得恢复活动 Session 的规则继续有效；automatic boot
+stop gate 未被证明，不能承诺 Host reboot 后 Poll/Delivery Gate 一定关闭。恢复时须
+显式 stop/confirm，再按 fresh QR 和完整 readiness 重新验收。
+
 ## 调用方约束
 
 - 调用方必须设置连接、总请求和重试上限，不假设未记录字段已经冻结。
@@ -208,5 +263,6 @@ Runtime mounts 与 Gateway Contract。退出码：
 本文不把它们列为当前生产 API。需要追溯时只查看
 [V1 验证结果](05_V1验证结果.md)，不得把历史观察外推到当前上游镜像。
 
-当前实机证据见
-[2026-09-03 R2 生产验收](validation/2026-09-03-forced-qr-r2-production.md)。
+历史实机证据见
+[2026-09-03 R2 生产验收](validation/2026-09-03-forced-qr-r2-production.md)；
+2026-10-11 reboot 后状态仍待复验，见[生产状态](production-status.md)。

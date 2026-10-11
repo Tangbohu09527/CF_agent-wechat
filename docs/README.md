@@ -2,13 +2,17 @@
 
 本页是唯一文档索引。当前事实、可复用 Runbook 与一次性验收记录必须分开使用。
 
+2026-10-11：用户报告 Gateway d9 新 plan 通过后已 reboot CFserver；微信容器、登录、API
+与收发 Gate 均未复验。2026-09-03 `production online` 是历史结果。远端 main 已包含
+PR #7；本分支上的媒体候选未合并、未证明生产升级，详见状态页的来源/待验收矩阵。
+
 ## Start here
 
 | 文档 | 用途 | 权威性 |
 | --- | --- | --- |
-| [当前生产状态](production-status.md) | 生产在线状态、repository promotion、镜像证据、重启事实与已知限制 | **当前生产事实唯一入口** |
+| [当前生产状态](production-status.md) | 已知运行状态、main/候选、精确 SHA/CI、重启事实与待验收矩阵 | **状态与证据边界入口，不是实时监控** |
 | [CFserver 生产 Runbook](deployment/cfserver-production.md) | Bootstrap、fresh QR、stop、status、重启、升级与回滚 | **详细生产操作唯一入口** |
-| [R2 生产验收记录](validation/2026-09-03-forced-qr-r2-production.md) | 2026-09-03 forced-QR R2 实机 Closeout | **当前生产验收唯一详细记录** |
+| [R2 生产验收记录](validation/2026-09-03-forced-qr-r2-production.md) | 2026-09-03 forced-QR R2 实机 Closeout | **带日期历史记录，不替代 reboot 后复验** |
 
 ## 新开发者阅读顺序
 
@@ -33,7 +37,7 @@
 | 文档 | 用途 |
 | --- | --- |
 | [架构设计](01_架构设计.md) | Host/Docker、Xvfb、WeChat、agent-server、Gateway 的层级与职责 |
-| [API 边界](api.md) | 当前脚本实际使用的 API、上游观察行为、认证与超时边界 |
+| [API 边界](api.md) | 生命周期 API；媒体元数据/下载/缓存/字节、图片质量与转码边界 |
 
 ## Deployment
 
@@ -41,6 +45,8 @@
 | --- | --- |
 | [部署导航](deployment-guide.md) | 区分 Bootstrap、start、stop、status 与 recovery |
 | [新设备 Bootstrap](deployment/new-device-bootstrap.md) | 只准备部署输入，不创建 Session 或启动服务 |
+| [干净 Debian 13 安装](deployment/clean-device.md) | PR #7 已有准备能力、A/B/C 验收界限和固定历史镜像 |
+| [Gateway 配套版本审计](deployment/gateway-clean-install-gaps.md) | 旧版缺口及新版核对，不能将旧问题视为永久当前状态 |
 
 ## Login lifecycle
 
@@ -61,6 +67,9 @@
 | 文档 | 分类 | 用途 |
 | --- | --- | --- |
 | [2026-09-03 R2 生产验收](validation/2026-09-03-forced-qr-r2-production.md) | 带日期生产证据 | forced fresh QR、重启、Gateway Contract 与集成链路证据 |
+| [2026-09-06 Controller/干净设备](validation/2026-09-06-controller-precheck-clean-deploy.md) | PR #7 代码/隔离环境证据 | A 自动化、B Debian 容器准备；真实扫码/完整宿主 C 不由 CI 证明 |
+| [2026-09-28 媒体取件候选](validation/2026-09-28-media-retrieval-candidate.md) | 未合并候选与历史失败 | 缓存根因、固定上游、质量/完整性；真实登录取件待验 |
+| [媒体制品锁文件](../upstream/media-retrieval.lock.json) | 固定身份与 provenance | historical/candidate 的源码、digest、文件摘要；不是生产配置 |
 | [2026-08-13 CFserver 记录](validation/2026-08-13-cfserver-production.md) | 历史快照 | 旧可信设备登录与基础 API 证据，不能证明 forced QR |
 | [2026-08-14 消息/媒体记录](validation/2026-08-14-message-media-production.md) | 历史快照 | 当时消息与图片 media 观察，不能替代当前 Runbook |
 
@@ -82,7 +91,8 @@
 [CFserver 生产 Runbook](deployment/cfserver-production.md)。
 
 Repository promotion 已于 2026-09-04 完成，branch authority 为 `main`；live tip
-通过 GitHub 或 `git rev-parse origin/main` 动态查询。该仓库事件不改写
+须核对 GitHub 远端，不能只依赖陈旧本地引用。2026-10-11 核对 main 为 `81d21f4…`，
+PR #7 已合并；媒体候选固定 `9b997ac…` 仍与 main 分开。完整 SHA/CI 见状态页。仓库事件不改写
 2026-09-03 及更早验证记录，也不证明任何选定 Release Commit 已重新构建或部署到
 CFserver。
 
