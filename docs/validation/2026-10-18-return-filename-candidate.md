@@ -93,3 +93,44 @@ rollback. A limited switch needs separate production approval; it must retain
 the existing login and must not rescan WeChat. After that switch, a separately
 authorized original-file send must verify the recipient's displayed basename
 and downloaded bytes. That live original-name acceptance has not occurred.
+
+## Fixed release and image preparation
+
+The release job builds the same pinned upstream plus reviewed overlay with Rust
+1.93.0 and `cargo build --release --locked` on Ubuntu 22.04. It rejects a release
+that requires GLIBC newer than 2.35. The earlier Ubuntu 24.04 test executable is
+not used as a deployment binary.
+
+The runtime base stays
+`ghcr.io/thisnick/agent-wechat@sha256:97d5a99f933592c15897a7579b4e2b2cbbb5f4dda856228f8271f91dd7cafb43`,
+with config/image ID
+`sha256:3b14e58c908ec11e9163ef0bbb51522bea15c1568c8e1012a29890b9adadc48e`.
+The generated Docker context contains only a fixed Dockerfile and the reviewed
+`agent-server` and `paste-file` replacements. Existing entrypoint, command,
+environment, user, healthcheck and volumes must remain identical. The job
+verifies that the base layers remain and exactly two filesystem layers are added.
+
+The job extracts and verifies the old base binary, native helpers and WeChat
+binary against the saved source/image lock; it then compares candidate files
+with the actual compiled release and helper. It also verifies unchanged native
+helpers and the WeChat binary. An isolated, networkless, read-only container uses
+the real runtime ELF loader to verify and resolve dependencies, and checks the
+helper's shell syntax. It never runs the WeChat entrypoint, starts a WeChat
+process, reads a login, invokes desktop tools or mounts production data. This
+loader check does not claim service health or live recipient acceptance.
+
+`return-filename-release-<tested revision>` contains `release-proof.json`, the
+actual binary/helper and `return-filename-overlay.tar.gz`. The proof records
+upstream revision, repository checkout/test/head revisions, Cargo lock,
+transformed source hashes, compiler, ABI requirements, extracted file hashes,
+built candidate image ID and package digest. The small package supports a
+reviewed rebuild over the exact already-present base without transferring the
+entire base image. Rebuilding must verify `SHA256SUMS`, use the pinned Dockerfile,
+re-extract both replacements, compare the unchanged runtime configuration, and
+record the resulting image ID. Reproducible inputs are provided; identical image
+IDs across different Docker versions/build timestamps are not asserted.
+
+The six local package-guard tests passed. The new release job must succeed for
+the exact new commit before this package is considered a built deployment
+candidate; older native or media CI does not establish that result. Production
+switch and original-name recipient acceptance remain separate operations.

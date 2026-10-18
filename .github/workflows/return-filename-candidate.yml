@@ -5,6 +5,8 @@ on:
     paths:
       - 'upstream/return-filename/**'
       - 'scripts/apply-return-filename.py'
+      - 'scripts/package-return-filename.py'
+      - 'tests/test_return_filename_package.py'
       - 'tests/test_return_filename_overlay.py'
       - 'tests/upstream/*file*'
       - '.github/workflows/return-filename-candidate.yml'
@@ -12,6 +14,8 @@ on:
     paths:
       - 'upstream/return-filename/**'
       - 'scripts/apply-return-filename.py'
+      - 'scripts/package-return-filename.py'
+      - 'tests/test_return_filename_package.py'
       - 'tests/test_return_filename_overlay.py'
       - 'tests/upstream/*file*'
       - '.github/workflows/return-filename-candidate.yml'
@@ -63,4 +67,48 @@ jobs:
         with:
           name: return-filename-${{ github.sha }}
           path: test-results/filename
+          retention-days: 14
+
+  release-overlay:
+    name: Ubuntu 22 release binary and fixed-base image
+    runs-on: ubuntu-22.04
+    timeout-minutes: 40
+    env:
+      CF_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: thisnick/agent-wechat
+          ref: 96c2e90c497d999bf5189a134a9b3b293731f42e
+          path: agent-wechat/release-candidate
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@1.93.0
+      - name: Verify and apply frozen source overlay
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p test-results/release-preparation
+          python3 -m unittest discover -s tests -p test_return_filename_package.py -v
+          python3 scripts/verify-media-candidate.py --source agent-wechat/release-candidate
+          python3 scripts/apply-return-filename.py --source agent-wechat/release-candidate > test-results/release-preparation/source.json
+      - name: Build actual release on Ubuntu 22.04
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --locked --manifest-path agent-wechat/release-candidate/packages/agent-server-rust/Cargo.toml
+      - name: Build and verify two-file image over exact runtime base
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/package-return-filename.py --source agent-wechat/release-candidate --applied test-results/release-preparation/source.json --output test-results/release
+      - name: Preserve fixed candidate and dependency/source proof
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: return-filename-release-${{ github.sha }}
+          path: |
+            test-results/release-preparation
+            test-results/release
           retention-days: 14
