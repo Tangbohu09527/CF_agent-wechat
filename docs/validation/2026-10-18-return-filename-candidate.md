@@ -61,3 +61,35 @@ and basename. Clipboard/keystroke commands are test stand-ins: no production
 WeChat or real chat is used. Passing these checks remains isolated evidence;
 production filename and recipient acceptance require separate authorization and
 verification after a reviewed deployment.
+
+## Recorded isolated result
+
+The code candidate is `a6c0973c0f1223c817945768a2f540cf5554b694`. PR #9's
+merge test revision is `b3987c9c0dac55d30ddfaee559139e11e613d09a`.
+[Actions run 39112259588](https://github.com/Tangbohu09527/CF_agent-wechat/actions/runs/39112259588)
+/ job `117630705830` passed 8 overlay checks and 9 Rust/Qt tests; 49 unrelated
+Rust tests were filtered out. Qt was 5.15.13. The native Qt case consumed the
+actual helper's percent-encoded URI under `LC_ALL=C`, checked original Unicode
+basename and bytes, and also read it as the distinct unprivileged `nobody` UID.
+The native tests include concurrent starts, success/failure, cancelled HTTP
+waiters, and queue timeout/cancellation. No live WeChat process was used.
+
+The safe artifact is `return-filename-b3987c9c0dac55d30ddfaee559139e11e613d09a`.
+Its `rust-qt.txt` SHA256 is
+`128545660d6d3a4863cfdbdd4d10065137bfb2b6fee8ed71ccb72949ce276562`;
+`source.json` SHA256 is
+`841e043dc6f8f3192a6dc92e8cc9eaf21315d24a3bb2b24c182081acff6f2c05`.
+This section is a later documentation-only update: the code candidate and test
+revision above identify the tested code; the later documentation HEAD is not a
+claim that another code revision or every repository workflow was tested.
+
+## Minimal later deployment boundary
+
+Before any deployment, obtain the missing current binary/image-to-fixed-source
+identity evidence. Build and verify a new image from the exact reviewed source
+and overlay, then record an immutable image digest and extracted binary/helper
+hashes. Preserve the current image digest and configuration for a reviewed
+rollback. A limited switch needs separate production approval; it must retain
+the existing login and must not rescan WeChat. After that switch, a separately
+authorized original-file send must verify the recipient's displayed basename
+and downloaded bytes. That live original-name acceptance has not occurred.
