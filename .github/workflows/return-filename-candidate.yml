@@ -1,0 +1,114 @@
+name: Original return filename candidate
+
+on:
+  push:
+    paths:
+      - 'upstream/return-filename/**'
+      - 'scripts/apply-return-filename.py'
+      - 'scripts/package-return-filename.py'
+      - 'tests/test_return_filename_package.py'
+      - 'tests/test_return_filename_overlay.py'
+      - 'tests/upstream/*file*'
+      - '.github/workflows/return-filename-candidate.yml'
+  pull_request:
+    paths:
+      - 'upstream/return-filename/**'
+      - 'scripts/apply-return-filename.py'
+      - 'scripts/package-return-filename.py'
+      - 'tests/test_return_filename_package.py'
+      - 'tests/test_return_filename_overlay.py'
+      - 'tests/upstream/*file*'
+      - '.github/workflows/return-filename-candidate.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  filename:
+    name: Pinned Rust sender and native Qt URI contract
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: thisnick/agent-wechat
+          ref: 96c2e90c497d999bf5189a134a9b3b293731f42e
+          path: agent-wechat/filename-candidate
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@1.93.0
+      - name: Install isolated Qt test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qtbase5-dev
+      - name: Check source, apply exact overlay, and build native Qt probe
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p test-results/filename
+          export CF_FILENAME_SOURCE="$PWD/agent-wechat/filename-candidate"
+          python3 -m unittest discover -s tests -p test_return_filename_overlay.py -v 2>&1 | tee test-results/filename/overlay.txt
+          python3 scripts/apply-return-filename.py --source "$CF_FILENAME_SOURCE" | tee test-results/filename/source.json
+          g++ -std=c++17 -fPIC tests/upstream/qt_file_uri.cpp -o /tmp/cf-return-filename-qt $(pkg-config --cflags --libs Qt5Core)
+          chmod 755 /tmp/cf-return-filename-qt
+          pkg-config --modversion Qt5Core > test-results/filename/qt-version.txt
+      - name: Exercise sender lifetime, original bytes, and different-UID Qt reads
+        shell: bash
+        run: |
+          set -euo pipefail
+          export CF_FILENAME_QT_PROBE="$PWD/tests/upstream/run-paste-file-contract.py"
+          export CF_PASTE_FILE="$PWD/agent-wechat/filename-candidate/docker/tools/paste-file"
+          export CF_QT_FILE_URI=/tmp/cf-return-filename-qt
+          cargo test --locked --manifest-path agent-wechat/filename-candidate/packages/agent-server-rust/Cargo.toml filename_ -- --nocapture 2>&1 | tee test-results/filename/rust-qt.txt
+      - name: Preserve isolated evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: return-filename-${{ github.sha }}
+          path: test-results/filename
+          retention-days: 14
+
+  release-overlay:
+    name: Ubuntu 22 release binary and fixed-base image
+    runs-on: ubuntu-22.04
+    timeout-minutes: 40
+    env:
+      CF_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: thisnick/agent-wechat
+          ref: 96c2e90c497d999bf5189a134a9b3b293731f42e
+          path: agent-wechat/release-candidate
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@1.93.0
+      - name: Verify and apply frozen source overlay
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p test-results/release-preparation
+          python3 -m unittest discover -s tests -p test_return_filename_package.py -v
+          python3 scripts/verify-media-candidate.py --source agent-wechat/release-candidate
+          python3 scripts/apply-return-filename.py --source agent-wechat/release-candidate > test-results/release-preparation/source.json
+      - name: Build actual release on Ubuntu 22.04
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --locked --manifest-path agent-wechat/release-candidate/packages/agent-server-rust/Cargo.toml
+      - name: Build and verify two-file image over exact runtime base
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/package-return-filename.py --source agent-wechat/release-candidate --applied test-results/release-preparation/source.json --output test-results/release
+      - name: Preserve fixed candidate and dependency/source proof
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: return-filename-release-${{ github.sha }}
+          path: |
+            test-results/release-preparation
+            test-results/release
+          retention-days: 14

@@ -1,0 +1,20 @@
+#!/bin/bash
+# Preserve the basename. ASCII percent-encoded UTF-8 URI bytes avoid Qt's
+# POSIX-locale handling of a raw non-ASCII URI; no renamed copy is created.
+set -euo pipefail
+if [ "$#" -ne 1 ] || [ ! -f "$1" ]; then
+  echo "paste-file: expected one existing file" >&2
+  exit 1
+fi
+URI="$(python3 - "$1" <<'PY'
+import os, sys
+from urllib.parse import quote_from_bytes
+path = os.path.realpath(sys.argv[1])
+print("file://" + quote_from_bytes(os.fsencode(path), safe="/"), end="")
+PY
+)"
+printf '%s\r\n' "$URI" | xclip -selection clipboard -t text/uri-list >/dev/null 2>&1 &
+sleep 0.1
+xdotool key ctrl+v
+sleep 0.1
+echo "pasted file"
