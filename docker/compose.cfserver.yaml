@@ -36,6 +36,7 @@ services:
           create_host_path: false
 
     environment:
+      TZ: Asia/Shanghai
       AGENT_HOST: "0.0.0.0"
       AGENT_PORT: "6174"
       AGENT_DB_PATH: "/data/agent.db"

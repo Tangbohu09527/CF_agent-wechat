@@ -1,0 +1,29 @@
+name: Shanghai runtime timezone
+on:
+  pull_request:
+    paths: ['docker/**', 'tests/test_timezone_defaults.py', '.github/workflows/runtime-timezone.yml']
+  push:
+    paths: ['docker/**', 'tests/test_timezone_defaults.py', '.github/workflows/runtime-timezone.yml']
+permissions:
+  contents: read
+jobs:
+  fixed-runtime:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 -m pip install PyYAML
+      - run: python3 -m unittest discover -s tests -p test_timezone_defaults.py -v
+      - name: Verify fixed image timezone without starting WeChat
+        shell: bash
+        run: |
+          set -euo pipefail
+          image=ghcr.io/thisnick/agent-wechat@sha256:97d5a99f933592c15897a7579b4e2b2cbbb5f4dda856228f8271f91dd7cafb43
+          docker pull "$image"
+          docker run --rm --network none --read-only --entrypoint /bin/sh -e TZ=Asia/Shanghai "$image" -c '
+            test -r /usr/share/zoneinfo/Asia/Shanghai
+            test ! -e /data/auth-token
+            test "$(date -d @1792321846 +%z)" = +0800
+            test "$(date -d @1792321846 +%s)" = 1792321846
+            test "$(TZ=UTC date -d @1792321846 +%s)" = 1792321846
+          '
