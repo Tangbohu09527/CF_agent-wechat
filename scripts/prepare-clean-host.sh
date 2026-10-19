@@ -17,6 +17,7 @@ REVISION=
 IMAGE=
 RUNTIME_UID=
 RUNTIME_GID=
+EXECUTION_MODE=manager
 TEMP_FILE=
 IMAGE_PROBE_ID=
 
@@ -29,6 +30,9 @@ Usage:
   /opt/cf-agent-wechat/scripts/prepare-clean-host.sh configure --manager USER \
     --commit FULL_SHA --image REGISTRY/IMAGE@sha256:DIGEST \
     --runtime-uid UID --runtime-gid GID
+  # Unified server installation only, under the already authorized root entry:
+  sudo bash scripts/prepare-clean-host.sh checkout --manager USER \
+    --commit FULL_SHA --execution-mode root-managed
 
 Baseline: Debian 13 (trixie), amd64, systemd, local rootful Docker Engine.
 system installs OS tools, Docker CE and Compose v2, and creates a locked manager
@@ -38,6 +42,9 @@ Debian 13 container but does NOT validate Docker daemon, systemd or reboot.
 checkout and configure MUST run as the named non-root manager with sudo access.
 Existing checkout/configuration is validated, never overwritten or upgraded.
 configure pulls the supplied immutable image and prepares the manager's venv.
+The explicit root-managed mode reuses checkout/configure as root and defers the
+manager's login venv to the existing login entry. It never grants sudo rules,
+changes manager credentials, logs in, starts Agent, or opens Gateway gates.
 It validates the image service UID/GID with an isolated id-only container.
 It does not generate Tokens, create Runtime/Session, call Gateway, or start any
 Agent/worker services. Complete the Gateway installation gate, then run
@@ -47,9 +54,16 @@ EOF
 
 die() { printf '[FAIL:%s] %s\n' "${STAGE:-arguments}" "$*" >&2; exit 1; }
 log() { printf '[INFO:%s] %s\n' "$STAGE" "$*"; }
+privileged() {
+  if [ "$EXECUTION_MODE" = root-managed ]; then
+    "$@"
+  else
+    sudo -n -- "$@"
+  fi
+}
 cleanup() {
   if [[ "$IMAGE_PROBE_ID" =~ ^[0-9a-f]{64}$ ]]; then
-    sudo -n -- /usr/bin/timeout --signal=TERM --kill-after=2s 20s \
+    privileged /usr/bin/timeout --signal=TERM --kill-after=2s 20s \
       /usr/bin/docker --context default rm --force --volumes "$IMAGE_PROBE_ID" >/dev/null 2>&1 || true
   fi
   [ -z "$TEMP_FILE" ] || rm -f -- "$TEMP_FILE"
@@ -66,12 +80,21 @@ while [ "$#" -gt 0 ]; do
     --image) IMAGE=$2 ;;
     --runtime-uid) RUNTIME_UID=$2 ;;
     --runtime-gid) RUNTIME_GID=$2 ;;
+    --execution-mode) EXECUTION_MODE=$2 ;;
     *) die "unsupported option" ;;
   esac
   shift 2
 done
 [[ "$MANAGER" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || die "--manager must name a non-root Unix account"
 [ "$MANAGER" != root ] || die "root cannot be the management user"
+case "$EXECUTION_MODE" in
+  manager) ;;
+  root-managed)
+    [ "$(id -u)" = 0 ] || die "root-managed execution requires the already authorized root installer"
+    case "$STAGE" in checkout|configure) ;; *) die "root-managed is limited to checkout/configure" ;; esac
+    ;;
+  *) die "unsupported execution mode" ;;
+esac
 if [ "$STAGE" != system ] && [ "$STAGE" != system-packages ]; then
   [[ "$REVISION" =~ ^[0-9a-f]{40}$ ]] || die "--commit must be a full lowercase Git SHA"
 fi
@@ -118,6 +141,10 @@ manager_identity() {
 
 manager_session() {
   manager_identity
+  if [ "$EXECUTION_MODE" = root-managed ]; then
+    [ "$(id -u)" = 0 ] || die "root-managed requires root"
+    return
+  fi
   [ "$(id -un)" = "$MANAGER" ] && [ "$(id -u)" != 0 ] ||
     die "run this stage directly as the named non-root manager"
   [ "${HOME:-}" = "$(getent passwd "$MANAGER" | cut -d: -f6)" ] || die "HOME must match the manager account"
@@ -228,15 +255,15 @@ checkout_stage() {
     # Clone into a fresh sibling so failed fetch never leaves a partial final
     # checkout. Failed staging directories are retained for diagnosis.
     local staging
-    staging=$(sudo -n -- mktemp -d /opt/cf-agent-wechat-install.XXXXXXXX)
-    sudo -n -- chown "$(id -u):$(id -g)" "$staging"
+    staging=$(privileged mktemp -d /opt/cf-agent-wechat-install.XXXXXXXX)
+    privileged chown "$(id -u):$(id -g)" "$staging"
     git -c core.hooksPath=/dev/null init "$staging"
     git -C "$staging" remote add origin "$REPOSITORY"
     git -C "$staging" -c core.hooksPath=/dev/null fetch --depth 1 origin "$REVISION"
     git -C "$staging" -c core.hooksPath=/dev/null checkout --detach FETCH_HEAD
     [ "$(git -C "$staging" rev-parse HEAD)" = "$REVISION" ] || die "fetched commit differs from requested SHA"
     chmod 755 "$staging"
-    sudo -n -- mv -T -n -- "$staging" "$INSTALL_ROOT"
+    privileged mv -T -n -- "$staging" "$INSTALL_ROOT"
     [ ! -e "$staging" ] || die "installation path appeared concurrently; staged checkout retained"
   fi
   validate_checkout
@@ -247,15 +274,15 @@ validate_image_service_identity() {
   local identity
   # Create only our own disposable probe, bypassing the upstream entrypoint.
   # No host paths, credentials, network, session or Gateway are available.
-  IMAGE_PROBE_ID=$(sudo -n -- /usr/bin/timeout --signal=TERM --kill-after=2s 30s \
+  IMAGE_PROBE_ID=$(privileged /usr/bin/timeout --signal=TERM --kill-after=2s 30s \
     /usr/bin/docker --context default create --network none --read-only \
     --cap-drop ALL --security-opt no-new-privileges --restart no \
     --entrypoint /usr/bin/id "$IMAGE" wechat) || die "image identity probe could not be created"
   [[ "$IMAGE_PROBE_ID" =~ ^[0-9a-f]{64}$ ]] || die "invalid image identity probe ID"
-  identity=$(sudo -n -- /usr/bin/timeout --signal=TERM --kill-after=2s 30s \
+  identity=$(privileged /usr/bin/timeout --signal=TERM --kill-after=2s 30s \
     /usr/bin/docker --context default start --attach "$IMAGE_PROBE_ID" 2>/dev/null) ||
     die "image service identity probe failed or timed out"
-  sudo -n -- /usr/bin/timeout --signal=TERM --kill-after=2s 20s \
+  privileged /usr/bin/timeout --signal=TERM --kill-after=2s 20s \
     /usr/bin/docker --context default rm --volumes "$IMAGE_PROBE_ID" >/dev/null ||
     die "image identity probe cleanup failed"
   IMAGE_PROBE_ID=
@@ -309,19 +336,29 @@ if path.exists():
 for key, value in expected.items():
     print(f'{key}={value}')
 PY
-  [ "$(sudo -n -- /usr/bin/docker context inspect default --format '{{.Endpoints.docker.Host}}')" = unix:///var/run/docker.sock ] ||
+  [ "$(privileged /usr/bin/docker context inspect default --format '{{.Endpoints.docker.Host}}')" = unix:///var/run/docker.sock ] ||
     die "the default Docker context must select the local Unix socket"
-  daemon_info=$(sudo -n -- /usr/bin/docker --context default info --format '{{.LiveRestoreEnabled}}|{{json .SecurityOptions}}')
+  daemon_info=$(privileged /usr/bin/docker --context default info --format '{{.LiveRestoreEnabled}}|{{json .SecurityOptions}}')
   case "$daemon_info" in false\|*) ;; *) die "Docker live-restore must be disabled" ;; esac
   case "$daemon_info" in *rootless*) die "rootless Docker is outside the production contract" ;; esac
-  sudo -n -- /usr/bin/timeout --signal=TERM --kill-after=10s 900s \
+  privileged /usr/bin/timeout --signal=TERM --kill-after=10s 900s \
     /usr/bin/docker --context default pull --platform linux/amd64 "$IMAGE" >/dev/null ||
     die "immutable image cannot be pulled from its registry; no local tag fallback is allowed"
-  image_info=$(sudo -n -- /usr/bin/docker --context default image inspect --format '{{.Os}}|{{.Architecture}}|{{.Id}}' "$IMAGE")
+  image_info=$(privileged /usr/bin/docker --context default image inspect --format '{{.Os}}|{{.Architecture}}|{{.Id}}' "$IMAGE")
   [[ "$image_info" =~ ^linux\|amd64\|sha256:[0-9a-f]{64}$ ]] || die "pulled image platform or Image ID is invalid"
   validate_image_service_identity
   if [ ! -e "$INSTALL_ROOT/docker/.env" ]; then
     create_once "$TEMP_FILE" "$INSTALL_ROOT/docker/.env" 600
+  fi
+  if [ "$EXECUTION_MODE" = root-managed ]; then
+    state_dir="$STATE_ROOT/root-managed"
+    safe_path "$state_dir"
+    install -d -m 700 "$state_dir"
+    printf 'configuration_version=1\nmanagement_git_commit=%s\nupstream_image_reference=%s\nactual_image=%s\nruntime_uid=%s\nruntime_gid=%s\nlogin_environment=DEFERRED_TO_LOGIN_ENTRY\n' \
+      "$REVISION" "$IMAGE" "$image_info" "$RUNTIME_UID" "$RUNTIME_GID" > "$TEMP_FILE"
+    create_once "$TEMP_FILE" "$state_dir/sources.txt" 600
+    log "root-managed base prepared; manager login dependencies remain deferred; no Runtime or login created"
+    return
   fi
   # Reuse the same pinned requirements and stamp as daily login, as manager.
   safe_path "$HOME/.local/share/cf-agent-wechat/venv"

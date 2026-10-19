@@ -1,0 +1,16 @@
+name: Unified installer component boundary
+on:
+  push:
+    paths: ['scripts/prepare-clean-host.sh', 'tests/unit/test_root_managed_prepare.py', '.github/workflows/unified-component.yml']
+  pull_request:
+    paths: ['scripts/prepare-clean-host.sh', 'tests/unit/test_root_managed_prepare.py', '.github/workflows/unified-component.yml']
+permissions:
+  contents: read
+jobs:
+  boundaries:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash -n scripts/prepare-clean-host.sh
+      - run: python3 -m unittest discover -s tests/unit -p test_root_managed_prepare.py -v

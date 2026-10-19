@@ -1,5 +1,20 @@
 # 干净 Debian 13 amd64 安装与验收
 
+## 统一入口候选的 root 基础安装模式（2026-10-20）
+
+Gateway 的统一服务端候选复用本仓 `prepare-clean-host.sh` 和
+`bootstrap-cfserver.sh`。checkout/configure 可显式传入
+`--execution-mode root-managed`，只接受已经获准的 root 安装进程；
+普通用户传入此参数会立即拒绝，不创建任何 sudo 规则或永久授权。
+默认管理用户模式不变。root 模式使用相同的固定来源、镜像摘要、UID/GID、
+路径和已有配置核验，并将管理用户的登录 venv 准备延迟到既有登录入口。
+
+该模式不启动 Bot、不生成或清空 Runtime、不扫码、不调用 start-qr-login、
+不打开 Poll/Delivery。基础服务就绪后，微信登录和员工授权仍是分别可见的待办。
+本候选基于时区 PR10 的管理源码；其中包含 PR9 文件名候选源码，并不表示
+已构建或启用该协议。统一入口继续显式固定已核验的上游镜像摘要，源码与实际
+协议二进制分别记录。不能用管理脚本来源 SHA 冒充运行协议版本。
+
 本入口把主机依赖、固定代码和 WeChat 配置准备变成可重复执行的仓库资产。
 它不是全栈上线按钮。当前 Gateway 固定版本仍有首次部署缺口，详见
 [Gateway 配套修复范围](gateway-clean-install-gaps.md)；未解决该门禁前不能声明新设备文本闭环通过。
