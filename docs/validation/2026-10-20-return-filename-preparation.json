@@ -1,0 +1,73 @@
+{
+  "date": "2026-10-20",
+  "timezone": "Asia/Shanghai",
+  "scope": "offline candidate preparation; no production or WeChat access",
+  "filename_revision": "7bd42b623d405956080a13481bbf4de21aa3477a",
+  "compatible_management_revision": "e56c7e4b606f1614e54210a391906f4be7440f5e",
+  "upstream_revision": "96c2e90c497d999bf5189a134a9b3b293731f42e",
+  "artifact_files_sha256": {
+    "return-filename-overlay.tar.gz": "a737b67ee4c4fa5733dd64f391b40c16ee3cc093b69207d94052e3925a370854",
+    "release-proof.json": "a95314739a2ef0588a8f7d01e924a2e3f998bed5c90904da71ff2134b1791fbd",
+    "context/agent-server": "98b3176d44bb5dd03b045591348fb51474f2208a1ac7fb595c11ad3fdd628408",
+    "context/paste-file": "6f36f76b5c0194c990a49199f064e01a4bb87d48e93f876db02e7c5a54ad654d"
+  },
+  "native_evidence_sha256": {
+    "overlay.txt": "3378accebe3db901b4cee94df218af96211b01268271416ab41e6e56d3c5258f",
+    "qt-version.txt": "4c3039876ab29593ed73fb0e353f540759b2678299a07639efcbc91daca0db0e",
+    "rust-qt.txt": "2fb9268d53a1dda40186e792a42a5e4ef0a0c38aff3bce1d7bb6f266a53cb95b",
+    "source.json": "841e043dc6f8f3192a6dc92e8cc9eaf21315d24a3bb2b24c182081acff6f2c05"
+  },
+  "base_image": "ghcr.io/thisnick/agent-wechat@sha256:97d5a99f933592c15897a7579b4e2b2cbbb5f4dda856228f8271f91dd7cafb43",
+  "base_config": "sha256:3b14e58c908ec11e9163ef0bbb51522bea15c1568c8e1012a29890b9adadc48e",
+  "historical_ci_image_id": "sha256:1ae2c63e3fe57780cf9d7b64d55f2f473d212aa80cd26ce0abd33b0ee514face",
+  "required_glibc_max": "2.34",
+  "fresh_checks": {
+    "overlay_tests": 8,
+    "package_guard_tests": 6,
+    "downloaded_package_hashes_verified": true,
+    "archive_members_match_context": true,
+    "frozen_source_matches_native_and_release_proof": true,
+    "send_target_parameter_block_unchanged": true,
+    "chat_selection_plan_unchanged": true
+  },
+  "reused_ci": {
+    "run": 39122064383,
+    "native_tests_passed": 9,
+    "qt_version": "5.15.13",
+    "release_and_loader_passed": true,
+    "executed_this_round": false
+  },
+  "synthetic_samples": [
+    {
+      "target_label": "private",
+      "relative_path": "private/中文 报告 (1).txt",
+      "basename": "中文 报告 (1).txt",
+      "bytes": 79,
+      "sha256": "964165f861e52e67780dd84c6761b27a73c801109deb140d0f7506825cc40a45"
+    },
+    {
+      "target_label": "private",
+      "relative_path": "private/资料 包 (2).zip",
+      "basename": "资料 包 (2).zip",
+      "bytes": 325,
+      "sha256": "7669002b8968f3d6d26bb90cac4e0b86812ef632d39af8abe64f9e3ea8e14901"
+    },
+    {
+      "target_label": "group",
+      "relative_path": "group/中文 报告 (1).txt",
+      "basename": "中文 报告 (1).txt",
+      "bytes": 77,
+      "sha256": "c3b4c226329e610d6b98f3b6ac0a6bd77b08f857e1039442addb349fd430487c"
+    },
+    {
+      "target_label": "group",
+      "relative_path": "group/资料 包 (2).zip",
+      "basename": "资料 包 (2).zip",
+      "bytes": 321,
+      "sha256": "091988ca989143f7b7a352b529696c69252e8c2e9a1fe2e19f9ebbf0ab1a7449"
+    }
+  ],
+  "live_wechat_started": false,
+  "production_connected": false,
+  "recipient_acceptance_verified": false
+}
