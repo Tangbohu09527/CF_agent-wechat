@@ -1,0 +1,51 @@
+name: Preserve-only expected-account login candidate
+on:
+  push:
+    paths:
+      - 'upstream/login-expected-account/**'
+      - 'scripts/apply-login-expected-account.py'
+      - 'tests/test_login_expected_account_overlay.py'
+      - '.github/workflows/login-expected-account.yml'
+  pull_request:
+    paths:
+      - 'upstream/login-expected-account/**'
+      - 'scripts/apply-login-expected-account.py'
+      - 'tests/test_login_expected_account_overlay.py'
+      - '.github/workflows/login-expected-account.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  preserved-account:
+    name: Pinned Rust login guard and authenticated API contract
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: thisnick/agent-wechat
+          ref: 96c2e90c497d999bf5189a134a9b3b293731f42e
+          path: agent-wechat/login-candidate
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@1.93.0
+      - name: Validate exact source and filename compatibility
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p test-results/login
+          export CF_LOGIN_SOURCE="$PWD/agent-wechat/login-candidate"
+          python3 -m unittest discover -s tests -p test_login_expected_account_overlay.py -v 2>&1 | tee test-results/login/overlay.txt
+          python3 scripts/apply-login-expected-account.py --source "$CF_LOGIN_SOURCE" --with-return-filename > test-results/login/source.json
+      - name: Run actual Rust plan, SQLite preservation, authenticated HTTP and WS rejection tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked --manifest-path agent-wechat/login-candidate/packages/agent-server-rust/Cargo.toml expected_account_ -- --nocapture 2>&1 | tee test-results/login/rust.txt
+      - name: Preserve synthetic-only evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: expected-account-${{ github.sha }}
+          path: test-results/login
+          retention-days: 14
