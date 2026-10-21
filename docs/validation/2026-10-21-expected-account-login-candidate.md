@@ -33,7 +33,9 @@ cargo test --locked --manifest-path "$CF_LOGIN_SOURCE/packages/agent-server-rust
 
 `--with-return-filename` 从同一干净源码组合已固定的 PR9 原文件名补丁，保留文件发送生命周期队列；不盲目合并安装器。仅需要登录补丁时可省略该参数。已修改源码不会被重复覆盖；重新验证使用另一份干净副本，不 reset/clean 旧材料。
 
-当前本机没有 Rust 工具链，未安装系统 Rust。Python 离线身份/组合检查 3 项通过；原生 Rust 编译、真实 SQLite 及认证 HTTP/WS 拒绝测试由新增 `login-expected-account.yml` 在一次性 Linux runner 使用锁定依赖执行。CI 最终状态另行补记，未执行或失败不得算通过。测试没有扫码、真实账号、上游 Token、真实微信发送或模型调用。
+本机没有 Rust 工具链，未安装系统 Rust。Python 离线身份/组合检查 3 项通过。代码提交 `84f2bbe077e7a48a6b4a5e9f74de82239fb185a1` 的 Linux CI 使用 Ubuntu 24.04、Rust 1.93.0 和官方 `Cargo.lock` 完成原生编译，8 项 Rust 测试通过：实际 SQLite 中账号不符不改 session/keys/checkpoint、有效更新保留身份、多账号检测拒绝、LoginPlan 保留/失败路径、认证 HTTP 能力响应以及 WS 缺失身份/请求切号在 native 工具前拒绝。未执行真实登录、扫码或微信 GUI，不把隔离测试算作现场验收。
+
+准确 CI：PR 检查 [39578604354](https://github.com/Tangbohu09527/CF_agent-wechat/actions/runs/39578604354) 已完成成功（2026-10-21 09:42 UTC）；同一代码 SHA 的 push 检查 [39578546321](https://github.com/Tangbohu09527/CF_agent-wechat/actions/runs/39578546321) 同样执行 8 项原生测试。CI 制品仅含合成测试日志及源码组合摘要，没有真实账号、上游 Token、二维码、正文、微信发送或模型调用。
 
 ## 后续现场许可边界
 
