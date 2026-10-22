@@ -88,4 +88,18 @@ mod live_login_observation_tests {
         let tree = account_tree("Enter Weixin", false);
         assert!(identify_states(&tree, "").main_window.is_none());
     }
+
+    #[test]
+    fn live_login_proxy_settings_are_responsive_but_do_not_prove_authentication() {
+        let tree: A11yNode = serde_json::from_value(json!({
+            "role":"frame", "name":"Weixin", "children":[
+                {"role":"label","name":"Network proxy settings"},
+                {"role":"check-box","name":"Use proxy"}
+            ]
+        })).unwrap();
+        let observed = identify_states(&tree, "");
+        assert_eq!(observed.main_window.as_ref().unwrap().state_id, "network_proxy_settings");
+        assert_eq!(reduce_auth_observation(&stale_online(), &tree, &[], &observed).unwrap_err(),
+                   "observation_unrecognized");
+    }
 }

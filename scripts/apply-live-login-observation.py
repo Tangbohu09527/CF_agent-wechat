@@ -95,6 +95,9 @@ def transform(inputs, *, regression_only=False, guarded_outputs=None):
         .ok_or("observation_unrecognized")?;
     let state = find_state_by_id(&main.state_id)
         .filter(|state| state.fsm() == "mainWindow")
+        .filter(|state| matches!(state.id(),
+            "chat" | "chat_open" | "login_qr" | "login_account" |
+            "login_phone_confirm" | "login_loading"))
         .ok_or("observation_unrecognized")?;
     Ok(state.reduce(&ReduceArgs { prev: previous, a11y, screenshot }))
 }

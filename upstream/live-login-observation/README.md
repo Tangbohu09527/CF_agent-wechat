@@ -5,7 +5,7 @@ It changes four source files:
 
 - `ia/states/login.rs`: recognize the saved-account **Enter Weixin** button alongside **Log In / Open WeChat**; still require **Switch Account** to identify this page.
 - `ia/actions.rs`: the existing-account login action selects those three exact labels, never **Switch Account**.
-- `router/status.rs`: require a freshly recognized main-window state. Unrecognized observations return `status=unknown`, `error=observation_unrecognized`, `reason=auth_observation_unrecognized`, `identityVerified=false` and `observedAt`; no stale context is saved on that path.
+- `router/status.rs`: require a freshly recognized authentication-bearing main-window state. Unrecognized observations and a proxy-settings screen that does not prove authentication return `status=unknown`, `error=observation_unrecognized`, `reason=auth_observation_unrecognized`, `identityVerified=false` and `observedAt`; no stale context is saved on that path.
 - `tools/wechat_db.rs`: short `mode=ro` SQLCipher connections include WAL, enforce `query_only` and bound busy wait to 1 second. They do not checkpoint, change journal mode or keep a read transaction open.
 
 The branch is based on the preserve-account candidate, but its **default output and release package exclude all expected-account, filename, media-send and installer overlays**. Nothing here clears runtime/session/keys/checkpoints or starts a service.
