@@ -1,0 +1,72 @@
+name: Active account read candidate
+on:
+  push:
+    paths:
+      - 'upstream/active-account-reader/**'
+      - 'scripts/apply-active-account-reader.py'
+      - 'scripts/package-active-account.py'
+      - 'tests/test_active_account_reader_overlay.py'
+      - '.github/workflows/active-account-reader.yml'
+  pull_request:
+    paths:
+      - 'upstream/active-account-reader/**'
+      - 'scripts/apply-active-account-reader.py'
+      - 'scripts/package-active-account.py'
+      - 'tests/test_active_account_reader_overlay.py'
+      - '.github/workflows/active-account-reader.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  native-and-release:
+    name: Fixed source contract RED GREEN, native reads and binary package
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/agent-wechat/cargo-target-active
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: thisnick/agent-wechat
+          ref: 96c2e90c497d999bf5189a134a9b3b293731f42e
+          path: agent-wechat/active-green
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@1.93.0
+      - name: Pin source contract RED and candidate GREEN
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p test-results/active-account
+          export CF_LOGIN_SOURCE="$PWD/agent-wechat/active-green"
+          set +e
+          CF_ACTIVE_PHASE=baseline python3 -m unittest discover -s tests -p test_active_account_reader_overlay.py -v > test-results/active-account/source-red.txt 2>&1
+          result=$?
+          set -e
+          cat test-results/active-account/source-red.txt
+          test "$result" -eq 1
+          grep -q 'FAILED (failures=2, skipped=2)' test-results/active-account/source-red.txt
+          python3 -m unittest discover -s tests -p test_active_account_reader_overlay.py -v 2>&1 | tee test-results/active-account/source-green.txt
+          python3 scripts/apply-active-account-reader.py --source agent-wechat/active-green > test-results/active-account/applied.json
+      - name: Native process-FD identity and actual SQL preservation regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked --manifest-path agent-wechat/active-green/packages/agent-server-rust/Cargo.toml active_account_ -- --nocapture 2>&1 | tee test-results/active-account/native.txt
+          cargo test --locked --manifest-path agent-wechat/active-green/packages/agent-server-rust/Cargo.toml live_login_ -- --nocapture 2>&1 | tee test-results/active-account/live-observation.txt
+      - name: Build only API replacement against official locked dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --locked --manifest-path agent-wechat/active-green/packages/agent-server-rust/Cargo.toml
+          python3 scripts/package-active-account.py --source agent-wechat/active-green --applied test-results/active-account/applied.json --binary "$CARGO_TARGET_DIR/release/agent-server" --output test-results/active-release
+      - name: Preserve synthetic evidence and reviewable API package
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: active-account-${{ github.sha }}
+          path: |
+            test-results/active-account
+            test-results/active-release
+          retention-days: 14
