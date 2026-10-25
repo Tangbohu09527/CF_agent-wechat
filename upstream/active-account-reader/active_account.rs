@@ -3,6 +3,7 @@ use crate::ia::types::Session;
 use crate::tools::wechat_db::{find_wechat_pid, get_db_path, list_account_dbs};
 use crate::tools::wechat_keys::{extract_keys_async, get_stored_keys, store_keys, verify_key};
 use axum::{http::StatusCode, Json};
+use rusqlite::{Connection, OpenFlags};
 use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 
@@ -91,6 +92,27 @@ pub fn ensure_active_account(session: &Session, expected: &ActiveAccount) -> Res
 #[derive(Clone, Copy)]
 pub enum ReadKind { Contacts, Chats, Messages }
 
+/// Existing keys can become unreadable while the client remains logged in.
+/// A failed read must never be reported as a successful empty message list.
+fn message_database_readable(path: &str, key: &str) -> bool {
+    if key.len() != 64 || !key.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return false;
+    }
+    let connection = match Connection::open_with_flags(
+        format!("file:{path}?mode=ro"),
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    ) {
+        Ok(connection) => connection,
+        Err(_) => return false,
+    };
+    if connection.execute_batch(&format!(
+        "PRAGMA key = \"x'{key}'\"; PRAGMA cipher_compatibility = 4; PRAGMA query_only = ON; PRAGMA busy_timeout = 1000;"
+    )).is_err() {
+        return false;
+    }
+    connection.query_row("SELECT count(*) FROM sqlite_master", [], |row| row.get::<_, i64>(0)).is_ok()
+}
+
 /// Keys remain partitioned by session + account. Session identity and cursors are never written.
 pub async fn active_read_keys(session: &Session, kind: ReadKind)
     -> Result<(ActiveAccount, HashMap<String, String>), ActiveReadError> {
@@ -120,6 +142,11 @@ pub async fn active_read_keys(session: &Session, kind: ReadKind)
     if required.iter().any(|name| !keys.contains_key(name)) {
         return Err(active_error("active_account_keys_unavailable"));
     }
+    if matches!(kind, ReadKind::Messages) && required.iter().any(|name| {
+        !message_database_readable(&get_db_path(&active.account_dir, name), &keys[name])
+    }) {
+        return Err(active_error("active_message_database_unreadable"));
+    }
     ensure_active_account(session, &active).map_err(active_error)?;
     Ok((active, keys))
 }
@@ -130,6 +157,31 @@ mod active_account_tests {
     use rusqlite::Connection;
     fn target(account: &str) -> String {
         format!("/home/wechat/xwechat_files/{account}/db_storage/session/session.db")
+    }
+    #[test]
+    fn active_account_message_read_failure_is_not_a_successful_empty_window() {
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("message.db");
+        let key = "17".repeat(32);
+        let wrong = "23".repeat(32);
+        let writer = Connection::open(&path).unwrap();
+        writer.execute_batch(&format!(
+            "PRAGMA key = \"x'{key}'\"; PRAGMA cipher_compatibility = 4; PRAGMA journal_mode = WAL; PRAGMA wal_autocheckpoint = 0; CREATE TABLE probe(id INTEGER); INSERT INTO probe VALUES(1);"
+        )).unwrap();
+        assert!(message_database_readable(path.to_str().unwrap(), &key));
+        assert!(!message_database_readable(path.to_str().unwrap(), &wrong));
+        assert!(!message_database_readable(path.to_str().unwrap(), "not-a-key"));
+        // Correct empty data is readable; unreadable is a different contract.
+        writer.execute_batch("DELETE FROM probe;").unwrap();
+        assert!(message_database_readable(path.to_str().unwrap(), &key));
+        assert_eq!(writer.query_row("SELECT count(*) FROM probe", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+    }
+    #[test]
+    fn active_account_message_read_failure_does_not_create_missing_database() {
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("missing.db");
+        assert!(!message_database_readable(path.to_str().unwrap(), &"17".repeat(32)));
+        assert!(!path.exists());
     }
     #[test]
     fn active_account_uses_current_fd_instead_of_saved_identity() {

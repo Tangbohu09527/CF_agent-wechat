@@ -6,6 +6,7 @@ on:
       - 'scripts/apply-active-account-reader.py'
       - 'scripts/package-active-account.py'
       - 'tests/test_active_account_reader_overlay.py'
+      - 'tests/test_message_read_failure_overlay.py'
       - '.github/workflows/active-account-reader.yml'
   pull_request:
     paths:
@@ -13,6 +14,7 @@ on:
       - 'scripts/apply-active-account-reader.py'
       - 'scripts/package-active-account.py'
       - 'tests/test_active_account_reader_overlay.py'
+      - 'tests/test_message_read_failure_overlay.py'
       - '.github/workflows/active-account-reader.yml'
   workflow_dispatch:
 permissions:
@@ -48,6 +50,7 @@ jobs:
           test "$result" -eq 1
           grep -q 'FAILED (failures=2, skipped=2)' test-results/active-account/source-red.txt
           python3 -m unittest discover -s tests -p test_active_account_reader_overlay.py -v 2>&1 | tee test-results/active-account/source-green.txt
+          python3 -m unittest discover -s tests -p test_message_read_failure_overlay.py -v 2>&1 | tee test-results/active-account/message-read-contract.txt
           python3 scripts/apply-active-account-reader.py --source agent-wechat/active-green > test-results/active-account/applied.json
       - name: Native process-FD identity and actual SQL preservation regressions
         shell: bash
